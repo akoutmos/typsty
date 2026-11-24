@@ -28,9 +28,11 @@ jobs:
         job:
           - { target: aarch64-apple-darwin, os: macos-15 }
           - { target: x86_64-apple-darwin, os: macos-15 }
+          # cross links against an older glibc than the runner's, so that the NIF and the
+          # worker also run on older distributions (such as Debian 11 and RHEL 8)
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04, use-cross: true }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04, use-cross: true }
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, use-cross: true }
           - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04, use-cross: true }
           - { target: x86_64-pc-windows-gnu, os: windows-2022 }
           - { target: x86_64-pc-windows-msvc, os: windows-2022 }
@@ -53,8 +55,10 @@ jobs:
           fi
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          # The version in .tool-versions, which Typst 0.15 needs at least
+          toolchain: "1.92.0"
           targets: ${{ matrix.job.target }}
 
       - name: Install cross
@@ -71,15 +75,18 @@ jobs:
           echo "file-path=$tarball" >> "$GITHUB_OUTPUT"
           echo "file-name=$(basename "$tarball")" >> "$GITHUB_OUTPUT"
 
+      # Both steps fail when the tarball is missing, rather than succeed without it
       - name: Upload the build
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.build.outputs.file-name }}
           path: ${{ steps.build.outputs.file-path }}
+          if-no-files-found: error
 
       - name: Publish the build to the GitHub release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
+          fail_on_unmatched_files: true
           files: |
             ${{ steps.build.outputs.file-path }}

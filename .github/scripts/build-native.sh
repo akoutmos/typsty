@@ -10,7 +10,9 @@
 #   .github/scripts/build-native.sh aarch64-apple-darwin 2.15 0.1.0
 #   .github/scripts/build-native.sh aarch64-unknown-linux-gnu 2.15 0.1.0 true
 #
-# The tarball is written to dist/, and its path is the last line of the output.
+# The tarball is written to dist/, and its path, relative to the repository's root, is the
+# last line of the output. (A relative path works for the actions that upload it on every
+# runner, including Windows, where Git Bash's absolute paths look like /d/a/...)
 
 set -euo pipefail
 
@@ -48,7 +50,7 @@ cp "$built/$worker" "$staging/$worker"
 chmod 755 "$staging/$worker"
 
 # COPYFILE_DISABLE keeps macOS's tar from adding ._ metadata files
-tarball="$root/dist/$name.tar.gz"
-(cd "$staging" && COPYFILE_DISABLE=1 tar -czf "$tarball" "$name" "$worker")
+tarball="dist/$name.tar.gz"
+(cd "$staging" && COPYFILE_DISABLE=1 tar -czf "$root/$tarball" "$name" "$worker")
 
 echo "$tarball"

@@ -1,0 +1,3 @@
+# Scripts and the VERSION file must keep LF line endings, even on Windows runners, which
+# check files out with CRLF by default: a CRLF shebang or version breaks the release build.
+* text=auto eol=lf

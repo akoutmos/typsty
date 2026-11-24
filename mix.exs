@@ -50,8 +50,8 @@ defmodule Typsty.MixProject do
     [
       name: "typsty",
       # The NIF and the worker are downloaded precompiled, and built from the native/ workspace
-      # when TYPSTY_BUILD is set. hex.pm shows the README from the package, so the images it
-      # references are packaged too.
+      # when TYPSTY_BUILD is set. The README's images are only needed by the docs, which get
+      # them through :assets.
       files:
         ~w(lib native/Cargo.toml native/Cargo.lock native/.cargo) ++
           for(
@@ -59,7 +59,8 @@ defmodule Typsty.MixProject do
             path <- ~w(Cargo.toml src),
             do: "native/#{crate}/#{path}"
           ) ++
-          ~w(images checksum-*.exs mix.exs .formatter.exs README.md LICENSE CHANGELOG.md VERSION),
+          ~w(checksum-*.exs mix.exs .formatter.exs README.md LICENSE CHANGELOG.md VERSION),
+      exclude_patterns: [~r/\.DS_Store$/],
       licenses: ["MIT"],
       maintainers: ["Alex Koutmos"],
       links: %{
@@ -89,7 +90,7 @@ defmodule Typsty.MixProject do
   defp dialyzer do
     [
       # The formatter plugin and the packages task use Mix, and the task downloads with :httpc
-      plt_add_apps: [:mix, :inets, :ssl, :public_key],
+      plt_add_apps: [:mix, :inets, :ssl, :public_key, :crypto],
       plt_file: {:no_warn, "priv/plts/dialyzer.plt"}
     ]
   end
