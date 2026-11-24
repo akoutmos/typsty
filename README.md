@@ -1,3 +1,5 @@
+# Typsty
+
 <p align="center">
   Render <a href="https://typst.app" target="_blank">Typst</a> documents to PDF, PNG and SVG right from Elixir!
 </p>
@@ -23,7 +25,7 @@
 
 <br>
 
-# Contents
+## Contents
 
 - [Installation](#installation)
 - [Level Up Your Elixir Skills!](#level-up-your-elixir-skills)
@@ -162,7 +164,10 @@ render a string of Typst source with `Typsty.to_pdf/3`, `Typsty.to_png/3` and
 
 ```elixir
 {:ok, pdf} = Typsty.to_pdf("= Hello #name", %{name: "World"})
+{:ok, [page]} = Typsty.to_png("= Hello #name", %{name: "World"}, ppi: 300)
 ```
+
+The assigns are always a map, and the options come after them.
 
 ## Variables
 
@@ -178,10 +183,15 @@ fields, do arithmetic and format dates:
 | strings                                          | `str`                                       |
 | atoms                                            | `str` (`:paid` becomes `"paid"`)            |
 | lists and tuples                                 | `array`                                     |
-| maps                                             | `dictionary`, with string keys              |
+| maps                                             | `dictionary`, with string keys, sorted      |
 | `Date`, `Time`, `NaiveDateTime`, `DateTime`      | `datetime` (`DateTime` keeps its wall time) |
 | `Decimal`                                        | `decimal`                                   |
 | other structs                                    | `dictionary`, or see `Typsty.Encoder`       |
+
+Keyword lists are lists of tuples, so they become arrays of pairs: pass maps for
+dictionaries. Typst's datetimes have no time zone or fractions of a second, so
+a `DateTime` keeps its wall time and times are truncated to the second, and its
+decimals have 28 significant digits.
 
 Implement `Typsty.Encoder` to pass your own structs differently:
 
@@ -194,7 +204,8 @@ end
 The variables are bound at the top of the template, like `#let` bindings, so
 they're only visible in the template itself. A variable named after something in
 Typst's standard library (such as `title`) shadows it there, but not in imported
-files and packages, and `std.title` still reaches the original. Other files can
+files and packages, and `std.title` still reaches the original (unless a
+variable is named `std`). Other files can
 read the variables from `sys.inputs`, which is also how a template can make one
 optional:
 
@@ -240,11 +251,18 @@ MyApp.Report.to_pdf(assigns,
 
 Without the `:root` option, a document can only read the files it's given. Set
 `:root` to a directory to also read files from it (files in `:files` take
-precedence). Documents can't read outside it.
+precedence). Documents can't read outside it, even through symbolic links.
 
-Typst keeps every file path it has seen for the life of the VM, up to 65,536 of
-them, so use stable names like `logo.png` or `photos/42.jpg` rather than a new
-unique name for every render.
+Typst keeps every file path it has seen for the life of the VM, and has room for
+65,535 of them, so use stable names like `logo.png` or `photos/42.jpg` rather
+than a new unique name for every render. Typsty stops a render that reads more
+than 10,000 different files, refuses new paths in `:files` after 50,000 have
+been given, and stops renders that need a new path once the table is nearly
+full, rather than let it overflow. Typst keeps label names for the life of the
+VM too, so make labels from fixed names (`<total>`), not from data such as ids.
+
+Renders inside the VM can't read PDF files (to use a PDF as an image, say),
+since a malformed PDF can crash the VM. Renders in a `Typsty.Pool` can.
 
 ## Fonts
 
@@ -276,6 +294,10 @@ mix typsty.packages.get @preview/cetz:0.4.2
 ```
 * Fetched @preview/cetz:0.4.2
 * Fetched @preview/oxifmt:1.0.0 (imported by @preview/cetz:0.4.2)
+
+Downloaded 2 of 2 packages into priv/typst/packages. Templates can import them when the :package_paths option includes that directory:
+
+    config :typsty, package_paths: [Application.app_dir(:my_app, "priv/typst/packages")]
 ```
 
 Packages are saved in `priv/typst/packages` (change it with `--path`), laid out
@@ -295,7 +317,8 @@ config :typsty, package_paths: [Application.app_dir(:my_app, "priv/typst/package
 ```
 
 To keep the list of packages in your repository, for CI and Docker builds, list
-them in your config and run the task without arguments:
+them in your config, with their versions, and run the task without arguments
+(in a Docker build, in the build stage, before `mix release`):
 
 ```elixir
 # config/config.exs
@@ -304,9 +327,9 @@ config :typsty, packages: ["@preview/cetz:0.4.2"]
 
 Typsty never downloads packages while rendering, so documents don't wait on the
 network and always use the package versions you ship. A template that imports a
-package that isn't there fails with an error that says which package to fetch.
-Your own packages can go in the same directories, under a namespace such as
-`local`.
+package that isn't there fails with an error that says which package to fetch
+and which directories were searched. Your own packages can go in the same
+directories, under a namespace such as `local`.
 
 ## Errors
 
@@ -324,12 +347,18 @@ wrong type, are returned as a `Typsty.RenderError` with the diagnostics Typst
 reported, pointing at the line in your module or `.typ` file:
 
 ```elixir
-{:error, %Typsty.RenderError{} = error} = MyApp.Invoice.to_pdf(%{number: 1042}, files: files)
+{:error, %Typsty.RenderError{reason: :typst} = error} = MyApp.Invoice.to_pdf(%{number: 1042}, files: files)
 Exception.message(error)
 #=> failed to render the Typst document:
 #=>
 #=> lib/my_app/invoice.ex:11:16: unknown variable: customer
 ```
+
+The error's `:reason` tells Typst's errors (`:typst`) apart from renders that
+timed out (`:timeout`) or couldn't start in time because the server was busy
+(`:busy`), so a web application can answer those with a 503 and a retry. See
+`Typsty.RenderError` for the others. Invalid arguments, such as an unknown
+option or a value that can't be passed to Typst, raise an `ArgumentError`.
 
 Typst's warnings, such as an unknown font family, are logged. Every render also
 emits [telemetry](https://hexdocs.pm/telemetry) events (see `Typsty.Telemetry`).
@@ -337,13 +366,15 @@ emits [telemetry](https://hexdocs.pm/telemetry) events (see `Typsty.Telemetry`).
 ## Running Typst inside the BEAM
 
 Typsty runs Typst in a NIF, inside your VM, so a crash in it would take the
-whole VM down. It's built so that what you render with can't crash it:
+whole VM down. It's built so that the data you render with can't crash it:
 
-- **Typst runs on its own thread**, with a 256 MiB stack (reserved address
-  space, not memory), and so does Typst's thread pool. Deeply nested content
-  can't overflow the small stacks of the BEAM's schedulers, panics in Typst
-  are returned as a `Typsty.RenderError`, and Typst's own limits (parsing,
-  call and layout depth) get a chance to stop runaway recursion.
+- **Renders don't hold up the VM.** Each render runs on a thread of its own,
+  outside the BEAM's schedulers, and the process that asked for it waits for a
+  message, like any other. The thread has a 256 MiB stack (reserved address
+  space, not memory), as does Typst's thread pool, so deeply nested content
+  can't overflow a stack, panics in Typst are returned as a
+  `Typsty.RenderError`, and Typst's own limits (parsing, call and layout depth)
+  get a chance to stop runaway recursion.
 - **Renders are independent.** Concurrent renders of the same template, with
   the same file names and assigns names but different values (as a Phoenix
   controller does for each request), each produce exactly what they would on
@@ -351,10 +382,11 @@ whole VM down. It's built so that what you render with can't crash it:
   value it depended on is the same in the new render.
 - **Renders time out** after 60 seconds by default (`:timeout`). A render that
   times out returns an error and is cancelled: it unwinds the next time Typst
-  lays out content, loads a file or font, or exports a page, which for most
-  documents is within milliseconds. A thread can't be killed safely, so a
-  template doing pure computation (a long loop of arithmetic) keeps running
-  until it gets to one of those points.
+  lays out content, loads a file or font, or exports a PNG or SVG page, which
+  for most documents is within milliseconds. A render is cancelled too when the
+  process waiting for it exits. A thread can't be killed safely, so a template
+  doing pure computation (a long loop of arithmetic) keeps running until it
+  gets to one of those points.
 - **Renders are limited** to `:max_concurrent_renders` at once (by default, one
   per CPU core), counting renders that timed out and are still being
   cancelled. New renders wait for a slot within their timeout, so renders that
@@ -363,22 +395,24 @@ whole VM down. It's built so that what you render with can't crash it:
 - **Data is checked before Typst gets it.** Variables can be nested at most
   256 levels deep. Images whose header claims more than 134 megapixels are
   refused before they're decoded (a small file can claim to be enormous), as
-  are SVG and XML files nested more than 1,024 levels deep. Files are only
-  read from `:root` and package directories if they're regular files, so a
-  symlink to `/dev/zero` or a FIFO can't hang a render.
+  are SVG and XML files nested more than 1,024 levels deep, compressed SVGs
+  that expand past 128 MiB, XML entities that nest or expand past 16 MiB, and
+  PDF files. Files are only read from `:root` and package directories if they
+  are regular files inside them, so a symbolic link can't lead elsewhere, and
+  a link to `/dev/zero` or a FIFO can't hang a render.
 - **PNG export is checked before rasterizing.** A page, and the images,
-  gradients and tilings on it, may use at most 2^28 pixels (1 GiB), so an
-  extreme `:ppi` or content far larger than the page returns an error instead
-  of an allocation that would fail.
-- **File paths are capped** at 50,000 distinct paths in `:files` for the life
-  of the VM, since Typst keeps every path it sees and breaks for good after
-  65,535 of them.
+  gradients and tilings on it, may use at most 2^28 pixels of textures (1 GiB),
+  so an extreme `:ppi` or content far larger than the page returns an error
+  instead of an allocation that would fail.
+- **File paths are rationed**, since Typst keeps every path it sees for the
+  life of the VM and breaks for good after 65,535 of them (see [Files](#files)).
 
-A template, though, is code. Like any code, it can loop for a long time or
-allocate as much memory as it asks for (`range(n)`, `"x" * n`, and so on), and
-if the machine runs out of memory, the VM goes down. Keep that in mind when a
-template uses data to decide how much work to do. When that's a risk, render in
-separate processes.
+A template, though, is code. Like any code, it can loop for a long time, and
+it can ask for as much memory as it likes (`range(n)`, `"x" * n`, and so on).
+An allocation that fails ends the VM at once, whatever memory is free: a
+template that asks for an exabyte doesn't wait for the machine to run out.
+Typsty can't stop that inside the VM. Render templates you don't write, or
+ones that use data to decide how much work to do, in separate processes.
 
 ## Rendering in separate processes
 
@@ -408,10 +442,15 @@ Or render every document with it:
 config :typsty, pool: MyApp.TypstPool
 ```
 
-Renders return exactly what they return without a pool: the same output and
-the same warnings and errors, pointing at the same lines. A worker that's
-stopped is replaced, and workers end when the pool stops, when the process
-rendering with them exits and when the VM exits.
+Renders return what they return without a pool: the same output and the same
+warnings and errors, pointing at the same lines (and they can read PDF files).
+A worker that's stopped is replaced, and workers end when the pool stops, when
+the process rendering with them exits and when the VM exits. A pool that stops
+during a render returns an error to the process waiting for it.
+
+The memory limit counts everything a worker allocates, including the fonts it
+has loaded and Typst's caches, and each worker keeps its own, so leave room for
+them; see `Typsty.Pool`.
 
 The pool's workers run `typsty_worker`, a program built from the same code as
 the NIF, which comes with it. Rendering in a worker copies the template, the
@@ -433,7 +472,7 @@ your `.formatter.exs`:
 ```
 
 To leave a sigil as it is, use the `noformat` modifier:
-`~TYPST"""...."""noformat`. See `Typsty.Formatter` for its options.
+`~TYPST"""..."""noformat`. See `Typsty.Formatter` for its options.
 
 ## Configuration
 
@@ -450,9 +489,12 @@ config :typsty,
   ppi: 144,
   pdf_standards: [],
   timeout: 60_000,
-  max_concurrent_renders: System.schedulers_online(),
   pool: nil,
-  log_warnings: true
+  # Renders inside the VM at once (by default, the number of dirty CPU schedulers)
+  max_concurrent_renders: :erlang.system_info(:dirty_cpu_schedulers),
+  log_warnings: true,
+  # Packages for mix typsty.packages.get to fetch (see Packages)
+  packages: []
 ```
 
 Paths are expanded relative to the current directory when a document renders,
@@ -470,8 +512,8 @@ the time of the render unless the template sets `#set document(date: ...)`.
 
 The NIF is downloaded precompiled for macOS (Apple Silicon and Intel), Linux
 (x86-64 and ARM64, glibc and musl) and Windows (x86-64). To build it from
-source instead, install [Rust](https://www.rust-lang.org/tools/install), add
-Rustler to your dependencies:
+source instead, install [Rust](https://www.rust-lang.org/tools/install) 1.92 or
+later, add Rustler to your dependencies:
 
 ```elixir
 {:rustler, ">= 0.0.0", optional: true}
@@ -483,8 +525,14 @@ and set `TYPSTY_BUILD=1` when compiling:
 TYPSTY_BUILD=1 mix deps.compile typsty --force
 ```
 
+or, to always build it from source, configure RustlerPrecompiled:
+
+```elixir
+config :rustler_precompiled, :force_build, typsty: true
+```
+
 Development versions of Typsty (such as a Git dependency on `master`) are always
-built from source.
+built from source, so they need Rust and the Rustler dependency too.
 
 ## Attribution
 
