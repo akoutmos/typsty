@@ -1,0 +1,141 @@
+name: Typsty CI
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  SHELL: sh
+  # Build the NIF from source, since a commit's precompiled NIFs don't exist yet
+  TYPSTY_BUILD: "1"
+  # Link-time optimization is for the released NIFs. Tests don't need it, and it's slow
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  rust_checks:
+    name: Rust checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/typsty_nif
+      - name: Rustfmt
+        working-directory: native/typsty_nif
+        run: cargo fmt --check
+      - name: Clippy
+        working-directory: native/typsty_nif
+        run: cargo clippy -- -D warnings
+
+  static_analysis:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Elixir
+        id: beam
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19.4"
+          otp-version: "28.2"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/typsty_nif
+          shared-key: nif
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: ${{ runner.os }}-deps-v1-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-deps-v1-
+      - name: Install dependencies
+        run: mix deps.get
+      - name: Restore PLT cache
+        uses: actions/cache@v4
+        with:
+          path: priv/plts
+          key: ${{ runner.os }}-plt-v1-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-plt-v1-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-
+      - name: Mix Formatter
+        run: mix format --check-formatted
+      - name: Check for unused dependencies in mix.lock
+        run: mix deps.unlock --check-unused
+      - name: Check for compiler warnings
+        run: mix compile --warnings-as-errors
+      - name: Credo strict checks
+        run: mix credo --strict
+      - name: Doctor documentation checks
+        run: mix doctor
+      - name: Dialyzer
+        run: mix dialyzer --format github
+      - name: Docs build without warnings
+        run: mix docs --warnings-as-errors
+
+  unit_test:
+    name: Tests (Elixir ${{ matrix.version.elixir }}, OTP ${{ matrix.version.otp }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        version:
+          - otp: "27"
+            elixir: "1.18"
+          - otp: "28"
+            elixir: "1.19"
+          - otp: "29"
+            elixir: "1.20"
+            coverage: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.version.elixir }}
+          otp-version: ${{ matrix.version.otp }}
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      # The NIF only depends on the NIF version (2.15), so every job can share its build
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/typsty_nif
+          shared-key: nif
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: ${{ runner.os }}-deps-v1-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-deps-v1-
+      - name: Install dependencies
+        run: mix deps.get
+      - name: ExUnit tests
+        if: ${{ !matrix.version.coverage }}
+        env:
+          MIX_ENV: test
+        run: mix test --warnings-as-errors
+      - name: ExUnit tests with coverage
+        if: ${{ matrix.version.coverage }}
+        env:
+          MIX_ENV: test
+          SHELL: /bin/bash
+        run: mix coveralls.github --warnings-as-errors
