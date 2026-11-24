@@ -213,9 +213,35 @@ defimpl Typsty.Encoder, for: MyApp.Money do
 end
 ```
 
+A template that uses a few assigns a lot can give them short names, by
+destructuring them at its top. The names are then the template's own, so pick
+ones that don't hide anything it uses from Typst, such as `title` or `page`:
+
+```typst
+#let (customer, items) = assigns
+
+= Invoice for #customer.name
+```
+
 `assigns` is bound at the top of the template, like a `#let` binding, so it's
-only visible in the template itself. Files it imports, and packages, can read
-the same dictionary from `sys.inputs`.
+only visible in the template itself. Pass the files it imports, such as
+components, the values they need as arguments, which keeps them independent of
+where their data comes from:
+
+```typst
+// components.typ
+#let line-items(items) = table(
+  columns: 2,
+  ..items.map(item => (item.name, [#item.price])).flatten(),
+)
+```
+
+```typst
+#import "components.typ": line-items
+#line-items(assigns.items)
+```
+
+(Imported files and packages can also read the assigns from `sys.inputs`.)
 
 `render/1` gets the assigns first, so it can compute values for the template
 with all of Elixir:
@@ -348,7 +374,7 @@ A syntax error fails the build with a `Typsty.SyntaxError`:
 
 Errors that depend on the data, such as a missing assign or a value of the
 wrong type, are returned as a `Typsty.RenderError` with the diagnostics Typst
-reported, pointing at the line in your module or `.typ` file:
+reported, pointing at the line in your module or `.typ` file, with hints:
 
 ```elixir
 {:error, %Typsty.RenderError{reason: :typst} = error} = MyApp.Invoice.to_pdf(%{number: 1042}, files: files)
@@ -356,6 +382,7 @@ Exception.message(error)
 #=> failed to render the Typst document:
 #=>
 #=> lib/my_app/invoice.ex:11:24: dictionary does not contain key "customer"
+#=>   hint: there's no "customer" in the assigns. Pass it from Elixir, or read it with `assigns.at("customer", default: none)` if it's optional
 ```
 
 The error's `:reason` tells Typst's errors (`:typst`) apart from renders that

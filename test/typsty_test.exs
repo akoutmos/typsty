@@ -57,6 +57,37 @@ defmodule TypstyTest do
       assert diagnostic.message =~ ~s(dictionary does not contain key "nmae")
     end
 
+    test "hints at assigns that weren't given" do
+      hint =
+        ~s|there's no "customer" in the assigns. Pass it from Elixir, or read it with | <>
+          ~s|`assigns.at("customer", default: none)` if it's optional|
+
+      for source <- ["#assigns.customer.name", ~S|#assigns.at("customer")|, "#let (customer,) = assigns"] do
+        assert {:error, %RenderError{diagnostics: [diagnostic]}} = Typsty.to_pdf(source, %{name: "World"})
+        assert diagnostic.hints == [hint], source
+      end
+
+      # Other dictionaries are left alone
+      for source <- ["#let d = (a: 1)\n#d.customer", "#assigns.items.first().customer"] do
+        assert {:error, %RenderError{diagnostics: [diagnostic]}} = Typsty.to_pdf(source, %{items: [%{}]})
+        assert diagnostic.hints == [], source
+      end
+    end
+
+    test "lets a template give assigns short names, and pass them to components" do
+      source = ~S"""
+      #import "components.typ": greeting
+      #let (name, items) = assigns
+      #assert.eq(greeting(name), "Hello World")
+      #assert.eq(items.len(), 2)
+      """
+
+      components = ~S|#let greeting(name) = "Hello " + name|
+
+      assert {:ok, _pdf} =
+               Typsty.to_pdf(source, %{name: "World", items: [1, 2]}, files: %{"components.typ" => components})
+    end
+
     test "returns errors with hints" do
       assert {:error, %RenderError{diagnostics: [diagnostic]}} = Typsty.to_pdf("#let a = 1\n#let b = 2\n#a-b")
       assert diagnostic.message == "unknown variable: a-b"

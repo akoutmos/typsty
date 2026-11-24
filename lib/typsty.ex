@@ -85,9 +85,34 @@ defmodule Typsty do
     document should show first).
   - Typst's decimals have 28 significant digits, at most 28 of them after the decimal point.
 
+  A template that uses a few assigns a lot can give them short names, by destructuring
+  them at its top. The names are then the template's own, so pick ones that don't hide
+  anything it uses from Typst, such as `title` or `page`:
+
+  ```typst
+  #let (customer, items) = assigns
+
+  = Invoice for #customer.name
+  ```
+
   `assigns` is bound at the top of the template, like a `let` binding, so it's only visible
-  in the template itself. Files it imports, and packages, can read the same dictionary from
-  `sys.inputs`.
+  in the template itself. Pass the files it imports, such as components, the values they
+  need as arguments, which keeps them independent of where their data comes from:
+
+  ```typst
+  // components.typ
+  #let line-items(items) = table(
+    columns: 2,
+    ..items.map(item => (item.name, [#item.price])).flatten(),
+  )
+  ```
+
+  ```typst
+  #import "components.typ": line-items
+  #line-items(assigns.items)
+  ```
+
+  (Imported files and packages can also read the assigns from `sys.inputs`.)
 
   `render/1` gets the assigns before the template does, so it can compute values for it:
 

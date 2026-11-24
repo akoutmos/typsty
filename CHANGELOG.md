@@ -17,7 +17,7 @@ The first release.
 - The assigns (a map) are passed to the template as a dictionary named `assigns` (`#assigns.name`), as Typst values
   rather than generated code, so they never shadow anything in Typst: strings, numbers, booleans, `nil`, lists,
   tuples, maps (as dictionaries sorted by key), dates and times, and decimals. Structs are passed as dictionaries, or
-  as `Typsty.Encoder` encodes them.
+  as `Typsty.Encoder` encodes them. Using an assign that wasn't given comes with a hint that says so.
 - A virtual file system: images, data files and `.typ` files are passed as binaries with the `:files` option. Files
   can also be read from a `:root` directory, which documents can't read outside of, even through symbolic links.
 - Fonts from the system, from Typst's embedded fonts and from `:font_paths`, scanned once per font configuration and

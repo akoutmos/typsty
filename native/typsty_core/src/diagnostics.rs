@@ -1,7 +1,8 @@
 //! Typst's errors and warnings, with their locations, for `Typsty.Diagnostic` structs.
 
 use typst::diag::SourceDiagnostic;
-use typst::syntax::{DiagSpan, Source, SyntaxDiagnostic, VirtualRoot};
+use typst::syntax::ast::{self, Expr};
+use typst::syntax::{DiagSpan, LinkedNode, Side, Source, SyntaxDiagnostic, VirtualRoot};
 use typst::WorldExt;
 
 use crate::world::TypstyWorld;
@@ -71,14 +72,17 @@ impl Diagnostic {
             })
             .collect();
 
+        let mut hints: Vec<String> = diagnostic
+            .hints
+            .iter()
+            .map(|hint| hint.v.to_string())
+            .collect();
+        hints.extend(missing_assign_hint(diagnostic, world));
+
         Self {
             severity,
             message: diagnostic.message.to_string(),
-            hints: diagnostic
-                .hints
-                .iter()
-                .map(|hint| hint.v.to_string())
-                .collect(),
+            hints,
             file,
             line,
             column,
@@ -123,6 +127,53 @@ pub fn from_sources<'a>(
         .into_iter()
         .map(|diagnostic| Diagnostic::from_source(diagnostic, world))
         .collect()
+}
+
+/// A hint for an assign the template uses but wasn't given. Typst reports it like a key
+/// missing from any dictionary, so the hint is only added when the template reads the key
+/// from `assigns`: `assigns.customer`, `assigns.at("customer")`, or
+/// `let (customer,) = assigns`.
+fn missing_assign_hint(diagnostic: &SourceDiagnostic, world: &TypstyWorld) -> Option<String> {
+    // The key is quoted, as a Typst string
+    let key = diagnostic
+        .message
+        .strip_prefix("dictionary does not contain key ")?;
+    let key = key
+        .strip_suffix(" and no default value was specified")
+        .unwrap_or(key);
+
+    if diagnostic.span.id()? != world.main_source().id() {
+        return None;
+    }
+
+    let range = world.range(diagnostic.span)?;
+    let root = LinkedNode::new(world.main_source().root());
+    let mut node = root.leaf_at(range.start, Side::After)?;
+
+    // The nearest expression that reads from a dictionary decides
+    let reads_assigns = loop {
+        if let Some(access) = node.cast::<ast::FieldAccess>() {
+            break is_assigns(access.target());
+        }
+
+        if let Some(call) = node.cast::<ast::FuncCall>() {
+            break matches!(call.callee(), Expr::FieldAccess(access) if is_assigns(access.target()));
+        }
+
+        if let Some(binding) = node.cast::<ast::LetBinding>() {
+            break binding.init().is_some_and(is_assigns);
+        }
+
+        node = node.parent()?.clone();
+    };
+
+    reads_assigns.then(|| {
+        format!("there's no {key} in the assigns. Pass it from Elixir, or read it with `assigns.at({key}, default: none)` if it's optional")
+    })
+}
+
+fn is_assigns(expr: Expr) -> bool {
+    matches!(expr, Expr::Ident(ident) if ident.as_str() == "assigns")
 }
 
 fn range(span: DiagSpan, source: &Source) -> Option<std::ops::Range<usize>> {
