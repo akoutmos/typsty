@@ -1,22 +1,33 @@
 //! The NIF that renders Typst documents inside the BEAM, with `typsty_core`.
 //!
-//! Terms are decoded and encoded on the NIF's own thread, and everything Typst does runs on
-//! a separate thread with a large stack (see `typsty_core::isolate`).
+//! A render doesn't hold a scheduler while Typst works: `start_render` checks the arguments
+//! and returns a job right away, and the render runs on a thread of its own (see
+//! `typsty_core::isolate`). Its result is sent to the process that started it as
+//! `{reference, result}`. The process cancels a render it stops waiting for with
+//! `cancel_render`, and a render whose job is garbage collected (because the process exited)
+//! is cancelled too.
 
 mod value;
 
-use std::time::Duration;
-
-use rustler::{Atom, Binary, Encoder, Env, NewBinary, NifMap, NifStruct, NifUnitEnum, Term};
-use typsty_core::{render, Failure, FontSettings, Format, Output, RenderJob};
+use rustler::env::SavedTerm;
+use rustler::{
+    Atom, Binary, Encoder, Env, LocalPid, NewBinary, NifMap, NifStruct, NifUnitEnum, OwnedEnv,
+    ResourceArc, Term,
+};
+use typsty_core::isolate::{self, Interrupted, Phase, Ticket};
+use typsty_core::{render, FontSettings, Format, Output, RenderJob, Rendered};
 
 mod atoms {
     rustler::atoms! {
         ok,
         error,
-        pdf,
-        png,
-        svg,
+        invalid,
+        typst,
+        crashed,
+        queued,
+        running,
+        finished,
+        abandoned,
     }
 }
 
@@ -41,8 +52,6 @@ struct RenderOptions {
     fonts: FontOptions,
     ppi: f64,
     pdf_standards: Vec<String>,
-    /// In milliseconds, or `nil` to wait for as long as the render takes.
-    timeout: Option<u64>,
     /// How many renders may run at once, counting renders that are being cancelled.
     max_running: usize,
 }
@@ -110,32 +119,54 @@ fn diagnostics(diagnostics: Vec<typsty_core::Diagnostic>) -> Vec<Diagnostic> {
     diagnostics.into_iter().map(Diagnostic::from).collect()
 }
 
-/// Compiles a template and exports it.
+/// A render that was started, which `cancel_render` gives up on. Dropping it (when the
+/// process that started the render exits) gives up on the render too.
+struct Job(Ticket);
+
+#[rustler::resource_impl]
+impl rustler::Resource for Job {}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        self.0.abandon();
+    }
+}
+
+/// Starts compiling and exporting a template, and returns `{:ok, job}` right away, or
+/// `{:error, :invalid, message}` when the arguments are invalid.
 ///
-/// Returns `{:ok, output, warnings}`, where the output is a binary for PDF and a list of
-/// binaries (one per page) for PNG and SVG, `{:error, diagnostics}` when Typst fails, or
-/// `{:error, message}` when the arguments are invalid.
+/// The result is sent to the calling process as `{reference, result}`, where the result is
+/// `{:ok, output, warnings}` (the output is a binary for PDF, and a list of binaries, one per
+/// page, for PNG and SVG), `{:error, :typst, diagnostics}` when Typst fails, or
+/// `{:error, :crashed, message}` when the render ends without a result.
+///
+/// Checking the arguments and copying the files takes a little while for large ones, so this
+/// runs on a dirty scheduler.
 #[rustler::nif(schedule = "DirtyCpu")]
-fn render<'a>(
+fn start_render<'a>(
     env: Env<'a>,
+    reference: Term<'a>,
     template: String,
     variables: Term<'a>,
     files: Vec<(String, Binary<'a>)>,
     options: RenderOptions,
 ) -> Term<'a> {
-    let format = if options.format == atoms::pdf() {
-        Format::Pdf
-    } else if options.format == atoms::png() {
-        Format::Png
-    } else if options.format == atoms::svg() {
-        Format::Svg
-    } else {
-        return (atoms::error(), "unknown format").encode(env);
+    let invalid = |message: String| (atoms::error(), atoms::invalid(), message).encode(env);
+
+    let format = match options
+        .format
+        .to_term(env)
+        .atom_to_string()
+        .ok()
+        .and_then(|name| Format::from_name(&name))
+    {
+        Some(format) => format,
+        None => return invalid("unknown format".into()),
     };
 
     let variables = match value::to_dict(variables) {
         Ok(variables) => variables,
-        Err(message) => return (atoms::error(), message).encode(env),
+        Err(message) => return invalid(message),
     };
 
     let job = RenderJob {
@@ -153,26 +184,101 @@ fn render<'a>(
         pdf_standards: options.pdf_standards,
     };
 
-    let timeout = options.timeout.map(Duration::from_millis);
-    let result = job
-        .render(timeout, Some(options.max_running))
-        .unwrap_or_else(|failure| {
-            Err(Failure::Diagnostics(vec![typsty_core::Diagnostic::error(
-                failure.message(),
-            )]))
+    let job = match job.prepare() {
+        Ok(job) => job,
+        Err(message) => return invalid(message),
+    };
+
+    // The result is encoded on the render's thread, before it's handed over, so that
+    // handing it over only takes sending it. Another copy of the reference is kept for
+    // reporting a render that ends without a result
+    let message = Message::new(reference);
+    let failure = Message::new(reference);
+    let pid = env.pid();
+
+    let started = isolate::start(
+        options.max_running,
+        move |cancellation| {
+            let result = job.render(cancellation);
+            message.encode(|env| encode_result(env, result))
+        },
+        move |result| match result {
+            Ok(message) => message.send(&pid),
+            Err(interrupted) => failure
+                .encode(|env| encode_interrupted(env, interrupted))
+                .send(&pid),
+        },
+    );
+
+    match started {
+        Ok(ticket) => (atoms::ok(), ResourceArc::new(Job(ticket))).encode(env),
+        Err(message) => (atoms::error(), atoms::crashed(), message).encode(env),
+    }
+}
+
+/// A message for the process that started a render, built in an environment of its own so
+/// that it can be sent from the render's thread.
+struct Message {
+    env: OwnedEnv,
+    reference: SavedTerm,
+    term: Option<SavedTerm>,
+}
+
+impl Message {
+    fn new(reference: Term) -> Self {
+        let env = OwnedEnv::new();
+        let reference = env.save(reference);
+
+        Self {
+            env,
+            reference,
+            term: None,
+        }
+    }
+
+    /// Builds the message `{reference, result}`.
+    fn encode(mut self, result: impl for<'a> FnOnce(Env<'a>) -> Term<'a>) -> Self {
+        let term = self.env.run(|env| {
+            let message = (self.reference.load(env), result(env)).encode(env);
+            self.env.save(message)
         });
 
+        self.term = Some(term);
+        self
+    }
+
+    fn send(mut self, pid: &LocalPid) {
+        if let Some(term) = self.term.take() {
+            // The process may have exited, which is fine
+            let _ = self.env.send_and_clear(pid, |env| term.load(env));
+        }
+    }
+}
+
+fn encode_result(env: Env, result: Result<Rendered, Vec<typsty_core::Diagnostic>>) -> Term {
     match result {
         Ok((output, warnings)) => {
             let output = encode_output(env, output);
             (atoms::ok(), output, diagnostics(warnings)).encode(env)
         }
-        Err(Failure::Invalid(message)) => (atoms::error(), message).encode(env),
-        Err(Failure::Diagnostics(errors)) => (atoms::error(), diagnostics(errors)).encode(env),
+        Err(errors) => (atoms::error(), atoms::typst(), diagnostics(errors)).encode(env),
     }
 }
 
-fn encode_output<'a>(env: Env<'a>, output: Output) -> Term<'a> {
+/// A render that ended without a result. Typsty stopping it is reported like Typst's errors.
+fn encode_interrupted(env: Env, interrupted: Interrupted) -> Term {
+    match interrupted {
+        Interrupted::Stopped(message) => (
+            atoms::error(),
+            atoms::typst(),
+            diagnostics(vec![typsty_core::Diagnostic::error(message)]),
+        )
+            .encode(env),
+        other => (atoms::error(), atoms::crashed(), other.message()).encode(env),
+    }
+}
+
+fn encode_output(env: Env, output: Output) -> Term {
     match output {
         Output::Pdf(bytes) => binary(env, &bytes),
         Output::Pages(pages) => pages
@@ -187,6 +293,22 @@ fn binary<'a>(env: Env<'a>, bytes: &[u8]) -> Term<'a> {
     let mut binary = NewBinary::new(env, bytes.len());
     binary.as_mut_slice().copy_from_slice(bytes);
     Binary::from(binary).encode(env)
+}
+
+/// Gives up on a render: a render that's waiting to start never starts, and a running one is
+/// cancelled, and its result isn't sent. Returns the phase the render was in: `:queued`,
+/// `:running`, `:finished` (its result was sent) or `:abandoned`.
+///
+/// The render's thread may be sending its result, which only takes a moment, so this runs on
+/// a dirty scheduler rather than wait on a normal one.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn cancel_render(job: ResourceArc<Job>) -> Atom {
+    match job.0.abandon() {
+        Phase::Queued => atoms::queued(),
+        Phase::Running => atoms::running(),
+        Phase::Finished => atoms::finished(),
+        Phase::Abandoned => atoms::abandoned(),
+    }
 }
 
 /// Checks a template's syntax. Returns the syntax errors, which is an empty list for a valid
@@ -219,10 +341,11 @@ fn font_families(options: FontOptions) -> Vec<String> {
     render::font_families(&options.settings())
 }
 
-/// The number of renders running, including renders that timed out and are being cancelled.
+/// The number of renders running, including renders that were given up on and are still
+/// being cancelled.
 #[rustler::nif]
 fn running_renders() -> usize {
-    typsty_core::isolate::running_renders()
+    isolate::running_renders()
 }
 
 /// The version of the Typst compiler, such as "0.15.1".
@@ -232,7 +355,8 @@ fn typst_version() -> String {
 }
 
 fn load(_env: Env, _info: Term) -> bool {
-    typsty_core::init();
+    // PDF files are refused inside the VM (see `typsty_core::checks`)
+    typsty_core::init(typsty_core::Config { pdf_files: false });
     true
 }
 

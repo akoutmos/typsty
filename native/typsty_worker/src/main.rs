@@ -7,28 +7,36 @@
 //! external term format. Requests are rendered one at a time:
 //!
 //! - request: `{:render, template, variables, files, options}`, with the variables as
-//!   `Typsty.Value` builds them for the NIF, and the same options the NIF takes
-//! - response: the NIF's results: `{:ok, output, warnings}`, `{:error, diagnostics}` or
-//!   `{:error, message}`
+//!   `Typsty.Value` builds them for the NIF, the options the NIF takes, and a `:timeout` in
+//!   milliseconds or `nil`
+//! - response: what the NIF sends: `{:ok, output, warnings}`, `{:error, :typst, diagnostics}`
+//!   or `{:error, :crashed, message}`, or `{:error, :invalid, message}` for invalid arguments
 //!
 //! The process ends, with an exit status the pool understands, when a render runs past its
 //! timeout or the process goes over its memory limit (`--memory-limit BYTES`). Stdout only
 //! carries responses; problems are reported on stderr.
+//!
+//! `typsty_worker --check` starts up as a worker would, prints the protocol version and
+//! exits, for the pool to check that the worker can run before starting any.
 
 mod etf;
 mod memory;
 mod value;
 
-use std::io::{self, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use etf::Term;
-use typsty_core::isolate;
-use typsty_core::{Diagnostic, Failure, FontSettings, Format, Output, RenderJob, Severity};
+use typsty_core::isolate::{self, Interrupted};
+use typsty_core::{Diagnostic, FontSettings, Format, Output, RenderJob, Rendered, Severity};
 
 #[global_allocator]
 static ALLOCATOR: memory::Limited = memory::Limited;
+
+/// The version of the protocol between the pool and the worker, which `--check` prints. The
+/// pool refuses a worker that speaks another version.
+const PROTOCOL_VERSION: u32 = 1;
 
 /// The exit statuses `Typsty.Pool` understands.
 pub mod exit {
@@ -47,17 +55,30 @@ pub mod exit {
     }
 }
 
+struct Arguments {
+    memory_limit: usize,
+    check: bool,
+}
+
 fn main() {
-    let memory_limit = match parse_args(std::env::args().skip(1)) {
-        Ok(limit) => limit,
+    let arguments = match parse_args(std::env::args().skip(1)) {
+        Ok(arguments) => arguments,
         Err(message) => {
             eprintln!("typsty_worker: {message}");
             exit::now(exit::PROTOCOL);
         }
     };
 
-    memory::set_limit(memory_limit);
-    typsty_core::init();
+    memory::set_limit(arguments.memory_limit);
+
+    // A crash here only ends this process, so documents may read PDF files (see
+    // `typsty_core::checks`)
+    typsty_core::init(typsty_core::Config { pdf_files: true });
+
+    if arguments.check {
+        println!("typsty_worker {PROTOCOL_VERSION}");
+        return;
+    }
 
     // Requests are read on a thread of their own, so that the worker notices right away when
     // the pool closes the port, even in the middle of a render, and exits. Closing the port
@@ -69,19 +90,24 @@ fn main() {
         .spawn(move || read_requests(requests))
         .unwrap_or_else(|_| exit::now(exit::PROTOCOL));
 
-    let mut output = io::stdout().lock();
+    // The memory in use after the caches were last cleared (see `trim_caches`)
+    let mut floor = memory::used();
 
     for request in received {
-        let response = handle(&request);
-        drop(request);
+        let response = handle(request);
 
-        if write_frame(&mut output, &response).is_err() {
+        let written = {
+            let mut output = BufWriter::new(io::stdout().lock());
+            etf::write_frame(&response, &mut output).and_then(|()| output.flush())
+        };
+
+        if written.is_err() {
             // The pool is gone
             exit::now(exit::PROTOCOL);
         }
 
         drop(response);
-        trim_caches();
+        trim_caches(&mut floor);
     }
 }
 
@@ -105,22 +131,26 @@ fn read_requests(requests: mpsc::SyncSender<Vec<u8>>) {
     }
 }
 
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<usize, String> {
-    let mut memory_limit = 0;
+fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Arguments, String> {
+    let mut arguments = Arguments {
+        memory_limit: 0,
+        check: false,
+    };
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--memory-limit" => {
-                memory_limit = args
+                arguments.memory_limit = args
                     .next()
                     .and_then(|value| value.parse().ok())
                     .ok_or("--memory-limit needs a number of bytes")?;
             }
+            "--check" => arguments.check = true,
             other => return Err(format!("unknown argument: {other}")),
         }
     }
 
-    Ok(memory_limit)
+    Ok(arguments)
 }
 
 fn read_frame(input: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
@@ -136,55 +166,80 @@ fn read_frame(input: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(frame))
 }
 
-fn write_frame(output: &mut impl Write, frame: &[u8]) -> io::Result<()> {
-    let length = u32::try_from(frame.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "response too large"))?;
+/// Typst's caches speed up later renders, but count against the memory limit. Once they take
+/// half of the room left under the limit, they're dropped, so that the next render has room.
+/// What's left after dropping them (the fonts Typst has loaded, mostly) is the new floor.
+fn trim_caches(floor: &mut usize) {
+    let Some(limit) = memory::limit() else {
+        return;
+    };
 
-    output.write_all(&length.to_be_bytes())?;
-    output.write_all(frame)?;
-    output.flush()
-}
-
-/// Typst's caches speed up later renders, but count against the memory limit. Once they
-/// take half of it, they're dropped, so that the next render has room.
-fn trim_caches() {
-    if let Some(limit) = memory::limit() {
-        if memory::used() > limit / 2 {
-            typsty_core::render::clear_caches();
-        }
+    if memory::used() > *floor + limit.saturating_sub(*floor) / 2 {
+        typsty_core::render::clear_caches();
+        *floor = memory::used();
     }
 }
 
-fn handle(request: &[u8]) -> Vec<u8> {
-    let parsed = etf::decode(request)
-        .map_err(|error| error.to_string())
-        .and_then(|term| parse_request(&term));
+fn handle(request: Vec<u8>) -> Term {
+    let decoded = etf::decode(&request);
+    // The request's files were copied out of it
+    drop(request);
 
-    let response = match parsed {
-        Err(message) => error_message(message),
-        Ok((job, timeout)) => match job.render(timeout, None) {
-            Err(isolate::Failure::TimedOut(_)) => exit::now(exit::TIMEOUT),
-            Err(failure) => error_diagnostics(vec![Diagnostic::error(failure.message())]),
-            Ok(Ok((output, warnings))) => Term::Tuple(vec![
-                Term::atom("ok"),
-                output_term(output),
-                diagnostics_term(warnings),
-            ]),
-            Ok(Err(Failure::Invalid(message))) => error_message(message),
-            Ok(Err(Failure::Diagnostics(errors))) => error_diagnostics(errors),
-        },
+    let job = decoded
+        .map_err(|error| error.to_string())
+        .and_then(parse_request)
+        .and_then(|(job, timeout)| Ok((job.prepare()?, timeout)));
+
+    let (job, timeout) = match job {
+        Ok(job) => job,
+        Err(message) => return error(Term::atom("invalid"), Term::binary(message)),
     };
 
-    etf::encode(&response)
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let (sender, results) = mpsc::sync_channel(1);
+
+    let started = isolate::start(
+        1,
+        move |cancellation| job.render(cancellation),
+        move |result| {
+            let _ = sender.send(result);
+        },
+    );
+
+    if let Err(message) = started {
+        return error(Term::atom("crashed"), Term::binary(message));
+    }
+
+    let result = match deadline {
+        Some(deadline) => results
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            // The render is still running: ending the process is the only way to stop it
+            .unwrap_or_else(|_| exit::now(exit::TIMEOUT)),
+        None => results
+            .recv()
+            .unwrap_or_else(|_| Err(Interrupted::Panicked("unknown".into()))),
+    };
+
+    match result {
+        Ok(Ok(rendered)) => ok(rendered),
+        Ok(Err(errors)) => error(Term::atom("typst"), diagnostics_term(errors)),
+        Err(Interrupted::Stopped(message)) => error(
+            Term::atom("typst"),
+            diagnostics_term(vec![Diagnostic::error(message)]),
+        ),
+        Err(interrupted) => error(Term::atom("crashed"), Term::binary(interrupted.message())),
+    }
 }
 
-fn parse_request(term: &Term) -> Result<(RenderJob, Option<Duration>), String> {
+/// Reads a request, taking its binaries out of it rather than copying them.
+fn parse_request(term: Term) -> Result<(RenderJob, Option<Duration>), String> {
     let invalid = || "invalid request".to_string();
 
     let Term::Tuple(elements) = term else {
         return Err(invalid());
     };
-    let [Term::Atom(tag), template, variables, files, Term::Map(options)] = elements.as_slice()
+    let Ok([Term::Atom(tag), template, variables, files, Term::Map(options)]) =
+        <[Term; 5]>::try_from(elements)
     else {
         return Err(invalid());
     };
@@ -203,7 +258,7 @@ fn parse_request(term: &Term) -> Result<(RenderJob, Option<Duration>), String> {
     let format = option("format")?
         .as_atom()
         .and_then(Format::from_name)
-        .ok_or("unknown format")?;
+        .ok_or("invalid request: unknown format")?;
 
     let Term::Map(fonts) = option("fonts")? else {
         return Err(invalid());
@@ -216,23 +271,31 @@ fn parse_request(term: &Term) -> Result<(RenderJob, Option<Duration>), String> {
             .ok_or_else(invalid)
     };
 
-    let files = match files {
-        Term::List(files) => files
-            .iter()
-            .map(|file| match file {
-                Term::Tuple(pair) => match pair.as_slice() {
-                    [path, Term::Binary(bytes)] => Ok((string(path)?, bytes.clone())),
-                    _ => Err(invalid()),
-                },
+    let Term::List(files) = files else {
+        return Err(invalid());
+    };
+    let files = files
+        .into_iter()
+        .map(|file| match file {
+            Term::Tuple(pair) => match <[Term; 2]>::try_from(pair) {
+                Ok([path, Term::Binary(bytes)]) => Ok((string(&path)?, bytes)),
                 _ => Err(invalid()),
-            })
-            .collect::<Result<_, _>>()?,
+            },
+            _ => Err(invalid()),
+        })
+        .collect::<Result<_, _>>()?;
+
+    let timeout = match option("timeout")? {
+        Term::Integer(milliseconds) if *milliseconds > 0 => {
+            Some(Duration::from_millis(*milliseconds as u64))
+        }
+        term if term.as_atom() == Some("nil") => None,
         _ => return Err(invalid()),
     };
 
     let job = RenderJob {
-        template: string(template)?,
-        variables: value::to_dict(variables)?,
+        template: string(&template)?,
+        variables: value::to_dict(&variables)?,
         files,
         format,
         root: optional_string(option("root")?)?,
@@ -246,22 +309,13 @@ fn parse_request(term: &Term) -> Result<(RenderJob, Option<Duration>), String> {
         pdf_standards: strings(option("pdf_standards")?)?,
     };
 
-    let timeout = match option("timeout")? {
-        Term::Integer(milliseconds) if *milliseconds > 0 => {
-            Some(Duration::from_millis(*milliseconds as u64))
-        }
-        term if term.as_atom() == Some("nil") => None,
-        _ => return Err(invalid()),
-    };
-
     Ok((job, timeout))
 }
 
 fn string(term: &Term) -> Result<String, String> {
     match term {
-        Term::Binary(bytes) => {
-            String::from_utf8(bytes.clone()).map_err(|_| "invalid string".into())
-        }
+        Term::Binary(bytes) => String::from_utf8(bytes.clone())
+            .map_err(|_| "invalid request: a string isn't valid UTF-8".into()),
         _ => Err("invalid request: expected a string".into()),
     }
 }
@@ -296,19 +350,17 @@ fn number(term: &Term) -> Result<f64, String> {
     }
 }
 
-fn error_message(message: String) -> Term {
-    Term::Tuple(vec![Term::atom("error"), Term::binary(message)])
-}
-
-fn error_diagnostics(diagnostics: Vec<Diagnostic>) -> Term {
-    Term::Tuple(vec![Term::atom("error"), diagnostics_term(diagnostics)])
-}
-
-fn output_term(output: Output) -> Term {
-    match output {
+fn ok((output, warnings): Rendered) -> Term {
+    let output = match output {
         Output::Pdf(bytes) => Term::Binary(bytes),
         Output::Pages(pages) => Term::List(pages.into_iter().map(Term::Binary).collect()),
-    }
+    };
+
+    Term::Tuple(vec![Term::atom("ok"), output, diagnostics_term(warnings)])
+}
+
+fn error(reason: Term, details: Term) -> Term {
+    Term::Tuple(vec![Term::atom("error"), reason, details])
 }
 
 fn diagnostics_term(diagnostics: Vec<Diagnostic>) -> Term {

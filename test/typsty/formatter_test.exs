@@ -99,6 +99,20 @@ defmodule Typsty.FormatterTest do
         )
       end
 
-    assert {error.file, error.line} == {"lib/doc.ex", 12}
+    # The formatter isn't told the sigil's column or indentation, so the error has no column
+    assert {error.file, error.line, error.column} == {"lib/doc.ex", 12, nil}
+
+    error =
+      assert_raise Typsty.SyntaxError, fn ->
+        Formatter.format("Fine\n#let x = (1, 2\n", extension: ".typ", file: "lib/doc.typ")
+      end
+
+    assert {error.file, error.line, error.column} == {"lib/doc.typ", 2, 10}
+  end
+
+  test "raises for invalid options, naming the formatter's option" do
+    assert_raise ArgumentError, ~r/the :typst_line_length formatter option is invalid, got: 0/, fn ->
+      Formatter.format("x", extension: ".typ", typst_line_length: 0)
+    end
   end
 end

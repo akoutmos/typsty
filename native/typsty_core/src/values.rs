@@ -12,12 +12,20 @@
 
 use std::str::FromStr;
 
-use typst::foundations::{Datetime, Decimal, Value};
+use typst::foundations::{Datetime, Decimal, Dict, Str, Value};
 
 /// How deeply lists and maps may be nested. Typst recurses into values when it hashes,
 /// compares and prints them, and the NIF converts them on a scheduler thread, which has a
 /// small stack. `Typsty.Value` enforces the same limit with a better error message.
 pub const MAX_DEPTH: usize = 256;
+
+/// A dictionary of a map's entries, sorted by key. Erlang maps have no order of their own,
+/// and the order the NIF and the worker see a map's entries in differs, so sorting gives
+/// every dictionary the same, predictable order.
+pub fn dict(mut entries: Vec<(Str, Value)>) -> Dict {
+    entries.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+    entries.into_iter().collect()
+}
 
 pub fn invalid(message: &str) -> String {
     format!("invalid variables: {message}")

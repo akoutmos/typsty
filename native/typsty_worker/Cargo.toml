@@ -3,14 +3,11 @@ name = "typsty_worker"
 description = "Renders Typst documents for Typsty.Pool, in a process of its own"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
-
-[[bin]]
-name = "typsty_worker"
-path = "src/main.rs"
 
 [dependencies]
 typsty_core.workspace = true
 typst.workspace = true
 # To exit at once when a render times out or uses too much memory
-libc = "0.2"
+libc.workspace = true

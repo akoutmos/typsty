@@ -15,7 +15,6 @@ defmodule TypstyTest do
 
     test "binds the assigns as variables" do
       assert {:ok, _pdf} = Typsty.to_pdf(~s|#assert.eq(name, "World")|, %{name: "World"})
-      assert {:ok, _pdf} = Typsty.to_pdf(~s|#assert.eq(name, "World")|, name: "World")
       assert {:ok, _pdf} = Typsty.to_pdf(~s|#assert.eq(name, "World")|, %{"name" => "World"})
     end
 
@@ -78,8 +77,13 @@ defmodule TypstyTest do
       assert {:error, %RenderError{diagnostics: [%{message: "PDF/A-2b error: missing document date"}]}} =
                Typsty.to_pdf("#set document(title: [Doc], date: none)\nHello", %{}, pdf_standards: ["a-2b"])
 
-      assert {:error, %RenderError{diagnostics: [%{message: "unknown PDF standard: z-1"}]}} =
-               Typsty.to_pdf("Hello", %{}, pdf_standards: ["z-1"])
+      assert_raise ArgumentError, ~r/unknown PDF standard in the :pdf_standards option: "z-1"/, fn ->
+        Typsty.to_pdf("Hello", %{}, pdf_standards: ["z-1"])
+      end
+
+      assert_raise ArgumentError, ~r/invalid :pdf_standards option/, fn ->
+        Typsty.to_pdf("Hello", %{}, pdf_standards: ["a-2b", "a-3b"])
+      end
     end
 
     test "raises for invalid variable names" do
@@ -90,6 +94,40 @@ defmodule TypstyTest do
       assert_raise ArgumentError, ~r/"for" is not a valid Typst variable name/, fn ->
         Typsty.to_pdf("x", %{for: 1})
       end
+
+      # Binding `_` would discard the value
+      assert_raise ArgumentError, ~r/"_" is not a valid Typst variable name/, fn ->
+        Typsty.to_pdf("x", %{_: 1})
+      end
+    end
+
+    test "raises for assigns that aren't a map, which keeps options from being taken for them" do
+      assert_raise ArgumentError,
+                   ~r/the assigns must be a map, got a list: \[ppi: 300\]. Options go in the argument after the assigns/,
+                   fn ->
+                     Typsty.to_png("x", ppi: 300)
+                   end
+
+      assert_raise ArgumentError, ~r/the assigns must be a map, got a URI struct/, fn ->
+        Typsty.to_pdf("x", URI.parse("https://typst.app"))
+      end
+    end
+
+    test "raises for templates that aren't Typst source" do
+      assert_raise ArgumentError, ~r/the Typst source isn't valid UTF-8/, fn -> Typsty.to_pdf(<<"= Hi ", 0xFF>>) end
+      assert_raise ArgumentError, ~r/the Typst source isn't valid UTF-8/, fn -> Typsty.validate(<<0xFF>>) end
+      assert_raise ArgumentError, ~r/the Typst source isn't valid UTF-8/, fn -> Typsty.format(<<0xFF>>) end
+
+      assert_raise ArgumentError,
+                   ~r/To render a document module, call its functions, like Typsty.Test.Greeting.to_pdf/,
+                   fn ->
+                     Typsty.to_pdf(Typsty.Test.Greeting, %{})
+                   end
+    end
+
+    test "ignores a byte order mark at the start of the template" do
+      assert {:ok, _pdf} = Typsty.to_pdf("\uFEFF= Title\n#context assert.eq(query(heading).len(), 1)")
+      assert Typsty.validate("\uFEFF= Title") == :ok
     end
 
     test "raises for invalid options" do
@@ -100,7 +138,20 @@ defmodule TypstyTest do
         Typsty.to_pdf("x", %{}, font_paths: "fonts")
       end
 
-      assert_raise ArgumentError, ~r/must be a map or a keyword list/, fn -> Typsty.to_pdf("x", [1, 2]) end
+      assert_raise ArgumentError, ~r/the options must be a keyword list/, fn -> Typsty.to_pdf("x", %{}, %{ppi: 1}) end
+      assert_raise ArgumentError, ~r/:root option must be a path/, fn -> Typsty.to_pdf("x", %{}, root: :foo) end
+
+      assert_raise ArgumentError, ~r/:timeout option must be a positive integer \(at most 4294967295\)/, fn ->
+        Typsty.to_pdf("x", %{}, timeout: 5_000_000_000)
+      end
+
+      assert_raise ArgumentError, ~r/:pool option names no running Typsty.Pool: :no_such_pool/, fn ->
+        Typsty.to_pdf("x", %{}, pool: :no_such_pool)
+      end
+
+      assert_raise ArgumentError, ~r/:pool option must be the name or pid of a Typsty.Pool, or nil/, fn ->
+        Typsty.to_pdf("x", %{}, pool: false)
+      end
     end
   end
 

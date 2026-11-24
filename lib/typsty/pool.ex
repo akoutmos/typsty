@@ -2,8 +2,9 @@ defmodule Typsty.Pool do
   @moduledoc """
   A pool of worker processes that render documents outside of the BEAM.
 
-  By default, Typsty renders inside your VM, with a NIF. That's the fastest way to render,
-  and it's protected against everything data can do (see the README). A template is code,
+  By default, Typsty renders inside your VM. That's the fastest way to render, and it's
+  protected against everything the data can do (see
+  [What a template can do](Typsty.html#module-what-a-template-can-do)). A template is code,
   though, and a template that loops for a long time or allocates without bound can only be
   stopped by ending the process it runs in. The pool runs renders in separate OS processes,
   so that it can:
@@ -12,7 +13,8 @@ defmodule Typsty.Pool do
   - **limit the memory** a render can use, ending its worker when it goes over
   - **contain crashes**: a worker that dies takes nothing else down
 
-  A worker that's ended is replaced with a new one.
+  A worker that's ended is replaced with a new one. Documents rendered in a pool can also
+  read PDF files, which renders inside the VM refuse.
 
   ## Usage
 
@@ -33,8 +35,14 @@ defmodule Typsty.Pool do
   ```
 
   Renders return what they return without a pool: the same output, warnings and errors,
-  pointing at the same lines. Three errors are particular to the pool: a render that runs
-  past its timeout, a render that goes over the memory limit, and a worker that crashes.
+  pointing at the same lines. Some errors are particular to the pool (see
+  `Typsty.RenderError`): a render that runs past its timeout (`:timeout`), a render that
+  waits past its timeout for a free worker (`:busy`), a render that goes over the memory
+  limit (`:memory_limit`), and a worker that crashes or a pool that stops during the render
+  (`:crashed`). A render can take up to a second longer than its timeout, while its worker
+  is stopped.
+
+  A pool serves the processes on its own node.
 
   ## Options
 
@@ -42,19 +50,30 @@ defmodule Typsty.Pool do
   - `:size` - the number of workers, which is how many renders can run at once. Defaults to
     the number of CPU cores (`System.schedulers_online/0`). A render waits for a free
     worker, within its timeout.
-  - `:memory_limit` - the most memory, in bytes, a worker may use, counting what Typst
-    caches between renders (the cache is cleared when it takes half of the limit). A render
-    that goes over it fails, and its worker is replaced. Defaults to `nil`, for no limit.
+  - `:memory_limit` - the most memory, in bytes, each worker may use. A render that goes over
+    it fails, and its worker is replaced. Defaults to `nil`, for no limit. See below.
   - `:max_renders` - replaces each worker after this many renders, which bounds the memory
-    a long-running worker holds on to. Defaults to `nil`, to keep workers for as long as they
-    work.
+    a long-running worker holds on to, and gives it a fresh table of file paths (see
+    [Files](Typsty.html#module-files)). Defaults to `nil`, to keep workers for as long as
+    they work.
+
+  ## Memory
+
+  The memory limit counts what a worker allocates: the document being rendered, Typst's
+  caches, and the fonts it has loaded, which it keeps (system fonts can be large: an emoji
+  font can take 200 MB). Allow for those, and for the files a render is given, which the
+  worker holds while it renders. Each worker keeps its own fonts and caches, so a pool uses
+  up to `size` times as much. The limit doesn't count thread stacks or the allocator's
+  overhead, so the operating system sees somewhat more.
+
+  A worker drops Typst's caches once they take half of the room left under the limit.
 
   ## How it works
 
   Each worker runs `typsty_worker`, a program built from the same code as the NIF, which
   Typsty installs next to it. The pool talks to it through a port. A worker renders one
   document at a time, and keeps Typst's caches and its fonts between renders, like the
-  NIF does.
+  NIF does. When the pool starts, it checks that the program runs.
 
   A worker exits as soon as its port closes, even in the middle of a render. That happens
   when a render times out, when the process that asked for the render exits, when the pool
@@ -73,6 +92,10 @@ defmodule Typsty.Pool do
   # The exit statuses of typsty_worker (native/typsty_worker/src/main.rs)
   @exit_memory_limit 85
   @exit_timeout 86
+  @exit_protocol 87
+
+  # The version of the protocol between the pool and the worker, which `--check` prints
+  @protocol_version 1
 
   # How long to wait for a worker to end itself after a render's timeout, before ending it
   @grace_period 1_000
@@ -88,6 +111,8 @@ defmodule Typsty.Pool do
 
   @doc """
   Starts a pool. See the module documentation for the options.
+
+  Raises if the worker program can't run, before starting any workers.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -97,12 +122,15 @@ defmodule Typsty.Pool do
     memory_limit = opts[:memory_limit] && positive_integer!(opts[:memory_limit], :memory_limit)
     max_renders = opts[:max_renders] && positive_integer!(opts[:max_renders], :max_renders)
 
+    executable = executable!()
+    args = if(memory_limit, do: ["--memory-limit", Integer.to_string(memory_limit)], else: [])
+    check_worker!(executable, args, memory_limit)
+
     pool_state = %{
-      executable: executable!(),
-      args: if(memory_limit, do: ["--memory-limit", Integer.to_string(memory_limit)], else: []),
+      executable: executable,
+      args: args,
       memory_limit: memory_limit,
-      max_renders: max_renders,
-      size: size
+      max_renders: max_renders
     }
 
     nimble_opts = [worker: {__MODULE__, pool_state}, pool_size: size]
@@ -123,6 +151,35 @@ defmodule Typsty.Pool do
     end
   end
 
+  # Starts the worker program once, the way the workers start, so that a program that can't
+  # run fails here rather than in every render
+  defp check_worker!(executable, args, memory_limit) do
+    result =
+      try do
+        System.cmd(executable, ["--check" | args], stderr_to_stdout: true)
+      rescue
+        error in ErlangError ->
+          reraise RuntimeError,
+                  [message: "Typsty.Pool can't run its worker program at #{executable}: #{Exception.message(error)}"],
+                  __STACKTRACE__
+      end
+
+    case result do
+      {output, 0} ->
+        if String.trim(output) != "typsty_worker #{@protocol_version}" do
+          raise "Typsty.Pool's worker program at #{executable} is from another version of Typsty. " <>
+                  "Recompile Typsty with `mix deps.compile typsty --force`"
+        end
+
+      {_output, @exit_memory_limit} ->
+        raise ArgumentError, "the :memory_limit option (#{memory_limit} bytes) is too low for a worker to start"
+
+      {output, status} ->
+        raise "Typsty.Pool's worker program at #{executable} failed to start (#{describe_exit(status)}): " <>
+                String.trim(output)
+    end
+  end
+
   defp positive_integer!(value, _option) when is_integer(value) and value > 0, do: value
 
   defp positive_integer!(value, option) do
@@ -130,43 +187,71 @@ defmodule Typsty.Pool do
   end
 
   @doc false
-  # Renders in a worker. Takes the arguments of Typsty.Native.render/4 (the pool name
-  # aside), and returns what it returns.
-  @spec __render__(NimblePool.pool(), String.t(), map(), [{String.t(), binary()}], map()) ::
-          {:ok, binary() | [binary()], [Diagnostic.t()]} | {:error, [Diagnostic.t()] | String.t()}
+  # Renders in a worker. Takes the arguments of Typsty.Native.start_render/5 (the pool
+  # aside), and returns what the NIF sends, or {:error, reason, message}.
+  @spec __render__(pid(), String.t(), map(), [{String.t(), binary()}], map()) ::
+          {:ok, binary() | [binary()], [Diagnostic.t()]}
+          | {:error, :typst, [Diagnostic.t()]}
+          | {:error, atom(), String.t()}
   def __render__(pool, template, variables, files, options) do
-    timeout = options.timeout
-    deadline = timeout && System.monotonic_time(:millisecond) + timeout
+    deadline = options.timeout && System.monotonic_time(:millisecond) + options.timeout
 
     NimblePool.checkout!(
       pool,
       :render,
       fn {pool_pid, _ref}, worker -> render_in(worker, pool_pid, {template, variables, files, options}, deadline) end,
-      timeout || :infinity
+      options.timeout || :infinity
     )
   catch
-    :exit, {:timeout, {NimblePool, :checkout, _}} ->
-      message = "rendering didn't start within the timeout (#{options.timeout} ms): every worker in the pool was busy"
-      {:error, [error(message)]}
+    :exit, {:timeout, {NimblePool, :checkout, _}} -> busy(options.timeout)
   end
 
-  defp render_in(%{port: port} = worker, pool_pid, {template, variables, files, options}, deadline) do
-    case remaining(deadline) do
-      remaining when remaining == :infinity or remaining > 0 ->
-        timeout = if remaining == :infinity, do: nil, else: remaining
-        request = {:render, template, variables, files, %{options | timeout: timeout}}
-        Port.command(port, :erlang.term_to_binary(request))
-
+  defp render_in(%{port: port} = worker, pool_pid, request, deadline) do
+    case take(port) do
+      {:ok, monitor} ->
         port
-        |> await(worker, remaining, options.timeout)
-        |> give_back(worker, pool_pid)
+        |> send_request(request, remaining(deadline), monitor, worker)
+        |> give_back(worker, pool_pid, monitor)
 
-      _expired ->
-        {timed_out(options.timeout), give_back_port(worker, pool_pid)}
+      :error ->
+        {{:error, :crashed, "the render's worker had exited"}, :remove}
     end
   end
 
-  defp await(port, worker, remaining, timeout) do
+  defp send_request(port, {template, variables, files, options}, remaining, monitor, worker)
+       when remaining == :infinity or remaining > 0 do
+    timeout = if remaining == :infinity, do: nil, else: remaining
+    request = {:render, template, variables, files, %{options | timeout: timeout}}
+    Port.command(port, :erlang.term_to_iovec(request))
+
+    await(port, monitor, worker, remaining, options.timeout)
+  end
+
+  # The deadline passed while waiting for a worker
+  defp send_request(_port, {_template, _variables, _files, options}, _expired, _monitor, _worker) do
+    {:reply, busy(options.timeout)}
+  end
+
+  # The worker's port is taken over for the render, so that its messages come here. It's
+  # monitored rather than linked: a pool that stops while the port is here ends the port,
+  # which must not end this process too.
+  defp take(port) do
+    Port.connect(port, self())
+    Process.unlink(port)
+
+    receive do
+      {:EXIT, ^port, _reason} -> :ok
+    after
+      0 -> :ok
+    end
+
+    {:ok, Port.monitor(port)}
+  rescue
+    # The worker exited while it was in the pool
+    ArgumentError -> :error
+  end
+
+  defp await(port, monitor, worker, remaining, timeout) do
     wait = if remaining == :infinity, do: :infinity, else: remaining + @grace_period
 
     receive do
@@ -175,6 +260,9 @@ defmodule Typsty.Pool do
 
       {^port, {:exit_status, status}} ->
         {:exited, exit_error(status, worker, timeout)}
+
+      {:DOWN, ^monitor, :port, ^port, _reason} ->
+        {:exited, {:error, :crashed, "the pool stopped during the render"}}
     after
       wait ->
         # Closing the port ends the worker
@@ -183,20 +271,26 @@ defmodule Typsty.Pool do
     end
   end
 
-  defp give_back({:reply, reply}, worker, pool_pid), do: {reply, give_back_port(worker, pool_pid)}
+  defp give_back({:reply, reply}, %{port: port}, pool_pid, monitor) do
+    Process.demonitor(monitor, [:flush])
+    {reply, give_back_port(port, pool_pid)}
+  end
 
-  defp give_back({:exited, error}, %{port: port}, _pool_pid) do
+  defp give_back({:exited, error}, %{port: port}, _pool_pid, monitor) do
+    Process.demonitor(monitor, [:flush])
     close(port)
     {error, :remove}
   end
 
   # The port goes back to the pool with the worker
-  defp give_back_port(%{port: port}, pool_pid) do
+  defp give_back_port(port, pool_pid) do
     Port.connect(port, pool_pid)
-    Process.unlink(port)
     :ok
   rescue
-    ArgumentError -> :remove
+    # The port or the pool is gone
+    ArgumentError ->
+      close(port)
+      :remove
   end
 
   defp close(port) do
@@ -221,19 +315,26 @@ defmodule Typsty.Pool do
   defp exit_error(@exit_timeout, _worker, timeout), do: timed_out(timeout)
 
   defp exit_error(@exit_memory_limit, worker, _timeout) do
-    {:error,
-     [error("the render used more than the pool's memory limit (#{worker.memory_limit} bytes), and was stopped")]}
+    {:error, :memory_limit,
+     "the render used more than the pool's memory limit (#{worker.memory_limit} bytes), and was stopped"}
   end
 
   defp exit_error(status, _worker, _timeout) do
-    {:error, [error("the render's worker crashed (it exited with status #{status})")]}
+    {:error, :crashed, "the render's worker crashed (#{describe_exit(status)})"}
   end
+
+  defp describe_exit(@exit_protocol), do: "it couldn't read its request"
+  defp describe_exit(137), do: "it was killed by signal 9, perhaps by the system, for running out of memory"
+  defp describe_exit(status) when status > 128, do: "it was killed by signal #{status - 128}"
+  defp describe_exit(status), do: "it exited with status #{status}"
 
   defp timed_out(timeout) do
-    {:error, [error("rendering didn't finish within the timeout (#{timeout} ms), and was stopped")]}
+    {:error, :timeout, "rendering didn't finish within the timeout (#{timeout} ms), and its worker was stopped"}
   end
 
-  defp error(message), do: %Diagnostic{severity: :error, message: message}
+  defp busy(timeout) do
+    {:error, :busy, "rendering didn't start within the timeout (#{timeout} ms): every worker in the pool was busy"}
+  end
 
   # NimblePool callbacks
 
@@ -254,20 +355,21 @@ defmodule Typsty.Pool do
   end
 
   @impl NimblePool
-  # The port is handed to the process rendering with it, which receives its messages
-  def handle_checkout(:render, {pid, _ref}, %{port: port} = worker, pool_state) do
-    Port.connect(port, pid)
+  # The process rendering with the worker takes its port over (see take/1)
+  def handle_checkout(:render, _from, worker, pool_state) do
     {:ok, worker, worker, pool_state}
   end
 
   @impl NimblePool
-  def handle_checkin(:ok, _from, worker, %{max_renders: max_renders} = pool_state) do
+  def handle_checkin(:ok, _from, %{port: port} = worker, %{max_renders: max_renders} = pool_state) do
     worker = %{worker | renders: worker.renders + 1}
 
-    if max_renders && worker.renders >= max_renders do
-      {:remove, :max_renders, pool_state}
-    else
-      {:ok, worker, pool_state}
+    cond do
+      # The worker exited after its render. The pool didn't see that happen, since the
+      # worker wasn't in the pool then
+      Port.info(port) == nil -> {:remove, :exited, pool_state}
+      max_renders && worker.renders >= max_renders -> {:remove, :max_renders, pool_state}
+      true -> {:ok, worker, pool_state}
     end
   end
 

@@ -1,8 +1,9 @@
 //! The environment a document is compiled in: its source, variables, files and fonts.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use typst::diag::{FileError, FileResult, PackageError};
 use typst::foundations::{Bytes, Datetime, Dict, Duration};
@@ -15,7 +16,7 @@ use typst_kit::fonts::FontStore;
 use typst_kit::packages::FsPackages;
 
 use crate::checks;
-use crate::isolate::Cancellation;
+use crate::isolate::{self, Cancellation};
 
 /// The path of the main source file in the project.
 pub const MAIN_PATH: &str = "/main.typ";
@@ -28,13 +29,32 @@ pub static MAIN_ID: LazyLock<FileId> = LazyLock::new(|| {
     ))
 });
 
-/// Typst gives every file path an id that lasts for the life of the VM, and it can only
-/// make 65,535 of them: after that, it panics, and every later compilation fails until the
-/// VM restarts. So the paths given in `:files` are capped below that, leaving room for the
-/// files Typst reads itself (imports, packages and files read from disk).
-const MAX_FILE_PATHS: usize = 50_000;
+// Typst gives every file path an id that lasts for the life of the VM, and it can only make
+// 65,535 of them: after that, it panics while holding the lock on its table of paths, and
+// every later render fails until the VM restarts. Typsty keeps well away from that:
+//
+// - a render may use at most `MAX_RENDER_FILES` paths, so one document can't use them up
+// - once the ids reach `MAX_FILE_ID`, renders that need a new path are stopped
+// - the paths given in `:files` are capped at `MAX_GIVEN_PATHS`, leaving room for the files
+//   Typst reads itself (imports, packages and files read from disk)
+//
+// Typst creates the id of a path just before it asks the world for the file, so the world
+// sees every new id as it's created.
 
-static FILE_PATHS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+/// The most distinct file paths one render may use.
+pub const MAX_RENDER_FILES: usize = 10_000;
+
+/// The highest file id renders may use. Typst's last one is 65,535; the rest is room for the
+/// ids that renders running at the same time create before they're stopped.
+pub const MAX_FILE_ID: u16 = 64_000;
+
+/// The most distinct paths that may be given in `:files`, over the life of the VM.
+pub const MAX_GIVEN_PATHS: usize = 50_000;
+
+/// The highest file id seen.
+static HIGHEST_FILE_ID: AtomicU16 = AtomicU16::new(0);
+
+static GIVEN_PATHS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// The standard library for documents without variables.
 static LIBRARY: LazyLock<LazyHash<Library>> = LazyLock::new(|| LazyHash::new(Library::default()));
@@ -45,34 +65,26 @@ const KEYWORDS: &[&str] = &[
     "else", "for", "in", "while", "break", "continue", "return", "import", "include", "as",
 ];
 
-pub struct TypstyWorld {
+/// What a document reads, checked before its render starts (see `Prepared::new`).
+pub struct Prepared {
     library: Option<LazyHash<Library>>,
-    fonts: Arc<FontStore>,
     main: Source,
-    /// The number of lines added before the template to bind its variables.
     preamble_lines: usize,
-    /// The files given to the render, which take precedence over the root directory. A file
-    /// that failed the checks in `checks` holds its error.
-    files: HashMap<FileId, FileResult<Bytes>>,
+    files: HashMap<FileId, Bytes>,
     root: Option<FsRoot>,
     packages: Vec<FsPackages>,
-    /// Files read from the root directory or from packages, and parsed sources.
-    loaded: Mutex<HashMap<FileId, FileResult<Bytes>>>,
-    sources: Mutex<HashMap<FileId, Source>>,
-    now: time::OffsetDateTime,
-    cancellation: Cancellation,
 }
 
-pub struct WorldOptions {
-    pub files: Vec<(String, Vec<u8>)>,
-    pub root: Option<String>,
-    pub package_paths: Vec<String>,
-    pub fonts: Arc<FontStore>,
-    pub cancellation: Cancellation,
-}
-
-impl TypstyWorld {
-    pub fn new(template: &str, variables: Dict, options: WorldOptions) -> Result<Self, String> {
+impl Prepared {
+    /// Checks the variable names and file paths, which is quick: fonts and files are only
+    /// read when the document renders. The error describes invalid arguments.
+    pub fn new(
+        template: &str,
+        variables: Dict,
+        files: Vec<(String, Vec<u8>)>,
+        root: Option<String>,
+        package_paths: Vec<String>,
+    ) -> Result<Self, String> {
         // The variables are passed in sys.inputs, and bound as regular variables at the top of
         // the main file. Like `let` bindings in the template itself, they're only visible in
         // the main file: they don't shadow the standard library in imported files and packages
@@ -97,9 +109,9 @@ impl TypstyWorld {
             (Some(LazyHash::new(library)), preamble, 1)
         };
 
-        let mut files = HashMap::with_capacity(options.files.len());
-        for (path, bytes) in options.files {
-            let id = project_file(&path)?;
+        let mut given = HashMap::with_capacity(files.len());
+        for (path, bytes) in files {
+            let id = given_file(&path)?;
 
             if id == *MAIN_ID {
                 return Err(format!(
@@ -107,29 +119,70 @@ impl TypstyWorld {
                 ));
             }
 
-            let checked = checks::check(&bytes)
-                .map(|()| Bytes::new(bytes))
-                .map_err(|problem| FileError::Other(Some(problem.into())));
-            files.insert(id, checked);
+            if given.insert(id, Bytes::new(bytes)).is_some() {
+                return Err(format!(
+                    "the :files option has the path {path:?} more than once (paths are relative to the project root, so \"logo.png\" and \"/logo.png\" are the same file)"
+                ));
+            }
         }
+
+        // Files are confined to the root even through symbolic links, which is checked
+        // against the root's real path
+        let root = root.map(|root| {
+            let root = PathBuf::from(root);
+            FsRoot::new(std::fs::canonicalize(&root).unwrap_or(root))
+        });
 
         Ok(Self {
             library,
-            fonts: options.fonts,
-            main: Source::new(*MAIN_ID, preamble + template),
+            main: Source::new(*MAIN_ID, preamble + strip_bom(template)),
             preamble_lines,
-            files,
-            root: options.root.map(|root| FsRoot::new(root.into())),
-            packages: options
-                .package_paths
-                .into_iter()
-                .map(FsPackages::new)
-                .collect(),
-            loaded: Mutex::new(HashMap::new()),
-            sources: Mutex::new(HashMap::new()),
-            now: time::OffsetDateTime::now_utc(),
-            cancellation: options.cancellation,
+            files: given,
+            root,
+            packages: package_paths.into_iter().map(FsPackages::new).collect(),
         })
+    }
+}
+
+pub struct TypstyWorld {
+    library: Option<LazyHash<Library>>,
+    fonts: Arc<FontStore>,
+    main: Source,
+    /// The number of lines added before the template to bind its variables.
+    preamble_lines: usize,
+    /// The files given to the render, which take precedence over the root directory.
+    files: HashMap<FileId, Bytes>,
+    root: Option<FsRoot>,
+    packages: Vec<FsPackages>,
+    /// Files read from the root directory or from packages, before they're checked.
+    loaded: Mutex<HashMap<FileId, FileResult<Bytes>>>,
+    /// Files that were checked (see `checks`): only files the document reads as data are, not
+    /// the sources it imports.
+    checked: Mutex<HashMap<FileId, FileResult<()>>>,
+    sources: Mutex<HashMap<FileId, Source>>,
+    /// The file ids the render used, to limit how many paths it may use.
+    used: Mutex<HashSet<FileId>>,
+    now: time::OffsetDateTime,
+    cancellation: Cancellation,
+}
+
+impl TypstyWorld {
+    pub fn new(prepared: Prepared, fonts: Arc<FontStore>, cancellation: Cancellation) -> Self {
+        Self {
+            library: prepared.library,
+            fonts,
+            main: prepared.main,
+            preamble_lines: prepared.preamble_lines,
+            files: prepared.files,
+            root: prepared.root,
+            packages: prepared.packages,
+            loaded: Mutex::new(HashMap::new()),
+            checked: Mutex::new(HashMap::new()),
+            sources: Mutex::new(HashMap::new()),
+            used: Mutex::new(HashSet::new()),
+            now: time::OffsetDateTime::now_utc(),
+            cancellation,
+        }
     }
 
     /// Unwinds the render if it was cancelled (see `isolate`).
@@ -153,46 +206,107 @@ impl TypstyWorld {
         ))
     }
 
-    /// Loads a file that wasn't given to the render: from the root directory, or from a
-    /// package directory.
-    fn load(&self, id: FileId) -> FileResult<Bytes> {
-        let mut loaded = self.loaded.lock().map_err(|_| FileError::AccessDenied)?;
-        if let Some(result) = loaded.get(&id) {
+    /// Stops the render if the file's id is past `MAX_FILE_ID`, or if the render has used
+    /// more than `MAX_RENDER_FILES` paths. Called at the start of `World` methods, while the
+    /// world holds none of its locks (see `isolate::stop`).
+    fn track(&self, id: FileId) {
+        if id == self.main.id() {
+            return;
+        }
+
+        if observe(id) > MAX_FILE_ID {
+            isolate::stop(
+                "Typst's table of file paths is full: it keeps every file path it sees for the life of the VM, and it has nearly run out of room for new ones. Use stable file names (like logo.png) rather than a new one for every render, and restart the VM, or render in a Typsty.Pool with the :max_renders option"
+                .into(),
+            );
+        }
+
+        let used = {
+            let mut used = lock(&self.used);
+            used.insert(id);
+            used.len()
+        };
+
+        if used > MAX_RENDER_FILES {
+            isolate::stop(format!(
+                "the document reads more than {MAX_RENDER_FILES} different files. Typst keeps every file path it sees for the life of the VM, so a render may only use {MAX_RENDER_FILES} of them"
+            ));
+        }
+    }
+
+    /// A file's contents, before they're checked.
+    fn raw(&self, id: FileId) -> FileResult<Bytes> {
+        if id == self.main.id() {
+            return Ok(Bytes::from_string(self.main.clone()));
+        }
+
+        if let Some(bytes) = self.files.get(&id) {
+            return Ok(bytes.clone());
+        }
+
+        if let Some(result) = lock(&self.loaded).get(&id) {
             return result.clone();
         }
 
-        let result = self.read(id);
-        loaded.insert(id, result.clone());
+        // Not locked while reading, so that other threads of the render can read other files.
+        // Two threads may read the same file at once, which is only wasted work
+        let result = self.load(id);
+        lock(&self.loaded).insert(id, result.clone());
         result
     }
 
-    fn read(&self, id: FileId) -> FileResult<Bytes> {
-        let root = match id.root() {
-            VirtualRoot::Project => self.root.clone().ok_or_else(|| {
-                FileError::Other(Some(
-                    format!(
-                        "{} is not in the :files option, and there is no :root directory to read it from",
-                        id.vpath().get_with_slash()
-                    )
-                    .into(),
-                ))
-            })?,
-            VirtualRoot::Package(spec) => self
-                .packages
-                .iter()
-                .find_map(|packages| packages.obtain(spec))
-                .ok_or_else(|| FileError::Package(PackageError::NotFound(spec.clone())))?,
+    /// Reads a file that wasn't given to the render: from the root directory, or from a
+    /// package directory.
+    fn load(&self, id: FileId) -> FileResult<Bytes> {
+        let (root, outside) = match id.root() {
+            VirtualRoot::Project => {
+                let root = self.root.as_ref().ok_or_else(|| {
+                    FileError::Other(Some(
+                        format!(
+                            "{} is not in the :files option, and there is no :root directory to read it from",
+                            id.vpath().get_with_slash()
+                        )
+                        .into(),
+                    ))
+                })?;
+                (root.clone(), "the :root directory")
+            }
+            VirtualRoot::Package(spec) => {
+                let root = self
+                    .packages
+                    .iter()
+                    .find_map(|packages| packages.obtain(spec))
+                    .ok_or_else(|| FileError::Package(PackageError::NotFound(spec.clone())))?;
+                (root, "its package's directory")
+            }
         };
 
-        let path = root.resolve(id.vpath())?;
-        let bytes = read_regular_file(&path)?;
-        checks::check(&bytes).map_err(|problem| FileError::Other(Some(problem.into())))?;
-        Ok(Bytes::new(bytes))
+        let path = confine(&root.resolve(id.vpath())?, root.path(), || {
+            format!(
+                "{} is outside {outside}, through a symbolic link",
+                id.vpath().get_with_slash()
+            )
+        })?;
+
+        read_regular_file(&path).map(Bytes::new)
     }
 }
 
-/// Reads a file, refusing anything but regular files (following symlinks): reading a device
-/// such as /dev/zero never ends, and reading a FIFO can block forever.
+/// The file's real path, if it's inside the root: symbolic links are followed, so that a
+/// link can't lead outside the root.
+fn confine(path: &Path, root: &Path, outside: impl FnOnce() -> String) -> FileResult<PathBuf> {
+    let real = std::fs::canonicalize(path).map_err(|error| FileError::from_io(error, path))?;
+    let real_root = std::fs::canonicalize(root).map_err(|error| FileError::from_io(error, root))?;
+
+    if real.starts_with(&real_root) {
+        Ok(real)
+    } else {
+        Err(FileError::Other(Some(outside().into())))
+    }
+}
+
+/// Reads a file, refusing anything but regular files: reading a device such as /dev/zero
+/// never ends, and reading a FIFO can block forever.
 fn read_regular_file(path: &Path) -> FileResult<Vec<u8>> {
     let metadata = std::fs::metadata(path).map_err(|error| FileError::from_io(error, path))?;
 
@@ -230,34 +344,42 @@ impl World for TypstyWorld {
 
     fn source(&self, id: FileId) -> FileResult<Source> {
         self.check_cancelled();
+        self.track(id);
 
         if id == self.main.id() {
             return Ok(self.main.clone());
         }
 
-        let mut sources = self.sources.lock().map_err(|_| FileError::AccessDenied)?;
-        if let Some(source) = sources.get(&id) {
+        if let Some(source) = lock(&self.sources).get(&id) {
             return Ok(source.clone());
         }
 
-        let bytes = self.file(id)?;
+        // Sources aren't checked like files: Typst's parser limits how deeply they nest
+        let bytes = self.raw(id)?;
         let text = std::str::from_utf8(&bytes).map_err(|_| FileError::InvalidUtf8)?;
-        let source = Source::new(id, text.trim_start_matches('\u{feff}').into());
-        sources.insert(id, source.clone());
+        let source = Source::new(id, strip_bom(text).into());
+        lock(&self.sources).insert(id, source.clone());
         Ok(source)
     }
 
     fn file(&self, id: FileId) -> FileResult<Bytes> {
         self.check_cancelled();
+        self.track(id);
 
+        let bytes = self.raw(id)?;
         if id == self.main.id() {
-            return Ok(Bytes::from_string(self.main.clone()));
+            return Ok(bytes);
         }
 
-        match self.files.get(&id) {
-            Some(result) => result.clone(),
-            None => self.load(id),
-        }
+        let checked = lock(&self.checked).get(&id).cloned();
+        let checked = checked.unwrap_or_else(|| {
+            let result = checks::check(&bytes, id.vpath().extension())
+                .map_err(|problem| FileError::Other(Some(problem.into())));
+            lock(&self.checked).insert(id, result.clone());
+            result
+        });
+
+        checked.map(|()| bytes)
     }
 
     fn font(&self, index: usize) -> Option<Font> {
@@ -275,26 +397,50 @@ impl World for TypstyWorld {
     }
 }
 
-/// The id of a file given in `:files`, within the cap on file paths.
-fn project_file(path: &str) -> Result<FileId, String> {
-    let vpath = VirtualPath::new(path).map_err(|_| format!("invalid file path: {path:?}"))?;
+/// Records a file id that Typst created, returning its number.
+fn observe(id: FileId) -> u16 {
+    let number = id.into_raw().get();
+    HIGHEST_FILE_ID.fetch_max(number, Ordering::Relaxed);
+    number
+}
 
-    let mut paths = FILE_PATHS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !paths.contains(vpath.get_with_slash()) {
-        if paths.len() >= MAX_FILE_PATHS {
-            return Err(format!(
-                "too many distinct file paths: Typst keeps every file path for the life of the VM, and this one would be more than {MAX_FILE_PATHS}. Use stable file names, like logo.png, rather than a new name for every render"
-            ));
+/// The id of a file given in `:files`. New paths are refused when too many were given, or
+/// when Typst's table of paths is nearly full, before Typst creates an id for them.
+fn given_file(path: &str) -> Result<FileId, String> {
+    let vpath = VirtualPath::new(path).map_err(|_| {
+        format!("invalid file path in the :files option: {path:?}. Paths can't contain \"..\" or start with a drive letter")
+    })?;
+
+    {
+        let mut paths = lock(&GIVEN_PATHS);
+        if !paths.contains(vpath.get_with_slash()) {
+            if paths.len() >= MAX_GIVEN_PATHS
+                || HIGHEST_FILE_ID.load(Ordering::Relaxed) >= MAX_FILE_ID
+            {
+                return Err(format!(
+                    "too many distinct file paths: Typst keeps every file path it sees for the life of the VM, and {path:?} would be more than it has room for. Use stable file names, like logo.png, rather than a new name for every render"
+                ));
+            }
+
+            paths.insert(vpath.get_with_slash().to_string());
         }
-
-        paths.insert(vpath.get_with_slash().to_string());
     }
 
-    Ok(FileId::new(RootedPath::new(VirtualRoot::Project, vpath)))
+    let id = FileId::new(RootedPath::new(VirtualRoot::Project, vpath));
+    observe(id);
+    Ok(id)
+}
+
+/// Typst's parser doesn't skip a byte order mark, which would become part of the first line.
+pub fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
 fn is_variable_name(name: &str) -> bool {
-    typst::syntax::is_ident(name) && !KEYWORDS.contains(&name)
+    // `_` is an identifier, but binding it discards the value
+    name != "_" && typst::syntax::is_ident(name) && !KEYWORDS.contains(&name)
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }

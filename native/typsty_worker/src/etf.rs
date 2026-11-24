@@ -1,10 +1,11 @@
 //! Erlang's external term format, for the requests `Typsty.Pool` sends
 //! (`:erlang.term_to_binary/1`) and the responses it reads (`:erlang.binary_to_term/2`).
 //!
-//! Only the terms Typsty uses are supported. Maps keep their order, so that Typst dicts are
-//! built in the same order as the NIF builds them.
+//! Only the terms Typsty uses are supported. Maps keep the order of their entries; Typst
+//! dictionaries are sorted by key either way (see `typsty_core::values::dict`).
 
 use std::fmt;
+use std::io::{self, Write};
 
 /// How deeply terms may be nested. Variables are nested at most 256 levels deep, and the
 /// request wraps them in a few more.
@@ -237,75 +238,109 @@ impl Reader<'_> {
     }
 }
 
-pub fn encode(term: &Term) -> Vec<u8> {
-    let mut bytes = vec![VERSION];
-    write(term, &mut bytes);
-    bytes
+/// Writes the term in the external term format, prefixed with its length as 4 bytes
+/// (`{:packet, 4}`). Binaries are written as they are, without copying them into a buffer.
+pub fn write_frame(term: &Term, out: &mut impl Write) -> io::Result<()> {
+    let length = 1 + encoded_length(term);
+    let length = u32::try_from(length)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "response too large"))?;
+
+    out.write_all(&length.to_be_bytes())?;
+    out.write_all(&[VERSION])?;
+    write(term, out)
 }
 
-fn write(term: &Term, out: &mut Vec<u8>) {
+#[cfg(test)]
+pub fn encode(term: &Term) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    write_frame(term, &mut bytes).unwrap();
+    bytes.split_off(4)
+}
+
+fn encoded_length(term: &Term) -> usize {
+    match term {
+        Term::Atom(name) if name.len() < 256 => 2 + name.len(),
+        Term::Atom(name) => 3 + name.len(),
+        Term::Integer(value) if (0..=255).contains(value) => 2,
+        Term::Integer(value) if i32::try_from(*value).is_ok() => 5,
+        Term::Integer(_) => 11,
+        Term::Float(_) => 9,
+        Term::Binary(bytes) => 5 + bytes.len(),
+        Term::List(elements) if elements.is_empty() => 1,
+        Term::List(elements) => 6 + elements.iter().map(encoded_length).sum::<usize>(),
+        Term::Tuple(elements) => {
+            let header = if elements.len() < 256 { 2 } else { 5 };
+            header + elements.iter().map(encoded_length).sum::<usize>()
+        }
+        Term::Map(entries) => {
+            5 + entries
+                .iter()
+                .map(|(key, value)| encoded_length(key) + encoded_length(value))
+                .sum::<usize>()
+        }
+    }
+}
+
+fn write(term: &Term, out: &mut impl Write) -> io::Result<()> {
     match term {
         Term::Atom(name) => {
             if name.len() < 256 {
-                out.push(SMALL_ATOM_UTF8_EXT);
-                out.push(name.len() as u8);
+                out.write_all(&[SMALL_ATOM_UTF8_EXT, name.len() as u8])?;
             } else {
-                out.push(ATOM_UTF8_EXT);
-                out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+                out.write_all(&[ATOM_UTF8_EXT])?;
+                out.write_all(&(name.len() as u16).to_be_bytes())?;
             }
-            out.extend_from_slice(name.as_bytes());
+            out.write_all(name.as_bytes())
         }
         Term::Integer(value) => {
             if (0..=255).contains(value) {
-                out.push(SMALL_INTEGER_EXT);
-                out.push(*value as u8);
+                out.write_all(&[SMALL_INTEGER_EXT, *value as u8])
             } else if let Ok(value) = i32::try_from(*value) {
-                out.push(INTEGER_EXT);
-                out.extend_from_slice(&value.to_be_bytes());
+                out.write_all(&[INTEGER_EXT])?;
+                out.write_all(&value.to_be_bytes())
             } else {
-                out.push(SMALL_BIG_EXT);
-                out.push(8);
-                out.push(u8::from(*value < 0));
-                out.extend_from_slice(&value.unsigned_abs().to_le_bytes());
+                out.write_all(&[SMALL_BIG_EXT, 8, u8::from(*value < 0)])?;
+                out.write_all(&value.unsigned_abs().to_le_bytes())
             }
         }
         Term::Float(value) => {
-            out.push(NEW_FLOAT_EXT);
-            out.extend_from_slice(&value.to_be_bytes());
+            out.write_all(&[NEW_FLOAT_EXT])?;
+            out.write_all(&value.to_be_bytes())
         }
         Term::Binary(bytes) => {
-            out.push(BINARY_EXT);
-            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-            out.extend_from_slice(bytes);
+            out.write_all(&[BINARY_EXT])?;
+            out.write_all(&(bytes.len() as u32).to_be_bytes())?;
+            out.write_all(bytes)
         }
-        Term::List(elements) if elements.is_empty() => out.push(NIL_EXT),
+        Term::List(elements) if elements.is_empty() => out.write_all(&[NIL_EXT]),
         Term::List(elements) => {
-            out.push(LIST_EXT);
-            out.extend_from_slice(&(elements.len() as u32).to_be_bytes());
+            out.write_all(&[LIST_EXT])?;
+            out.write_all(&(elements.len() as u32).to_be_bytes())?;
             for element in elements {
-                write(element, out);
+                write(element, out)?;
             }
-            out.push(NIL_EXT);
+            out.write_all(&[NIL_EXT])
         }
         Term::Tuple(elements) => {
             if elements.len() < 256 {
-                out.push(SMALL_TUPLE_EXT);
-                out.push(elements.len() as u8);
+                out.write_all(&[SMALL_TUPLE_EXT, elements.len() as u8])?;
             } else {
-                out.push(LARGE_TUPLE_EXT);
-                out.extend_from_slice(&(elements.len() as u32).to_be_bytes());
+                out.write_all(&[LARGE_TUPLE_EXT])?;
+                out.write_all(&(elements.len() as u32).to_be_bytes())?;
             }
             for element in elements {
-                write(element, out);
+                write(element, out)?;
             }
+            Ok(())
         }
         Term::Map(entries) => {
-            out.push(MAP_EXT);
-            out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            out.write_all(&[MAP_EXT])?;
+            out.write_all(&(entries.len() as u32).to_be_bytes())?;
             for (key, value) in entries {
-                write(key, out);
-                write(value, out);
+                write(key, out)?;
+                write(value, out)?;
             }
+            Ok(())
         }
     }
 }
@@ -330,7 +365,32 @@ mod tests {
             ]),
         ]);
 
-        assert_eq!(decode(&encode(&term)).unwrap(), term);
+        let encoded = encode(&term);
+        assert_eq!(encoded.len(), 1 + encoded_length(&term));
+        assert_eq!(decode(&encoded).unwrap(), term);
+    }
+
+    #[test]
+    fn decodes_what_erlang_encodes() {
+        // :erlang.term_to_binary({9223372036854775807, -9223372036854775808, :héllo, :"é"})
+        // with the last atom encoded as Latin-1 (ATOM_EXT), as older nodes do
+        let bytes = [
+            131, 104, 4, 110, 8, 0, 255, 255, 255, 255, 255, 255, 255, 127, 110, 8, 1, 0, 0, 0, 0,
+            0, 0, 0, 128, 119, 6, 104, 195, 169, 108, 108, 111, 100, 0, 1, 233,
+        ];
+
+        assert_eq!(
+            decode(&bytes).unwrap(),
+            Term::Tuple(vec![
+                Term::Integer(i64::MAX),
+                Term::Integer(i64::MIN),
+                Term::atom("héllo"),
+                Term::atom("é"),
+            ])
+        );
+
+        // 2^64 doesn't fit
+        assert!(decode(&[131, 110, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).is_err());
     }
 
     #[test]

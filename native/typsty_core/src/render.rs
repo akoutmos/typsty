@@ -1,16 +1,15 @@
 //! Rendering, checking and formatting templates.
 
-use std::time::Duration;
-
 use typst::foundations::Dict;
 use typst::syntax::Source;
 use typst_layout::PagedDocument;
+use typst_pdf::PdfStandards;
 
 use crate::diagnostics::{self, Diagnostic};
 use crate::export::{self, Output};
 use crate::fonts::{self, FontSettings};
 use crate::isolate::{self, Cancellation};
-use crate::world::{TypstyWorld, WorldOptions};
+use crate::world::{self, Prepared, TypstyWorld};
 
 /// How many compilations a memoized result survives without being used. Typst memoizes
 /// evaluation, layout, decoded images and rendered textures across compilations, which
@@ -35,16 +34,10 @@ impl Format {
     }
 }
 
-pub enum Failure {
-    /// The arguments are invalid, which is raised as an `ArgumentError`.
-    Invalid(String),
-    /// Typst reported errors, or the render failed.
-    Diagnostics(Vec<Diagnostic>),
-}
-
 /// The exported document and Typst's warnings.
 pub type Rendered = (Output, Vec<Diagnostic>);
 
+/// A render's arguments, as the NIF and the worker receive them.
 pub struct RenderJob {
     pub template: String,
     pub variables: Dict,
@@ -58,34 +51,70 @@ pub struct RenderJob {
 }
 
 impl RenderJob {
-    /// Renders on a thread of its own (see `isolate`), waiting for it up to the timeout, which
-    /// includes waiting for one of the `limit` slots for renders running at once. The outer
-    /// error is the render not finishing: it timed out, panicked, or couldn't start.
-    pub fn render(
-        self,
-        timeout: Option<Duration>,
-        limit: Option<usize>,
-    ) -> Result<Result<Rendered, Failure>, isolate::Failure> {
-        isolate::run(timeout, limit, move |cancellation| self.run(cancellation))
-    }
+    /// Checks the arguments, which is quick, so that invalid ones are reported before the
+    /// render waits for its turn. The error describes the invalid argument.
+    pub fn prepare(self) -> Result<PreparedJob, String> {
+        let pdf_standards = export::pdf_standards(&self.pdf_standards)?;
 
-    fn run(self, cancellation: Cancellation) -> Result<Rendered, Failure> {
-        let world_options = WorldOptions {
-            files: self.files,
-            root: self.root,
-            package_paths: self.package_paths,
-            fonts: fonts::store(&self.fonts),
-            cancellation,
-        };
+        if !(self.ppi.is_finite() && self.ppi > 0.0) {
+            return Err(format!(
+                "the :ppi option must be a positive number, got: {}",
+                self.ppi
+            ));
+        }
+
+        let world = Prepared::new(
+            &self.template,
+            self.variables,
+            self.files,
+            self.root,
+            self.package_paths,
+        )?;
+
+        Ok(PreparedJob {
+            world,
+            fonts: self.fonts,
+            format: self.format,
+            ppi: self.ppi,
+            pdf_standards,
+        })
+    }
+}
+
+/// A render whose arguments were checked (see `RenderJob::prepare`).
+pub struct PreparedJob {
+    world: Prepared,
+    fonts: FontSettings,
+    format: Format,
+    ppi: f64,
+    pdf_standards: PdfStandards,
+}
+
+impl PreparedJob {
+    /// Compiles and exports the document. Runs on a render's thread (see `isolate::start`),
+    /// and returns Typst's errors when it fails.
+    pub fn render(self, cancellation: Cancellation) -> Result<Rendered, Vec<Diagnostic>> {
+        let fonts = fonts::store(&self.fonts);
 
         // Evicted after exporting (rendering PNGs memoizes textures), and also when a
         // cancelled render unwinds
         let _evict = EvictOnDrop;
 
-        let world = TypstyWorld::new(&self.template, self.variables, world_options)
-            .map_err(Failure::Invalid)?;
+        let world = TypstyWorld::new(self.world, fonts, cancellation);
+        let compiled = typst::compile::<PagedDocument>(&world);
+        let warnings = diagnostics::from_sources(&compiled.warnings, &world);
 
-        compile_and_export(&world, self.format, self.ppi, &self.pdf_standards)
+        let document = compiled
+            .output
+            .map_err(|errors| diagnostics::from_sources(&errors, &world))?;
+
+        let output = match self.format {
+            Format::Pdf => export::pdf(&document, self.pdf_standards, &world)?,
+            Format::Png => export::png(&document, self.ppi, &world)?,
+            Format::Svg => export::svg(&document, &world),
+        };
+
+        Ok((output, warnings))
     }
 }
 
@@ -102,35 +131,10 @@ impl Drop for EvictOnDrop {
     }
 }
 
-fn compile_and_export(
-    world: &TypstyWorld,
-    format: Format,
-    ppi: f64,
-    pdf_standards: &[String],
-) -> Result<Rendered, Failure> {
-    let compiled = typst::compile::<PagedDocument>(world);
-    let warnings = diagnostics::from_sources(&compiled.warnings, world);
-
-    let document = compiled
-        .output
-        .map_err(|errors| Failure::Diagnostics(diagnostics::from_sources(&errors, world)))?;
-
-    let output = match format {
-        Format::Pdf => export::pdf(&document, pdf_standards, world),
-        Format::Png => export::png(&document, ppi, world),
-        Format::Svg => Ok(export::svg(&document, world)),
-    }
-    .map_err(Failure::Diagnostics)?;
-
-    Ok((output, warnings))
-}
-
 /// Checks a template's syntax. Returns the syntax errors, which is empty for a valid template.
 pub fn syntax_errors(template: String) -> Vec<Diagnostic> {
-    isolate::run(None, None, move |_cancellation| {
-        collect_syntax_errors(&template)
-    })
-    .unwrap_or_else(|failure| vec![Diagnostic::error(failure.message())])
+    isolate::run(move || collect_syntax_errors(world::strip_bom(&template)))
+        .unwrap_or_else(|interrupted| vec![Diagnostic::error(interrupted.message())])
 }
 
 fn collect_syntax_errors(template: &str) -> Vec<Diagnostic> {
@@ -156,13 +160,20 @@ pub fn format(
         .with_tab_spaces(indent_width)
         .with_wrap_text(wrap_text);
 
-    isolate::run(None, None, move |_cancellation| {
+    isolate::run(move || {
+        let template = world::strip_bom(&template);
+
         typstyle_core::Typstyle::new(config)
-            .format_text(template.as_str())
+            .format_text(template)
             .render()
-            .map_err(|_| collect_syntax_errors(&template))
+            .map_err(|error| match collect_syntax_errors(template) {
+                errors if errors.is_empty() => vec![Diagnostic::error(format!(
+                    "typstyle couldn't format the template: {error}"
+                ))],
+                errors => errors,
+            })
     })
-    .unwrap_or_else(|failure| Err(vec![Diagnostic::error(failure.message())]))
+    .unwrap_or_else(|interrupted| Err(vec![Diagnostic::error(interrupted.message())]))
 }
 
 /// Scans for fonts (caching them for later renders) and returns the font families found.

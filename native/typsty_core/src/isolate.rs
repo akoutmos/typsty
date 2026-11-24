@@ -2,14 +2,18 @@
 //!
 //! Dirty schedulers have small stacks (320 KiB by default), and Typst recurses deeply when
 //! it parses, evaluates and lays out nested content, values and SVGs. A stack overflow can't
-//! be caught: it kills the whole VM. So the work runs on a thread of its own with a large
-//! stack, and Typst's thread pool gets large stacks too.
+//! be caught: it kills the whole VM. So each render runs on a thread of its own with a large
+//! stack, and Typst's thread pool gets large stacks too. Running on a separate thread also
+//! turns panics into errors.
 //!
-//! Running on a separate thread also turns panics into errors, and lets the NIF stop waiting
-//! after a timeout, so that a render that runs too long doesn't hold a scheduler.
+//! Renders are started with `start`, which returns right away: the NIF doesn't wait for the
+//! render, so it never holds a scheduler while Typst works. The result is handed to a
+//! callback on the render's thread, which the NIF uses to send it to the process that asked
+//! for the render. At most a given number of renders run at once; the others wait in a
+//! queue, in the order they were started.
 //!
 //! A thread can't be killed safely (it would leave Typst's caches and the allocator locked),
-//! so a render that times out is cancelled cooperatively instead: the cancellation flag is
+//! so a render that's abandoned is cancelled cooperatively instead: the cancellation flag is
 //! set, and the render unwinds the next time Typst calls into its `World` (see
 //! `Cancellation::check`). Typst calls the world constantly while it lays out documents and
 //! loads files and fonts, and whenever it checks a memoized result. Pure computation in a
@@ -17,115 +21,64 @@
 //! the next call into the world.
 
 use std::any::Any;
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// The stack size of the threads that run Typst. This is reserved address space: memory is
 /// only used as the stack actually grows.
 pub const STACK_SIZE: usize = 256 * 1024 * 1024;
 
-pub enum Failure {
-    /// The work panicked, with the panic's message.
+/// Why a render's work didn't return.
+#[derive(Debug)]
+pub enum Interrupted {
+    /// It panicked: a bug in Typst or in Typsty.
     Panicked(String),
-    /// The work didn't finish in time, and was cancelled.
-    TimedOut(Duration),
-    /// The render couldn't start in time, because the limit of renders running at once was
-    /// reached.
-    Busy { timeout: Duration, limit: usize },
-    /// The thread couldn't be started.
-    Spawn(String),
+    /// Typsty stopped it, because it went over one of Typsty's limits (see `stop`).
+    Stopped(String),
+    /// It was cancelled, after it was abandoned.
+    Cancelled,
+    /// Its thread couldn't be started.
+    NoThread(String),
 }
 
-impl Failure {
+impl Interrupted {
     pub fn message(&self) -> String {
         match self {
-            Failure::Panicked(message) => format!("Typst crashed (it panicked with: {message})"),
-            Failure::TimedOut(timeout) => format!(
-                "rendering didn't finish within the timeout ({} ms), and was cancelled",
-                timeout.as_millis()
-            ),
-            Failure::Busy { timeout, limit } => format!(
-                "rendering didn't start within the timeout ({} ms): {limit} renders were already running (the :max_concurrent_renders limit), counting renders that timed out and are still being cancelled",
-                timeout.as_millis()
-            ),
-            Failure::Spawn(error) => format!("couldn't start a thread to render on: {error}"),
+            Interrupted::Panicked(message) => {
+                format!("Typst crashed (it panicked with: {message})")
+            }
+            Interrupted::Stopped(message) => message.clone(),
+            Interrupted::Cancelled => "the render was cancelled".into(),
+            Interrupted::NoThread(error) => {
+                format!("couldn't start a thread to render on: {error}")
+            }
         }
     }
 }
 
-/// The number of renders running, including renders that timed out and are still being
-/// cancelled. A cancelled render only stops at its next call into the world, so without a
-/// limit, renders that keep timing out could pile up in the background.
-static RENDERS: Mutex<usize> = Mutex::new(0);
-static RENDER_FINISHED: Condvar = Condvar::new();
-
-pub fn running_renders() -> usize {
-    *RENDERS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// A render's place among the renders running at once, given back when its work ends.
-struct RenderSlot;
-
-impl RenderSlot {
-    /// Waits for fewer than `limit` renders to be running, until the deadline.
-    fn acquire(limit: usize, deadline: Option<Instant>) -> Option<RenderSlot> {
-        let mut running = RENDERS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        while *running >= limit.max(1) {
-            running = match deadline {
-                None => RENDER_FINISHED
-                    .wait(running)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                Some(deadline) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return None;
-                    }
-
-                    RENDER_FINISHED
-                        .wait_timeout(running, remaining)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .0
-                }
-            };
-        }
-
-        *running += 1;
-        Some(RenderSlot)
-    }
-}
-
-impl Drop for RenderSlot {
-    fn drop(&mut self) {
-        *RENDERS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) -= 1;
-        RENDER_FINISHED.notify_one();
-    }
-}
-
-/// A flag the NIF sets when it stops waiting for a render.
+/// A flag set when a render is abandoned, which makes it unwind.
 #[derive(Clone, Default)]
 pub struct Cancellation(Arc<AtomicBool>);
 
 /// The panic payload a cancelled render unwinds with.
 struct Cancelled;
 
+/// The panic payload a render that Typsty stops unwinds with.
+struct Stopped(String);
+
 impl Cancellation {
     fn cancel(&self) {
         self.0.store(true, Ordering::Relaxed);
     }
 
-    /// Unwinds the render if it was cancelled. Unwinding is safe here: it only runs at the
-    /// start of a `World` method, before any of the world's locks are taken, and the locks
-    /// Typst holds while calling the world (comemo's) are released as the stack unwinds.
-    /// `resume_unwind` skips the panic hook, so nothing is reported.
+    /// Unwinds the render if it was cancelled. This is only called at the start of a `World`
+    /// method, while the world holds none of its own locks. The locks Typst holds while it
+    /// calls the world (comemo's) are released as the stack unwinds, and nothing is memoized
+    /// for the calls that unwind. `resume_unwind` skips the panic hook, so nothing is
+    /// reported.
     pub fn check(&self) {
         if self.0.load(Ordering::Relaxed) {
             resume_unwind(Box::new(Cancelled));
@@ -133,66 +86,273 @@ impl Cancellation {
     }
 }
 
-/// Runs the work on a new thread with a large stack, and waits for it, up to the timeout.
-/// When it times out, the work's cancellation is set.
+/// Stops the render running on this thread, with an error. Like `Cancellation::check`, it may
+/// only be called where the world holds none of its own locks.
 ///
-/// Work with a `limit` is a render: it first waits (within the timeout) until fewer than
-/// `limit` renders are running, and counts as running until its work actually ends.
-pub fn run<T, F>(timeout: Option<Duration>, limit: Option<usize>, work: F) -> Result<T, Failure>
+/// Typst doesn't stop at every error: errors in show rules and `context` blocks are collected
+/// while it goes on laying out the document. Unwinding stops it right away.
+pub fn stop(message: String) -> ! {
+    resume_unwind(Box::new(Stopped(message)))
+}
+
+/// Runs the work, turning panics and unwinding into an `Interrupted`.
+fn catch<T>(work: impl FnOnce() -> T) -> Result<T, Interrupted> {
+    catch_unwind(AssertUnwindSafe(work)).map_err(|payload| {
+        if payload.is::<Cancelled>() {
+            return Interrupted::Cancelled;
+        }
+
+        match payload.downcast::<Stopped>() {
+            Ok(stopped) => Interrupted::Stopped(stopped.0),
+            Err(payload) => Interrupted::Panicked(panic_message(payload)),
+        }
+    })
+}
+
+/// Runs quick work on a new thread with a large stack, and waits for it: checking and
+/// formatting templates, which can't run for long.
+pub fn run<T, W>(work: W) -> Result<T, Interrupted>
 where
     T: Send + 'static,
-    F: FnOnce(Cancellation) -> T + Send + 'static,
+    W: FnOnce() -> T + Send + 'static,
 {
-    let deadline = timeout.map(|timeout| Instant::now() + timeout);
-
-    let slot = match limit {
-        Some(limit) => Some(RenderSlot::acquire(limit, deadline).ok_or(Failure::Busy {
-            timeout: timeout.unwrap_or_default(),
-            limit,
-        })?),
-        None => None,
-    };
-
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let cancellation = Cancellation::default();
-    let worker_cancellation = cancellation.clone();
-
     std::thread::Builder::new()
         .name("typsty".into())
         .stack_size(STACK_SIZE)
-        .spawn(move || {
-            // The slot is given back when the work ends, even if the NIF stopped waiting
-            let _slot = slot;
-            let result =
-                catch_unwind(AssertUnwindSafe(|| work(worker_cancellation))).map_err(panic_message);
-            // The receiver is gone if the NIF stopped waiting after a timeout
-            let _ = sender.send(result);
-        })
-        .map_err(|error| Failure::Spawn(error.to_string()))?;
-
-    let received = match (timeout, deadline) {
-        (Some(timeout), Some(deadline)) => {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            receiver
-                .recv_timeout(remaining)
-                .map_err(|error| match error {
-                    mpsc::RecvTimeoutError::Timeout => {
-                        cancellation.cancel();
-                        Failure::TimedOut(timeout)
-                    }
-                    mpsc::RecvTimeoutError::Disconnected => Failure::Panicked("unknown".into()),
-                })?
-        }
-        _ => receiver
-            .recv()
-            .map_err(|_| Failure::Panicked("unknown".into()))?,
-    };
-
-    received.map_err(Failure::Panicked)
+        .spawn(move || catch(work))
+        .map_err(|error| Interrupted::NoThread(error.to_string()))?
+        .join()
+        .unwrap_or_else(|_| Err(Interrupted::Panicked("unknown".into())))
 }
 
-/// Panics in Typst's threads become errors with the panic's message, so the default panic
-/// hook's report on stderr is only kept for other threads.
+/// How far along a render is, as seen by whoever started it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// Waiting for fewer renders to be running.
+    Queued,
+    Running,
+    /// Its result was handed over.
+    Finished,
+    /// Given up on, before its result was handed over (see `Ticket::abandon`).
+    Abandoned,
+}
+
+struct Shared {
+    cancellation: Cancellation,
+    phase: Mutex<Phase>,
+}
+
+/// What `start` returns, to give up on the render.
+pub struct Ticket(Arc<Shared>);
+
+impl Ticket {
+    /// Gives up on the render, if it hasn't finished: a queued render never starts, and a
+    /// running one is cancelled. Its result won't be handed over. Returns the phase the render
+    /// was in.
+    pub fn abandon(&self) -> Phase {
+        let previous = {
+            let mut phase = lock(&self.0.phase);
+            let previous = *phase;
+            if matches!(previous, Phase::Queued | Phase::Running) {
+                *phase = Phase::Abandoned;
+                self.0.cancellation.cancel();
+            }
+            previous
+        };
+
+        // Frees the memory a queued render holds (its files, for example) right away. The
+        // queue is locked after the phase is unlocked: `next_job` locks them the other way
+        // around
+        if previous == Phase::Queued {
+            lock(&QUEUE)
+                .waiting
+                .retain(|job| !Arc::ptr_eq(&job.shared, &self.0));
+        }
+
+        previous
+    }
+}
+
+/// A render waiting to start.
+struct Job {
+    shared: Arc<Shared>,
+    /// The most renders that may be running for it to start.
+    limit: usize,
+    /// Runs the render and hands its result over, unless it was abandoned. Given the error
+    /// starting its thread failed with, it hands that over instead.
+    run: Box<dyn FnOnce(Option<String>) + Send>,
+}
+
+struct Queue {
+    /// Renders running, including abandoned ones that are still unwinding: a cancelled render
+    /// only stops at its next call into the world, so without counting them, renders that
+    /// keep timing out could pile up in the background.
+    running: usize,
+    waiting: VecDeque<Job>,
+}
+
+static QUEUE: Mutex<Queue> = Mutex::new(Queue {
+    running: 0,
+    waiting: VecDeque::new(),
+});
+
+/// The number of renders running, including renders that were abandoned and are still
+/// being cancelled.
+pub fn running_renders() -> usize {
+    lock(&QUEUE).running
+}
+
+/// Starts a render on a thread of its own, once fewer than `limit` renders are running, and
+/// returns right away. `deliver` is called on the render's thread with the result, unless the
+/// render was abandoned first. It's called while the render's phase is locked, so once
+/// `Ticket::abandon` returns `Phase::Finished`, `deliver` has returned.
+///
+/// Fails if the render could start right away, but its thread couldn't be started.
+pub fn start<T, W, D>(limit: usize, work: W, deliver: D) -> Result<Ticket, String>
+where
+    T: 'static,
+    W: FnOnce(Cancellation) -> T + Send + 'static,
+    D: FnOnce(Result<T, Interrupted>) + Send + 'static,
+{
+    let shared = Arc::new(Shared {
+        cancellation: Cancellation::default(),
+        phase: Mutex::new(Phase::Queued),
+    });
+
+    let for_job = shared.clone();
+    let run = Box::new(move |spawn_error: Option<String>| {
+        let result = match spawn_error {
+            None => {
+                let cancellation = for_job.cancellation.clone();
+                catch(move || work(cancellation))
+            }
+            Some(error) => Err(Interrupted::NoThread(error)),
+        };
+        hand_over(&for_job, result, deliver);
+    });
+
+    let job = Job {
+        shared: shared.clone(),
+        limit: limit.max(1),
+        run,
+    };
+
+    let ready = {
+        let mut queue = lock(&QUEUE);
+        if queue.waiting.is_empty() && queue.running < job.limit {
+            queue.running += 1;
+            Some(job)
+        } else {
+            queue.waiting.push_back(job);
+            None
+        }
+    };
+
+    if let Some(job) = ready {
+        // This runs on the caller's thread (a scheduler, for the NIF), where the result can't
+        // be handed over: the error is returned instead
+        if let Err((_job, error)) = launch(job) {
+            lock(&QUEUE).running -= 1;
+            return Err(format!("couldn't start a thread to render on: {error}"));
+        }
+    }
+
+    Ok(Ticket(shared))
+}
+
+fn hand_over<T>(
+    shared: &Shared,
+    result: Result<T, Interrupted>,
+    deliver: impl FnOnce(Result<T, Interrupted>),
+) {
+    let mut phase = lock(&shared.phase);
+    if *phase != Phase::Abandoned {
+        *phase = Phase::Finished;
+        deliver(result);
+    }
+}
+
+/// Runs a job that has taken one of the running slots, on a new thread. Gives the job back
+/// if the thread can't be started.
+fn launch(job: Job) -> Result<(), (Job, String)> {
+    {
+        let mut phase = lock(&job.shared.phase);
+        if *phase == Phase::Abandoned {
+            drop(phase);
+            release_slot();
+            return Ok(());
+        }
+        *phase = Phase::Running;
+    }
+
+    // The thread takes the job, so that the job can be given back if the thread can't start
+    let slot = Arc::new(Mutex::new(Some(job)));
+    let for_thread = slot.clone();
+
+    let spawned = std::thread::Builder::new()
+        .name("typsty".into())
+        .stack_size(STACK_SIZE)
+        .spawn(move || {
+            let job = lock(&for_thread).take();
+            if let Some(job) = job {
+                (job.run)(None);
+            }
+            release_slot();
+        });
+
+    match spawned {
+        Ok(_handle) => Ok(()),
+        Err(error) => match lock(&slot).take() {
+            Some(job) => Err((job, error.to_string())),
+            None => Ok(()),
+        },
+    }
+}
+
+/// Gives back a running slot, and starts the next render that may run. Runs on a render's
+/// thread, as it ends.
+fn release_slot() {
+    let next = {
+        let mut queue = lock(&QUEUE);
+        queue.running -= 1;
+        next_job(&mut queue)
+    };
+
+    if let Some(job) = next {
+        if let Err((job, error)) = launch(job) {
+            // Handed over from this thread, which isn't a scheduler
+            (job.run)(Some(error));
+            release_slot();
+        }
+    }
+}
+
+fn next_job(queue: &mut Queue) -> Option<Job> {
+    while let Some(job) = queue.waiting.front() {
+        if *lock(&job.shared.phase) == Phase::Abandoned {
+            queue.waiting.pop_front();
+        } else if queue.running < job.limit {
+            queue.running += 1;
+            return queue.waiting.pop_front();
+        } else {
+            return None;
+        }
+    }
+
+    None
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+thread_local! {
+    /// Where the last panic on this thread happened, recorded by the panic hook.
+    static PANIC_LOCATION: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Panics in Typst's threads become errors with the panic's message (see `catch`), so the
+/// default panic hook's report on stderr is only kept for other threads.
 pub fn init_panic_hook() {
     let default_hook = std::panic::take_hook();
 
@@ -201,7 +361,10 @@ pub fn init_panic_hook() {
             .name()
             .is_some_and(|name| name.starts_with("typsty"));
 
-        if !ours {
+        if ours {
+            let location = info.location().map(ToString::to_string);
+            PANIC_LOCATION.with(|cell| *cell.borrow_mut() = location);
+        } else {
             default_hook(info);
         }
     }));
@@ -209,14 +372,16 @@ pub fn init_panic_hook() {
 
 /// Sets up the global thread pool that Typst lays out pages and the PDF exporter decodes
 /// images on, with large stacks. Its default panic handler aborts the process, so panics
-/// in its background jobs are only logged instead.
+/// in its background jobs are only logged instead. A render waiting for such a job could
+/// then wait forever, holding its slot; that's a Typst bug either way, and aborting the VM
+/// would be worse.
 pub fn init_thread_pool() {
     // This fails if the pool was already initialized, which is fine
     let _ = rayon::ThreadPoolBuilder::new()
         .thread_name(|index| format!("typsty-worker-{index}"))
         .stack_size(STACK_SIZE)
         .panic_handler(|payload| {
-            if !payload.is::<Cancelled>() {
+            if !payload.is::<Cancelled>() && !payload.is::<Stopped>() {
                 eprintln!(
                     "[Typsty] a Typst background job panicked: {}",
                     panic_message(payload)
@@ -227,13 +392,88 @@ pub fn init_thread_pool() {
 }
 
 fn panic_message(payload: Box<dyn Any + Send>) -> String {
-    if payload.is::<Cancelled>() {
-        "cancelled".into()
-    } else if let Some(message) = payload.downcast_ref::<&str>() {
+    let message = if let Some(message) = payload.downcast_ref::<&str>() {
         message.to_string()
     } else if let Some(message) = payload.downcast_ref::<String>() {
         message.clone()
     } else {
         "unknown".into()
+    };
+
+    match PANIC_LOCATION.with(|cell| cell.borrow_mut().take()) {
+        Some(location) => format!("{message}, at {location}"),
+        None => message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn run<T: Send + 'static>(
+        limit: usize,
+        work: impl FnOnce(Cancellation) -> T + Send + 'static,
+    ) -> (Ticket, mpsc::Receiver<Result<T, Interrupted>>) {
+        let (sender, receiver) = mpsc::channel();
+        let ticket = start(limit, work, move |result| {
+            let _ = sender.send(result);
+        })
+        .unwrap();
+        (ticket, receiver)
+    }
+
+    #[test]
+    fn hands_over_results_and_panics() {
+        init_panic_hook();
+
+        let (_ticket, receiver) = run(4, |_| 1 + 1);
+        assert_eq!(receiver.recv().unwrap().unwrap(), 2);
+
+        let (_ticket, receiver) = run(4, |_| -> () { panic!("boom") });
+        let Err(Interrupted::Panicked(message)) = receiver.recv().unwrap() else {
+            panic!("expected a panic");
+        };
+        assert!(message.starts_with("boom, at "), "{message}");
+
+        let (_ticket, receiver) = run(4, |_| -> () { stop("too many files".into()) });
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            Err(Interrupted::Stopped(message)) if message == "too many files"
+        ));
+    }
+
+    #[test]
+    fn queues_renders_over_the_limit_and_abandons_them() {
+        // A render that runs until it's cancelled
+        let spin = |cancellation: Cancellation| loop {
+            cancellation.check();
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        let (first, _first_result) = run(1, spin);
+        let (second, second_result) = run(1, |_| "second");
+
+        assert!(second_result
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+        assert_eq!(second.abandon(), Phase::Queued);
+        assert_eq!(first.abandon(), Phase::Running);
+
+        // The abandoned render's result is never handed over
+        assert!(second_result
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+
+        let (third, third_result) = run(1, |_| "third");
+        assert_eq!(
+            third_result
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            "third"
+        );
+        assert_eq!(third.abandon(), Phase::Finished);
     }
 }

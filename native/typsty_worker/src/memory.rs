@@ -3,8 +3,9 @@
 //! much memory, and starts a new worker.
 //!
 //! Operating systems can't do this portably (macOS doesn't enforce `RLIMIT_AS`, and Windows
-//! needs job objects), and this behaves the same everywhere. It counts the heap, which is
-//! where Typst's memory goes; stacks and memory-mapped font files aren't counted.
+//! needs job objects), and this behaves the same everywhere. It counts the bytes requested
+//! from the heap, which is where Typst's memory goes: documents, caches and the font files
+//! Typst has loaded. Thread stacks and the allocator's own overhead aren't counted.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};

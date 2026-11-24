@@ -17,32 +17,32 @@ defmodule Typsty.Value do
   @max_int 9_223_372_036_854_775_807
   @min_int -9_223_372_036_854_775_808
 
-  @doc false
-  @spec variables(map() | keyword()) :: %{String.t() => term()}
-  def variables(assigns) when is_map(assigns) or is_list(assigns) do
-    if is_list(assigns) and not Keyword.keyword?(assigns) do
-      raise ArgumentError, "the variables must be a map or a keyword list, got: #{inspect(assigns)}"
-    end
+  # Typst's decimals have about 28 significant digits; the exponents of decimals that could
+  # fit are well within these bounds, which keep huge exponents from being written out
+  @max_decimal_exponent 40
 
-    assigns
-    |> Map.new()
-    |> encode([])
-  end
+  # How many structs Typsty.Encoder may turn into other structs in a row, so that two
+  # implementations that encode as each other can't loop forever
+  @max_encodings 32
+
+  @doc false
+  @spec variables(map()) :: %{String.t() => term()}
+  def variables(assigns) when is_map(assigns) and not is_struct(assigns), do: encode(assigns, [], 0)
 
   def variables(assigns) do
-    raise ArgumentError, "the variables must be a map or a keyword list, got: #{inspect(assigns)}"
+    raise ArgumentError, "the assigns must be a map, got: #{inspect(assigns)}"
   end
 
-  defp encode(value, _path) when value in [nil, true, false], do: value
-  defp encode(value, _path) when is_atom(value), do: Atom.to_string(value)
+  defp encode(value, _path, _encodings) when value in [nil, true, false], do: value
+  defp encode(value, _path, _encodings) when is_atom(value), do: Atom.to_string(value)
 
-  defp encode(value, path) when is_integer(value) and (value > @max_int or value < @min_int) do
+  defp encode(value, path, _encodings) when is_integer(value) and (value > @max_int or value < @min_int) do
     invalid!(path, "is an integer that doesn't fit in 64 bits, which Typst integers are limited to")
   end
 
-  defp encode(value, _path) when is_number(value), do: value
+  defp encode(value, _path, _encodings) when is_number(value), do: value
 
-  defp encode(value, path) when is_binary(value) do
+  defp encode(value, path, _encodings) when is_binary(value) do
     if String.valid?(value) do
       value
     else
@@ -50,65 +50,87 @@ defmodule Typsty.Value do
     end
   end
 
-  defp encode(value, path) when is_list(value) do
+  defp encode(value, path, _encodings) when is_list(value) do
     if not proper?(value), do: invalid!(path, "is an improper list")
     depth!(path)
 
     value
     |> Enum.with_index()
-    |> Enum.map(fn {item, index} -> encode(item, [index | path]) end)
+    |> Enum.map(fn {item, index} -> encode(item, [index | path], 0) end)
   end
 
-  defp encode(value, path) when is_tuple(value), do: value |> Tuple.to_list() |> encode(path)
+  defp encode(value, path, encodings) when is_tuple(value), do: value |> Tuple.to_list() |> encode(path, encodings)
 
-  defp encode(%Date{} = date, _path) do
+  defp encode(%Date{} = date, _path, _encodings) do
     %Date{year: year, month: month, day: day} = Date.convert!(date, Calendar.ISO)
     {:date, year, month, day}
   end
 
-  defp encode(%Time{} = time, _path) do
+  defp encode(%Time{} = time, _path, _encodings) do
     %Time{hour: hour, minute: minute, second: second} = Time.convert!(time, Calendar.ISO)
     {:time, hour, minute, second}
   end
 
-  defp encode(%NaiveDateTime{} = datetime, _path) do
+  defp encode(%NaiveDateTime{} = datetime, _path, _encodings) do
     datetime = NaiveDateTime.convert!(datetime, Calendar.ISO)
     {:datetime, datetime.year, datetime.month, datetime.day, datetime.hour, datetime.minute, datetime.second}
   end
 
   # Typst datetimes have no time zone, so a DateTime keeps its wall time
-  defp encode(%DateTime{} = datetime, path), do: datetime |> DateTime.to_naive() |> encode(path)
+  defp encode(%DateTime{} = datetime, path, encodings),
+    do: datetime |> DateTime.to_naive() |> encode(path, encodings)
 
-  defp encode(%{__struct__: Decimal, coef: coef, exp: exp, sign: sign}, path) do
-    if is_integer(coef) do
-      {:decimal, decimal_string(sign, coef, exp)}
-    else
-      invalid!(path, "is a decimal that isn't a number (#{coef}), which Typst decimals can't represent")
+  defp encode(%{__struct__: Decimal, coef: coef, exp: exp, sign: sign}, path, _encodings) do
+    cond do
+      not is_integer(coef) ->
+        invalid!(path, "is a decimal that isn't a number (#{coef}), which Typst decimals can't represent")
+
+      exp > @max_decimal_exponent or exp < -(@max_decimal_exponent + length(Integer.digits(coef))) ->
+        invalid!(
+          path,
+          "is a decimal with an exponent of #{exp}, which doesn't fit in a Typst decimal " <>
+            "(about 28 significant digits, at most 28 of them after the decimal point)"
+        )
+
+      true ->
+        {:decimal, decimal_string(sign, coef, exp)}
     end
   end
 
-  defp encode(%module{} = struct, path) do
+  defp encode(%Typsty.Template{}, path, _encodings) do
+    invalid!(
+      path,
+      "is a Typsty.Template, which can't be passed to another template. " <>
+        "Pass the data it uses instead, or put its source in a .typ file and import it"
+    )
+  end
+
+  defp encode(%module{}, path, encodings) when encodings >= @max_encodings do
+    invalid!(path, "is a #{inspect(module)} struct, after #{encodings} structs in a row were encoded as other structs")
+  end
+
+  defp encode(%module{} = struct, path, encodings) do
     case Typsty.Encoder.encode(struct) do
       %^module{} -> invalid!(path, "is a #{inspect(module)} struct that Typsty.Encoder encodes as itself")
-      encoded -> encode(encoded, path)
+      encoded -> encode(encoded, path, encodings + 1)
     end
   end
 
-  defp encode(value, path) when is_map(value) do
+  defp encode(value, path, _encodings) when is_map(value) do
     depth!(path)
 
     Enum.reduce(value, %{}, fn {key, item}, acc ->
       key = key!(key, path)
 
       if Map.has_key?(acc, key) do
-        invalid!(path, "has the key #{inspect(key)} more than once, once the keys are converted to strings")
+        invalid!(path, "has two keys that are both #{inspect(key)} once converted to strings (like :name and \"name\")")
       end
 
-      Map.put(acc, key, encode(item, [key | path]))
+      Map.put(acc, key, encode(item, [key | path], 0))
     end)
   end
 
-  defp encode(value, path) do
+  defp encode(value, path, _encodings) do
     invalid!(path, "is #{inspect(value)}, which can't be passed to Typst")
   end
 
@@ -124,7 +146,10 @@ defmodule Typsty.Value do
   defp key!(key, _path) when is_integer(key), do: Integer.to_string(key)
 
   defp key!(key, path) do
-    invalid!(path, "has the key #{inspect(key)}. Keys must be atoms, strings or integers")
+    invalid!(
+      path,
+      "has the key #{inspect(key)}. Keys must be strings, integers, or atoms other than nil, true and false"
+    )
   end
 
   defp depth!(path) do
@@ -161,7 +186,7 @@ defmodule Typsty.Value do
     raise ArgumentError, "invalid variables: #{describe(path)} #{problem}"
   end
 
-  defp describe([]), do: "the value"
+  defp describe([]), do: "the assigns"
 
   # Deeply nested paths are shortened to their start and end
   defp describe(path) when length(path) > 12 do

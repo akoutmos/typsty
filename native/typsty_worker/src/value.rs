@@ -39,16 +39,18 @@ fn to_value(term: &Term, depth: usize) -> Result<Value> {
             .collect::<Result<Array>>()
             .map(Value::Array),
         Term::Map(entries) => {
-            let mut dict = Dict::new();
-            for (key, value) in entries {
-                let Term::Binary(key) = key else {
-                    return Err(invalid("map keys must be strings"));
-                };
-                let key =
-                    std::str::from_utf8(key).map_err(|_| invalid("map keys must be strings"))?;
-                dict.insert(Str::from(key), to_value(value, depth + 1)?);
-            }
-            Ok(Value::Dict(dict))
+            let entries = entries
+                .iter()
+                .map(|(key, value)| {
+                    let Term::Binary(key) = key else {
+                        return Err(invalid("map keys must be strings"));
+                    };
+                    let key = std::str::from_utf8(key)
+                        .map_err(|_| invalid("map keys must be strings"))?;
+                    Ok((Str::from(key), to_value(value, depth + 1)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Value::Dict(values::dict(entries)))
         }
         Term::Tuple(elements) => tagged(elements),
     }

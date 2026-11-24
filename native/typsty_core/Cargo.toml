@@ -3,6 +3,7 @@ name = "typsty_core"
 description = "Compiles and exports Typst documents for Typsty's NIF and worker"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
@@ -17,5 +18,7 @@ typstyle-core.workspace = true
 time.workspace = true
 # Typst's thread pool, configured with large stacks
 rayon.workspace = true
-# Reads image dimensions from headers, to reject decompression bombs before decoding
+# Reads image dimensions from headers, to refuse decompression bombs before decoding
 imagesize.workspace = true
+# Decompresses compressed SVGs with a limit, to refuse ones that expand too much
+flate2.workspace = true

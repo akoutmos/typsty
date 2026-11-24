@@ -10,6 +10,8 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# Typst 0.15 needs Rust 1.92
+rust-version = "1.92"
 publish = false
 
 [workspace.dependencies]
@@ -25,6 +27,8 @@ typstyle-core = "0.15.3"
 time = "0.3"
 rayon = "1"
 imagesize = "0.14"
+flate2 = "1"
+libc = "0.2"
 
 [profile.release]
 # Panics must unwind, so that they become errors instead of aborting the VM
@@ -32,3 +36,5 @@ panic = "unwind"
 # Smaller and faster binaries, at the cost of longer release builds
 lto = true
 codegen-units = 1
+# Panics are reported with their message and location, so the binaries don't need symbols
+strip = true

@@ -46,8 +46,16 @@ defmodule Typsty.Diagnostic do
     }
 
     # The template's first line starts at its column (after `~TYPST"`, for a sigil on one
-    # line), and the others at its indentation (for a heredoc)
-    column = if line == 1, do: column + template.column - 1, else: column + template.indentation
+    # line), and the others at its indentation (for a heredoc). They're unknown when the
+    # formatter reports an error
+    column =
+      cond do
+        is_nil(column) -> nil
+        line == 1 and is_integer(template.column) -> column + template.column - 1
+        line > 1 and is_integer(template.indentation) -> column + template.indentation
+        true -> nil
+      end
+
     diagnostic = %{diagnostic | column: column}
 
     locate_trace(diagnostic, template)

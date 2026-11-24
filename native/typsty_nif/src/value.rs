@@ -59,14 +59,16 @@ fn to_value(term: Term, depth: usize) -> Result<Value> {
             Ok(Value::Array(array))
         }
         TermType::Map => {
-            let mut dict = Dict::new();
-            for (key, value) in MapIterator::new(term).ok_or_else(|| invalid("unexpected map"))? {
-                let key: &str = key
-                    .decode()
-                    .map_err(|_| invalid("map keys must be strings"))?;
-                dict.insert(Str::from(key), to_value(value, depth + 1)?);
-            }
-            Ok(Value::Dict(dict))
+            let entries = MapIterator::new(term)
+                .ok_or_else(|| invalid("unexpected map"))?
+                .map(|(key, value)| {
+                    let key: &str = key
+                        .decode()
+                        .map_err(|_| invalid("map keys must be strings"))?;
+                    Ok((Str::from(key), to_value(value, depth + 1)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Value::Dict(values::dict(entries)))
         }
         TermType::Tuple => tagged(term),
         _ => Err(invalid("unsupported term")),

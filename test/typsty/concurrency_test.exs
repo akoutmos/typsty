@@ -75,7 +75,10 @@ defmodule Typsty.ConcurrencyTest do
 
       # Every render is different, so a mixed-up file or variable would show
       assert expected |> Map.values() |> Enum.uniq() |> length() == Enum.count(@ids)
-      assert Enum.all?(Map.values(expected), &match?({:ok, _}, &1))
+
+      for {id, result} <- expected,
+          not match?({:ok, _}, result),
+          do: flunk("render #{id}: #{inspect(result, limit: 3)}")
 
       # Each id is rendered several times, interleaved with the others
       jobs = for _round <- 1..4, id <- Enum.shuffle(@ids), do: id

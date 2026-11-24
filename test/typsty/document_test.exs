@@ -7,7 +7,7 @@ defmodule Typsty.DocumentTest do
   describe "a module with render/1" do
     test "renders the ~TYPST sigil with the assigns render/1 computed" do
       assert {:ok, "%PDF-" <> _} = Greeting.to_pdf(%{name: "World", items: ["one", "two"]})
-      assert {:ok, [<<137, "PNG", _::binary>>]} = Greeting.to_png(name: "World", items: [])
+      assert {:ok, [<<137, "PNG", _::binary>>]} = Greeting.to_png(%{name: "World", items: []})
       assert {:ok, ["<svg" <> _]} = Greeting.to_svg(%{name: "World", items: []})
     end
 

@@ -1,5 +1,6 @@
 defmodule Typsty.PoolProcessesTest do
-  # Counts the worker processes the VM has started, so these tests run on their own
+  # Counts the worker processes the VM has started, and changes the application config, so
+  # these tests run on their own
   use ExUnit.Case, async: false
 
   alias Typsty.Pool
@@ -29,6 +30,11 @@ defmodule Typsty.PoolProcessesTest do
     |> Enum.sort()
   end
 
+  # Waits until the pool has no idle workers. NimblePool keeps them in a queue.
+  defp wait_until_busy(pool) do
+    assert eventually(fn -> :queue.len(:sys.get_state(pool).resources) == 0 end)
+  end
+
   defp eventually(fun, tries \\ 200) do
     cond do
       fun.() -> true
@@ -44,7 +50,7 @@ defmodule Typsty.PoolProcessesTest do
 
   test "workers are started with the pool, and end with it" do
     pid = start_supervised!({Pool, name: :pool_lifecycle, size: 3})
-    assert length(workers()) == 3
+    assert eventually(fn -> length(workers()) == 3 end)
 
     stop_supervised!(:pool_lifecycle)
     refute Process.alive?(pid)
@@ -53,6 +59,7 @@ defmodule Typsty.PoolProcessesTest do
 
   test "a worker whose render times out is replaced" do
     start_supervised!({Pool, name: :pool_timeout, size: 2})
+    assert eventually(fn -> length(workers()) == 2 end)
     before = workers()
 
     assert {:error, _} = Typsty.to_pdf(@busy, %{}, pool: :pool_timeout, timeout: 100)
@@ -63,10 +70,11 @@ defmodule Typsty.PoolProcessesTest do
 
   test "a worker is stopped when the process rendering with it exits" do
     start_supervised!({Pool, name: :pool_caller_exits, size: 1})
+    assert eventually(fn -> length(workers()) == 1 end)
     [worker] = workers()
 
     caller = spawn(fn -> Typsty.to_pdf(@busy, %{}, pool: :pool_caller_exits, timeout: :infinity) end)
-    Process.sleep(200)
+    wait_until_busy(:pool_caller_exits)
     Process.exit(caller, :kill)
 
     # The busy worker ends right away, and a new one replaces it
@@ -76,6 +84,7 @@ defmodule Typsty.PoolProcessesTest do
 
   test "workers are replaced after :max_renders renders" do
     start_supervised!({Pool, name: :pool_recycled, size: 1, max_renders: 2})
+    assert eventually(fn -> length(workers()) == 1 end)
     [first] = workers()
 
     assert {:ok, _} = Typsty.to_pdf("1", %{}, pool: :pool_recycled)
@@ -83,5 +92,16 @@ defmodule Typsty.PoolProcessesTest do
 
     assert {:ok, _} = Typsty.to_pdf("2", %{}, pool: :pool_recycled)
     assert eventually(fn -> match?([second] when second != first, workers()) end)
+  end
+
+  test "the pool can be set in the config, for every render" do
+    start_supervised!({Pool, name: :pool_configured, size: 1})
+
+    Application.put_env(:typsty, :pool, :pool_configured)
+    on_exit(fn -> Application.delete_env(:typsty, :pool) end)
+
+    # PDF files can only be read in a pool
+    {:ok, pdf} = Typsty.to_pdf("#set page(width: 2cm, height: 2cm)\nA PDF", %{}, pool: nil)
+    assert {:ok, _pdf} = Typsty.to_pdf(~S|#image("page.pdf")|, %{}, files: %{"page.pdf" => pdf})
   end
 end

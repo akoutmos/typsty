@@ -24,7 +24,14 @@ defmodule Typsty.WorkerBuild do
   # The worker's sources, which Typsty.Native tracks so that changing them rebuilds it
   @spec sources() :: [Path.t()]
   def sources do
-    ["Cargo.toml", "Cargo.lock", "typsty_worker/Cargo.toml", "typsty_worker/src/**/*.rs"]
+    [
+      "Cargo.toml",
+      "Cargo.lock",
+      "typsty_worker/Cargo.toml",
+      "typsty_worker/src/**/*.rs",
+      "typsty_core/Cargo.toml",
+      "typsty_core/src/**/*.rs"
+    ]
     |> Enum.flat_map(&Path.wildcard(Path.join(@native_dir, &1)))
   end
 
@@ -39,8 +46,14 @@ defmodule Typsty.WorkerBuild do
       {output, 0} ->
         destination = Path.join("priv/native", executable_name())
         File.mkdir_p!(Path.dirname(destination))
-        File.cp!(executable!(output), destination)
-        File.chmod!(destination, 0o755)
+
+        # Copied next to it and renamed into place, rather than copied over it: a running
+        # worker's program can't be overwritten on Linux ("text file busy"), but it can be
+        # replaced
+        temporary = destination <> ".tmp"
+        File.cp!(executable!(output), temporary)
+        File.chmod!(temporary, 0o755)
+        File.rename!(temporary, destination)
         Mix.Project.build_structure()
 
       {_output, status} ->

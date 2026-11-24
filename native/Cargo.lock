@@ -2683,6 +2683,7 @@ name = "typsty_core"
 version = "0.1.0"
 dependencies = [
  "comemo",
+ "flate2",
  "imagesize",
  "rayon",
  "time",

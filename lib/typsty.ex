@@ -65,14 +65,26 @@ defmodule Typsty do
   | `Decimal`                                 | `decimal`                              |
   | other structs                             | see `Typsty.Encoder`                   |
 
-  Top-level keys must be valid Typst identifiers (`invoice_number` or `invoice-number`, but
-  not `invoice number` or `for`). Map keys inside the data can be anything.
+  The assigns are a map. Its keys must be valid Typst identifiers (`invoice_number` or
+  `invoice-number`, but not `invoice number`, `for` or `_`). The keys of maps inside the data
+  can be atoms, strings or integers.
+
+  A few things to know about the conversion:
+
+  - Dictionaries are sorted by key, since Elixir maps have no order.
+  - Keyword lists are lists of tuples, so they become arrays of `(key, value)` pairs; pass
+    maps for dictionaries. Charlists are lists of integers too.
+  - Typst's datetimes have no fractions of a second or time zones: times are truncated to
+    the second, and a `DateTime` keeps its wall time (convert it to the time zone the
+    document should show first).
+  - Typst's decimals have 28 significant digits, at most 28 of them after the decimal point.
 
   Like `let` bindings in the template, the variables are only visible in the template
   itself, so they never shadow Typst's standard library in imported files or packages. A
   variable named after a standard library function (such as `title`) shadows it in the
-  template only; the function is still available as `std.title`. Other files can read the
-  variables from `sys.inputs`, which is also how a template can make a variable optional:
+  template only; the function is still available as `std.title` (unless a variable is named
+  `std`). Other files can read the variables from `sys.inputs`, which is also how a template
+  can make a variable optional:
 
   ```typst
   #let subtitle = sys.inputs.at("subtitle", default: none)
@@ -108,8 +120,16 @@ defmodule Typsty do
   To also read files from a directory, set `:root`; files given with `:files` take
   precedence. Without `:root`, the document can only read the files it's given.
 
-  Typst interns every file path it sees for the life of the VM, up to 65,536 of them. Use
-  stable names, like `logo.png` or `photos/1.jpg`, rather than a unique name per render.
+  Typst keeps every file path it sees for the life of the VM, and has room for 65,535 of
+  them. Use stable names, like `logo.png` or `photos/1.jpg`, rather than a unique name per
+  render. Typsty stops a render that reads more than 10,000 different files, refuses new
+  paths in `:files` once 50,000 have been given, and stops renders that need a new path
+  once Typst's table is nearly full. Rendering in a `Typsty.Pool` with `:max_renders` starts
+  each worker with an empty table. Typst keeps label names for the life of the VM too, so
+  make labels from fixed names, not from data such as ids.
+
+  Documents rendered inside the VM can't read PDF files (as images, for example): a
+  malformed PDF can crash the VM. Render them in a `Typsty.Pool`, which can.
 
   ## Options
 
@@ -121,7 +141,8 @@ defmodule Typsty do
   ```
 
   - `:files` - a map (or list of tuples) of paths to binaries, as above.
-  - `:root` - a directory to read the files that aren't in `:files` from. Defaults to `nil`.
+  - `:root` - a directory to read the files that aren't in `:files` from. Documents can't
+    read outside it, even through symbolic links. Defaults to `nil`.
   - `:font_paths` - directories to load fonts from, searched recursively. Defaults to `[]`.
   - `:system_fonts` - whether to use the fonts installed on the system. Defaults to `true`.
     Turn it off for documents that render the same on every machine.
@@ -134,28 +155,51 @@ defmodule Typsty do
   - `:ppi` - for PNG, the resolution in pixels per inch. Defaults to `144`.
   - `:pdf_standards` - for PDF, the standards to conform to, such as `["a-2b"]` or
     `["ua-1"]`. Defaults to `[]`.
-  - `:timeout` - how long to wait for the render, in milliseconds, or `:infinity`, including
-    the time spent waiting for a free slot (see `:max_concurrent_renders` below). Defaults
-    to `60_000`. A render that times out returns an error and is cancelled: it stops the
-    next time Typst lays out content, loads a file or a font, or exports a page, which
-    for most documents is within milliseconds. A template doing pure computation (a long
-    loop of arithmetic) keeps running until it gets to one of those. In a `Typsty.Pool`, a
-    render that times out is stopped right away.
-  - `:pool` - a `Typsty.Pool` to render in, instead of rendering inside the VM. Defaults to
-    `nil`.
+  - `:timeout` - how long to wait for the render, in milliseconds (at most `4_294_967_295`),
+    or `:infinity`, including the time spent waiting for a free slot (see
+    `:max_concurrent_renders` below). Defaults to `60_000`. A render that times out returns
+    an error and is cancelled: it stops the next time Typst lays out content, loads a file
+    or a font, or exports a PNG or SVG page, which for most documents is within
+    milliseconds. A template doing pure computation (a long loop of arithmetic) keeps running
+    until it gets to one of those. In a `Typsty.Pool`, a render that times out is stopped
+    right away.
+  - `:pool` - the name or pid of a `Typsty.Pool` to render in, instead of rendering inside
+    the VM. Defaults to `nil`.
 
   Renders also share one setting that can only be set in the application config:
 
-  - `:max_concurrent_renders` - how many renders may run at once, counting renders that
-    timed out and are still being cancelled. A render waits for a free slot, within its
-    timeout. This keeps renders that keep timing out from piling up in the background.
-    Defaults to the number of dirty CPU schedulers (the number of CPU cores), which is
-    how many renders can run at once anyway. See `running_renders/0`.
+  - `:max_concurrent_renders` - how many renders may run inside the VM at once, counting
+    renders that timed out and are still being cancelled. A render waits for a free slot,
+    within its timeout. This keeps renders that keep timing out from piling up in the
+    background. Defaults to the number of dirty CPU schedulers (normally the number of CPU
+    cores). See `running_renders/0`. Renders in a `Typsty.Pool` are limited by its size
+    instead.
+
+  Renders run on threads of their own, outside the BEAM's schedulers, and the process that
+  asked for the render waits for a message, so a render never holds up a scheduler.
 
   Fonts are scanned once for each combination of `:font_paths`, `:system_fonts` and
   `:embedded_fonts` and then cached, so only the first render with given font settings
   pays for scanning them. Call `font_families/1` when your application starts to scan them
   ahead of time.
+
+  ## Errors
+
+  The functions that render return `{:error, %Typsty.RenderError{}}` when the document can't
+  be rendered, with a `:reason` that tells Typst's errors apart from timeouts and the like
+  (see `Typsty.RenderError`). They raise `ArgumentError` for invalid arguments: invalid
+  options, assigns that aren't a map, or data that can't be passed to Typst (see
+  [Variables](#module-variables)).
+
+  ## What a template can do
+
+  Typsty protects the VM from the data a document is rendered with: values, files and
+  images are checked before Typst gets them, and renders run with large stacks, away from
+  the schedulers. A template, though, is code. A template that loops forever is stopped at
+  its timeout only when it next calls into Typst, and one that asks for an enormous amount
+  of memory (`"a" * 1000000000000`) makes the allocation fail, which ends the VM. Render
+  templates you don't control, such as ones your users write, in a `Typsty.Pool`, where
+  such a render only ends its worker.
 
   ## Warnings
 
@@ -198,8 +242,8 @@ defmodule Typsty do
     pool: nil
   ]
 
-  @typedoc "Assigns for a template: a map or keyword list with atom or string keys."
-  @type assigns :: map() | keyword()
+  @typedoc "Assigns for a template: a map with atom or string keys."
+  @type assigns :: map()
 
   @typedoc "A template: Typst source, or a template from the `~TYPST` sigil or `render/1`."
   @type template :: String.t() | Template.t()
@@ -219,6 +263,18 @@ defmodule Typsty do
   - `:template` - the template file, relative to the module's file. Defaults to the
     module's file name with the `.typ` extension. Only used when the module doesn't define
     `render/1`.
+
+  ## Overriding the generated functions
+
+  `to_pdf/2`, `to_png/2` and `to_svg/2` are overridable, to give a module's renders default
+  options, for example. Override them without default arguments, and call `super/2`; the
+  versions with one argument and the bang variants call them, so they get the defaults too:
+
+  ```elixir
+  def to_pdf(assigns, opts) do
+    super(assigns, Keyword.put_new(opts, :files, %{"logo.png" => MyApp.Assets.logo()}))
+  end
+  ```
   """
   defmacro __using__(opts) do
     opts = Keyword.validate!(opts, [:template])
@@ -274,16 +330,18 @@ defmodule Typsty do
   @doc false
   defmacro __before_compile__(env) do
     {template, explicit?} = Module.get_attribute(env.module, :__typsty_template__)
-    render_defined? = Module.defines?(env.module, {:render, 1})
+    render_defined? = Module.defines?(env.module, {:render, 1}, :def)
     template_exists? = File.regular?(template)
     relative = Path.relative_to_cwd(template)
 
+    check_render_is_public!(env)
+
     cond do
-      render_defined? and template_exists? ->
+      render_defined? and (template_exists? or explicit?) ->
         raise CompileError,
           file: env.file,
           line: env.line,
-          description: "#{inspect(env.module)} defines render/1 and has a template at #{relative}. Use one or the other"
+          description: "#{inspect(env.module)} defines render/1 and has a template (#{relative}). Use one or the other"
 
       render_defined? ->
         # Recompiles the module if the template is added later, to report both being defined
@@ -292,8 +350,7 @@ defmodule Typsty do
         end
 
       template_exists? ->
-        source = File.read!(template)
-        validate!(%Template{source: source, file: template})
+        source = read_template!(template, env)
 
         quote do
           @external_resource unquote(template)
@@ -315,6 +372,30 @@ defmodule Typsty do
             "#{inspect(env.module)} needs a template: define render/1 using the ~TYPST sigil, " <>
               "or add a template file (#{reason})"
     end
+  end
+
+  defp check_render_is_public!(env) do
+    if Module.defines?(env.module, {:render, 1}, :defp) do
+      raise CompileError,
+        file: env.file,
+        line: env.line,
+        description: "#{inspect(env.module)} defines render/1 as private: it must be public (def, not defp)"
+    end
+  end
+
+  # Reads a .typ template, checking its syntax
+  defp read_template!(template, env) do
+    source = File.read!(template)
+
+    if not String.valid?(source) do
+      raise CompileError,
+        file: env.file,
+        line: env.line,
+        description: "the template #{Path.relative_to_cwd(template)} isn't valid UTF-8. Save it as UTF-8"
+    end
+
+    validate!(%Template{source: source, file: template})
+    source
   end
 
   @doc """
@@ -419,7 +500,7 @@ defmodule Typsty do
   """
   @spec validate(String.t()) :: :ok | {:error, [Diagnostic.t()]}
   def validate(source) when is_binary(source) do
-    case Native.syntax_errors(source) do
+    case Native.syntax_errors(utf8!(source, "the Typst source")) do
       [] -> :ok
       diagnostics -> {:error, diagnostics}
     end
@@ -431,15 +512,15 @@ defmodule Typsty do
 
   ## Options
 
-  - `:line_length` - the maximum line length. Defaults to `80`.
+  - `:line_length` - the maximum line length. Defaults to `98`, like `mix format`.
   - `:indent` - the number of spaces to indent by. Defaults to `2`.
   - `:wrap_text` - whether to wrap long lines of text in markup. Defaults to `false`.
   """
   @spec format(String.t(), keyword()) :: {:ok, String.t()} | {:error, [Diagnostic.t()]}
   def format(source, opts \\ []) when is_binary(source) do
-    opts = Keyword.validate!(opts, line_length: 80, indent: 2, wrap_text: false)
+    opts = Keyword.validate!(opts, line_length: 98, indent: 2, wrap_text: false)
 
-    Native.format(source, %{
+    Native.format(utf8!(source, "the Typst source"), %{
       line_width: positive_integer!(opts[:line_length], :line_length),
       indent_width: positive_integer!(opts[:indent], :indent),
       wrap_text: boolean!(opts[:wrap_text], :wrap_text)
@@ -461,9 +542,9 @@ defmodule Typsty do
   end
 
   @doc """
-  Returns the number of renders running, including renders that timed out and are still
-  being cancelled. Useful in health checks and metrics: it's at most
-  `:max_concurrent_renders`.
+  Returns the number of renders running inside the VM, including renders that timed out
+  and are still being cancelled. Useful in health checks and metrics: it's at most
+  `:max_concurrent_renders`. Renders in a `Typsty.Pool` aren't counted.
   """
   @spec running_renders() :: non_neg_integer()
   def running_renders, do: Native.running_renders()
@@ -492,36 +573,60 @@ defmodule Typsty do
   def __unwrap__!({:ok, result}), do: result
   def __unwrap__!({:error, %RenderError{} = error}), do: raise(error)
 
-  defp template(source, assigns) when is_binary(source), do: %Template{source: source, assigns: assigns!(assigns)}
+  defp template(source, assigns) when is_binary(source) do
+    %Template{source: utf8!(source, "the Typst source"), assigns: assigns!(assigns)}
+  end
 
   defp template(%Template{} = template, assigns) do
     %{template | assigns: Map.merge(assigns!(template.assigns), assigns!(assigns))}
   end
 
-  defp assigns!(assigns) when is_map(assigns), do: assigns
+  defp template(module, _assigns) when is_atom(module) and module not in [nil, true, false] do
+    raise ArgumentError,
+          "expected Typst source or a Typsty.Template, got: #{inspect(module)}. " <>
+            "To render a document module, call its functions, like #{inspect(module)}.to_pdf(assigns)"
+  end
 
-  defp assigns!(assigns) when is_list(assigns) do
-    if Keyword.keyword?(assigns) do
-      Map.new(assigns)
+  defp template(other, _assigns) do
+    raise ArgumentError, "expected Typst source (a string) or a Typsty.Template, got: #{inspect(other)}"
+  end
+
+  defp utf8!(source, what) do
+    if String.valid?(source) do
+      source
     else
-      raise ArgumentError, "the assigns must be a map or a keyword list, got: #{inspect(assigns)}"
+      raise ArgumentError, "#{what} isn't valid UTF-8"
     end
   end
 
-  defp assigns!(assigns),
-    do: raise(ArgumentError, "the assigns must be a map or a keyword list, got: #{inspect(assigns)}")
+  defp assigns!(%_{} = struct) do
+    raise ArgumentError,
+          "the assigns must be a map, got a #{inspect(struct.__struct__)} struct. " <>
+            "Put it in a map, like %{invoice: invoice}, to pass it to the template"
+  end
+
+  defp assigns!(assigns) when is_map(assigns), do: assigns
+
+  defp assigns!(assigns) when is_list(assigns) do
+    raise ArgumentError,
+          "the assigns must be a map, got a list: #{inspect(assigns)}. " <>
+            "Options go in the argument after the assigns, like Typsty.to_png(source, %{}, ppi: 300)"
+  end
+
+  defp assigns!(assigns), do: raise(ArgumentError, "the assigns must be a map, got: #{inspect(assigns)}")
 
   defp render(%Template{} = template, format, opts, module) do
     metadata = %{module: module, format: format, template: template}
 
     :telemetry.span([:typsty, :render], metadata, fn ->
-      opts = opts |> Keyword.validate!(Keyword.keys(@default_options)) |> with_defaults()
+      opts = opts |> options!() |> with_defaults()
       variables = Value.variables(template.assigns)
       files = files!(opts[:files])
+      pool = pool!(opts[:pool])
 
       native_opts = %{
         format: format,
-        root: opts[:root] && Path.expand(opts[:root]),
+        root: root!(opts[:root]),
         package_paths: paths!(opts[:package_paths], :package_paths),
         fonts: font_options(opts),
         ppi: opts[:ppi] |> positive_number!(:ppi) |> Kernel.*(1.0),
@@ -530,52 +635,105 @@ defmodule Typsty do
         max_running: max_concurrent_renders!()
       }
 
-      case render_with(opts[:pool], template.source, variables, files, native_opts) do
+      case render_with(pool, template.source, variables, files, native_opts) do
         {:ok, output, warnings} ->
           warnings = Enum.map(warnings, &Diagnostic.locate(&1, template))
           log_warnings(warnings)
           {{:ok, output}, Map.merge(metadata, %{result: :ok, diagnostics: warnings})}
 
-        {:error, message} when is_binary(message) ->
+        {:error, :invalid, message} ->
           raise ArgumentError, message
 
-        {:error, diagnostics} ->
-          diagnostics = Enum.map(diagnostics, &(&1 |> Diagnostic.locate(template) |> package_hint()))
-
-          {{:error, %RenderError{diagnostics: diagnostics}},
-           Map.merge(metadata, %{result: :error, diagnostics: diagnostics})}
+        {:error, reason, details} ->
+          diagnostics = diagnostics(reason, details, template, native_opts)
+          error = %RenderError{reason: reason, diagnostics: diagnostics}
+          {{:error, error}, Map.merge(metadata, %{result: :error, reason: reason, diagnostics: diagnostics})}
       end
     end)
+  end
+
+  defp diagnostics(:typst, diagnostics, template, native_opts) do
+    Enum.map(diagnostics, &(&1 |> Diagnostic.locate(template) |> rewrite_hints(native_opts)))
+  end
+
+  defp diagnostics(_reason, message, _template, _native_opts) when is_binary(message) do
+    [%Diagnostic{severity: :error, message: message}]
   end
 
   # A package from Typst Universe that isn't in the :package_paths directories
   @missing_package ~r/package not found \(searched for (@preview\/[^\s)]+)\)/
 
-  defp package_hint(%Diagnostic{message: message, hints: hints} = diagnostic) do
+  # Typst's hints are written for its command-line tool, which takes a --root argument
+  @root_hint ~r/--root/
+
+  defp rewrite_hints(%Diagnostic{message: message, hints: hints} = diagnostic, native_opts) do
+    hints =
+      Enum.map(hints, fn hint ->
+        if hint =~ @root_hint,
+          do: "files outside the project root can only be read by changing the :root option",
+          else: hint
+      end)
+
     case Regex.run(@missing_package, message) do
-      [_, spec] ->
-        hint =
-          "download it with `mix typsty.packages.get #{spec}`, " <>
-            "and add the directory it's saved in to the :package_paths option"
-
-        %{diagnostic | hints: hints ++ [hint]}
-
-      nil ->
-        diagnostic
+      [_, spec] -> %{diagnostic | hints: hints ++ [package_hint(spec, native_opts.package_paths)]}
+      nil -> %{diagnostic | hints: hints}
     end
   end
 
-  defp render_with(nil, source, variables, files, native_opts) do
-    Native.render(source, variables, files, native_opts)
+  defp package_hint(spec, package_paths) do
+    "download it with `mix typsty.packages.get #{spec}`, and add the directory it's saved in " <>
+      "to the :package_paths option. #{searched(package_paths)}"
   end
 
-  defp render_with(pool, source, variables, files, native_opts)
-       when is_atom(pool) or is_pid(pool) or (is_tuple(pool) and elem(pool, 0) in [:global, :via]) do
+  defp searched([]), do: "The :package_paths option is empty, so no directories were searched"
+  defp searched(paths), do: "Searched " <> Enum.map_join(paths, ", ", &describe_path/1)
+
+  defp describe_path(path), do: if(File.dir?(path), do: path, else: "#{path} (which doesn't exist)")
+
+  defp render_with(nil, source, variables, files, native_opts) do
+    reference = make_ref()
+
+    case Native.start_render(reference, source, variables, files, native_opts) do
+      {:ok, job} -> await(reference, job, native_opts.timeout, native_opts.max_running)
+      {:error, _reason, _message} = error -> error
+    end
+  end
+
+  defp render_with(pool, source, variables, files, native_opts) do
     Typsty.Pool.__render__(pool, source, variables, files, native_opts)
   end
 
-  defp render_with(pool, _source, _variables, _files, _native_opts) do
-    raise ArgumentError, "the :pool option must be the name or pid of a Typsty.Pool, got: #{inspect(pool)}"
+  # The render's thread sends its result. Holding on to the job until then keeps the render
+  # going: once the job is garbage collected (when this process exits, say), it's cancelled.
+  defp await(reference, job, timeout, max_running) do
+    receive do
+      {^reference, result} -> result
+    after
+      timeout || :infinity ->
+        case Native.cancel_render(job) do
+          :queued ->
+            {:error, :busy,
+             "rendering didn't start within the timeout (#{timeout} ms): " <>
+               "#{max_running} #{if max_running == 1, do: "render was", else: "renders were"} already running " <>
+               "(the :max_concurrent_renders limit), counting renders that timed out and are still being cancelled"}
+
+          :running ->
+            {:error, :timeout, "rendering didn't finish within the timeout (#{timeout} ms), and is being cancelled"}
+
+          :finished ->
+            receive do
+              {^reference, result} -> result
+            end
+        end
+    end
+  end
+
+  defp options!(opts) do
+    if Keyword.keyword?(opts) do
+      Keyword.validate!(opts, Keyword.keys(@default_options))
+    else
+      raise ArgumentError, "the options must be a keyword list, got: #{inspect(opts)}"
+    end
   end
 
   defp with_defaults(opts) do
@@ -649,11 +807,48 @@ defmodule Typsty do
     end
   end
 
+  # The longest a receive can wait
+  @max_timeout 4_294_967_295
+
   defp timeout!(:infinity), do: nil
-  defp timeout!(timeout) when is_integer(timeout) and timeout > 0, do: timeout
+  defp timeout!(timeout) when is_integer(timeout) and timeout > 0 and timeout <= @max_timeout, do: timeout
 
   defp timeout!(timeout) do
-    raise ArgumentError, "the :timeout option must be a positive integer or :infinity, got: #{inspect(timeout)}"
+    raise ArgumentError,
+          "the :timeout option must be a positive integer (at most #{@max_timeout}) or :infinity, got: #{inspect(timeout)}"
+  end
+
+  defp root!(nil), do: nil
+
+  defp root!(root) when is_binary(root), do: Path.expand(root)
+
+  defp root!(root) do
+    raise ArgumentError, "the :root option must be a path (a string) or nil, got: #{inspect(root)}"
+  end
+
+  # A pool's name or pid: an atom, {:global, name} or {:via, module, name}
+  defguardp is_pool(pool)
+            when (is_atom(pool) and pool not in [true, false]) or is_pid(pool) or
+                   (is_tuple(pool) and tuple_size(pool) in [2, 3] and elem(pool, 0) in [:global, :via])
+
+  defp pool!(nil), do: nil
+
+  defp pool!(pool) when is_pool(pool) do
+    case GenServer.whereis(pool) do
+      pid when is_pid(pid) and node(pid) == node() ->
+        pid
+
+      nil ->
+        raise ArgumentError, "the :pool option names no running Typsty.Pool: #{inspect(pool)}"
+
+      _remote ->
+        raise ArgumentError,
+              "the :pool option must be a Typsty.Pool on this node (its workers are local processes), got: #{inspect(pool)}"
+    end
+  end
+
+  defp pool!(pool) do
+    raise ArgumentError, "the :pool option must be the name or pid of a Typsty.Pool, or nil, got: #{inspect(pool)}"
   end
 
   defp positive_integer!(value, _option) when is_integer(value) and value > 0, do: value
