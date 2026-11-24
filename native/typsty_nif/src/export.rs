@@ -51,7 +51,11 @@ pub fn pdf(
         .map_err(|errors| diagnostics::from_sources(&errors, world))
 }
 
-pub fn png(document: &PagedDocument, ppi: f64) -> Result<Output, Vec<Diagnostic>> {
+pub fn png(
+    document: &PagedDocument,
+    ppi: f64,
+    world: &TypstyWorld,
+) -> Result<Output, Vec<Diagnostic>> {
     let pixel_per_pt = ppi / 72.0;
     let options = typst_render::RenderOptions {
         pixel_per_pt: Scalar::new(pixel_per_pt),
@@ -61,6 +65,8 @@ pub fn png(document: &PagedDocument, ppi: f64) -> Result<Output, Vec<Diagnostic>
     let mut pages = Vec::with_capacity(document.pages().len());
 
     for (index, page) in document.pages().iter().enumerate() {
+        world.check_cancelled();
+
         check_raster_size(page, pixel_per_pt).map_err(|problem| {
             vec![Diagnostic::error(format!(
                 "page {} can't be rendered as a PNG at {ppi} ppi: {problem}",
@@ -83,14 +89,17 @@ pub fn png(document: &PagedDocument, ppi: f64) -> Result<Output, Vec<Diagnostic>
     Ok(Output::Pages(pages))
 }
 
-pub fn svg(document: &PagedDocument) -> Output {
+pub fn svg(document: &PagedDocument, world: &TypstyWorld) -> Output {
     let options = typst_svg::SvgOptions::default();
 
     Output::Pages(
         document
             .pages()
             .iter()
-            .map(|page| typst_svg::svg(page, &options).into_bytes())
+            .map(|page| {
+                world.check_cancelled();
+                typst_svg::svg(page, &options).into_bytes()
+            })
             .collect(),
     )
 }

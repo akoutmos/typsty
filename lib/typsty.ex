@@ -134,10 +134,20 @@ defmodule Typsty do
   - `:ppi` - for PNG, the resolution in pixels per inch. Defaults to `144`.
   - `:pdf_standards` - for PDF, the standards to conform to, such as `["a-2b"]` or
     `["ua-1"]`. Defaults to `[]`.
-  - `:timeout` - how long to wait for the render, in milliseconds, or `:infinity`. Defaults
-    to `60_000`. Typst can't be interrupted, so a render that times out keeps running in
-    the background until it finishes, but the caller gets an error and the scheduler that
-    ran it is free again.
+  - `:timeout` - how long to wait for the render, in milliseconds, or `:infinity`, including
+    the time spent waiting for a free slot (see `:max_concurrent_renders` below). Defaults
+    to `60_000`. A render that times out returns an error and is cancelled: it stops the
+    next time Typst lays out content, loads a file or a font, or exports a page, which
+    for most documents is within milliseconds. A template doing pure computation (a long
+    loop of arithmetic) keeps running until it gets to one of those.
+
+  Renders also share one setting that can only be set in the application config:
+
+  - `:max_concurrent_renders` - how many renders may run at once, counting renders that
+    timed out and are still being cancelled. A render waits for a free slot, within its
+    timeout. This keeps renders that keep timing out from piling up in the background.
+    Defaults to the number of dirty CPU schedulers (the number of CPU cores), which is
+    how many renders can run at once anyway. See `running_renders/0`.
 
   Fonts are scanned once for each combination of `:font_paths`, `:system_fonts` and
   `:embedded_fonts` and then cached, so only the first render with given font settings
@@ -446,6 +456,14 @@ defmodule Typsty do
   end
 
   @doc """
+  Returns the number of renders running, including renders that timed out and are still
+  being cancelled. Useful in health checks and metrics: it's at most
+  `:max_concurrent_renders`.
+  """
+  @spec running_renders() :: non_neg_integer()
+  def running_renders, do: Native.running_renders()
+
+  @doc """
   Returns the version of the Typst compiler that Typsty uses, such as `"0.15.1"`.
   """
   @spec typst_version() :: String.t()
@@ -503,7 +521,8 @@ defmodule Typsty do
         fonts: font_options(opts),
         ppi: opts[:ppi] |> positive_number!(:ppi) |> Kernel.*(1.0),
         pdf_standards: strings!(opts[:pdf_standards], :pdf_standards),
-        timeout: timeout!(opts[:timeout])
+        timeout: timeout!(opts[:timeout]),
+        max_running: max_concurrent_renders!()
       }
 
       case Native.render(template.source, variables, files, native_opts) do
@@ -600,6 +619,16 @@ defmodule Typsty do
 
   defp positive_number!(value, option) do
     raise ArgumentError, "the #{inspect(option)} option must be a positive number, got: #{inspect(value)}"
+  end
+
+  defp max_concurrent_renders! do
+    case Application.get_env(:typsty, :max_concurrent_renders, :erlang.system_info(:dirty_cpu_schedulers)) do
+      limit when is_integer(limit) and limit > 0 ->
+        limit
+
+      other ->
+        raise ArgumentError, "the :max_concurrent_renders config must be a positive integer, got: #{inspect(other)}"
+    end
   end
 
   defp timeout!(:infinity), do: nil

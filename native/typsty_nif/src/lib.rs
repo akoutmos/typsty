@@ -62,6 +62,8 @@ struct RenderOptions {
     pdf_standards: Vec<String>,
     /// In milliseconds, or `nil` to wait for as long as the render takes.
     timeout: Option<u64>,
+    /// How many renders may run at once, counting renders that are being cancelled.
+    max_running: usize,
 }
 
 #[derive(NifMap)]
@@ -133,11 +135,13 @@ fn render<'a>(
         pdf_standards: options.pdf_standards,
     };
 
-    let result = isolate::run(timeout, move || job.run()).unwrap_or_else(|failure| {
-        Err(Failure::Diagnostics(vec![Diagnostic::error(
-            failure.message(),
-        )]))
-    });
+    let limit = Some(options.max_running);
+    let result = isolate::run(timeout, limit, move |cancellation| job.run(cancellation))
+        .unwrap_or_else(|failure| {
+            Err(Failure::Diagnostics(vec![Diagnostic::error(
+                failure.message(),
+            )]))
+        });
 
     match result {
         Ok((output, warnings)) => (atoms::ok(), encode_output(env, output), warnings).encode(env),
@@ -159,22 +163,31 @@ struct RenderJob {
 }
 
 impl RenderJob {
-    fn run(self) -> Result<Rendered, Failure> {
+    fn run(self, cancellation: isolate::Cancellation) -> Result<Rendered, Failure> {
         let world_options = WorldOptions {
             files: self.files,
             root: self.root,
             package_paths: self.package_paths,
             fonts: fonts::store(&self.fonts),
+            cancellation,
         };
+
+        // Evicted after exporting (rendering PNGs memoizes textures), and also when a
+        // cancelled render unwinds
+        let _evict = EvictOnDrop;
 
         let world = TypstyWorld::new(&self.template, self.variables, world_options)
             .map_err(Failure::Invalid)?;
 
-        let result = compile_and_export(&world, self.format, self.ppi, &self.pdf_standards);
+        compile_and_export(&world, self.format, self.ppi, &self.pdf_standards)
+    }
+}
 
-        // Evicted after exporting too, since rendering PNGs memoizes textures
+struct EvictOnDrop;
+
+impl Drop for EvictOnDrop {
+    fn drop(&mut self) {
         comemo::evict(CACHE_MAX_AGE);
-        result
     }
 }
 
@@ -193,8 +206,8 @@ fn compile_and_export(
 
     let output = match format {
         Format::Pdf => export::pdf(&document, pdf_standards, world),
-        Format::Png => export::png(&document, ppi),
-        Format::Svg => Ok(export::svg(&document)),
+        Format::Png => export::png(&document, ppi, world),
+        Format::Svg => Ok(export::svg(&document, world)),
     }
     .map_err(Failure::Diagnostics)?;
 
@@ -222,8 +235,10 @@ fn binary<'a>(env: Env<'a>, bytes: &[u8]) -> Term<'a> {
 /// template.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn syntax_errors(template: String) -> Vec<Diagnostic> {
-    isolate::run(None, move || collect_syntax_errors(&template))
-        .unwrap_or_else(|failure| vec![Diagnostic::error(failure.message())])
+    isolate::run(None, None, move |_cancellation| {
+        collect_syntax_errors(&template)
+    })
+    .unwrap_or_else(|failure| vec![Diagnostic::error(failure.message())])
 }
 
 fn collect_syntax_errors(template: &str) -> Vec<Diagnostic> {
@@ -245,7 +260,7 @@ fn format<'a>(env: Env<'a>, template: String, options: FormatOptions) -> Term<'a
         .with_tab_spaces(options.indent_width)
         .with_wrap_text(options.wrap_text);
 
-    let result = isolate::run(None, move || {
+    let result = isolate::run(None, None, move |_cancellation| {
         typstyle_core::Typstyle::new(config)
             .format_text(template.as_str())
             .render()
@@ -272,6 +287,12 @@ fn font_families(options: FontOptions) -> Vec<String> {
     families.sort();
     families.dedup();
     families
+}
+
+/// The number of renders running, including renders that timed out and are being cancelled.
+#[rustler::nif]
+fn running_renders() -> usize {
+    isolate::running_renders()
 }
 
 /// The version of the Typst compiler, such as "0.15.1".

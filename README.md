@@ -343,9 +343,22 @@ whole VM down. It's built so that what you render with can't crash it:
   can't overflow the small stacks of the BEAM's schedulers, panics in Typst
   are returned as a `Typsty.RenderError`, and Typst's own limits (parsing,
   call and layout depth) get a chance to stop runaway recursion.
-- **Renders time out** after 60 seconds by default (`:timeout`), so a render
-  that never finishes doesn't hold a scheduler forever. Typst can't be
-  interrupted, so the render keeps running in the background until it ends.
+- **Renders are independent.** Concurrent renders of the same template, with
+  the same file names and assigns names but different values (as a Phoenix
+  controller does for each request), each produce exactly what they would on
+  their own. Typst's cache only reuses work after checking that every file and
+  value it depended on is the same in the new render.
+- **Renders time out** after 60 seconds by default (`:timeout`). A render that
+  times out returns an error and is cancelled: it unwinds the next time Typst
+  lays out content, loads a file or font, or exports a page, which for most
+  documents is within milliseconds. A thread can't be killed safely, so a
+  template doing pure computation (a long loop of arithmetic) keeps running
+  until it gets to one of those points.
+- **Renders are limited** to `:max_concurrent_renders` at once (by default, one
+  per CPU core), counting renders that timed out and are still being
+  cancelled. New renders wait for a slot within their timeout, so renders that
+  keep timing out can't pile up in the background. `Typsty.running_renders/0`
+  reports how many are running.
 - **Data is checked before Typst gets it.** Variables can be nested at most
   256 levels deep. Images whose header claims more than 134 megapixels are
   refused before they're decoded (a small file can claim to be enormous), as
@@ -398,6 +411,7 @@ config :typsty,
   ppi: 144,
   pdf_standards: [],
   timeout: 60_000,
+  max_concurrent_renders: System.schedulers_online(),
   log_warnings: true
 ```
 

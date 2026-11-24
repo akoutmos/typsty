@@ -30,4 +30,5 @@ defmodule Typsty.Native do
   def format(_template, _options), do: :erlang.nif_error(:nif_not_loaded)
   def font_families(_options), do: :erlang.nif_error(:nif_not_loaded)
   def typst_version, do: :erlang.nif_error(:nif_not_loaded)
+  def running_renders, do: :erlang.nif_error(:nif_not_loaded)
 end

@@ -15,6 +15,7 @@ use typst_kit::fonts::FontStore;
 use typst_kit::packages::FsPackages;
 
 use crate::checks;
+use crate::isolate::Cancellation;
 
 /// The path of the main source file in the project.
 pub const MAIN_PATH: &str = "/main.typ";
@@ -59,6 +60,7 @@ pub struct TypstyWorld {
     loaded: Mutex<HashMap<FileId, FileResult<Bytes>>>,
     sources: Mutex<HashMap<FileId, Source>>,
     now: time::OffsetDateTime,
+    cancellation: Cancellation,
 }
 
 pub struct WorldOptions {
@@ -66,6 +68,7 @@ pub struct WorldOptions {
     pub root: Option<String>,
     pub package_paths: Vec<String>,
     pub fonts: Arc<FontStore>,
+    pub cancellation: Cancellation,
 }
 
 impl TypstyWorld {
@@ -125,7 +128,13 @@ impl TypstyWorld {
             loaded: Mutex::new(HashMap::new()),
             sources: Mutex::new(HashMap::new()),
             now: time::OffsetDateTime::now_utc(),
+            cancellation: options.cancellation,
         })
+    }
+
+    /// Unwinds the render if it was cancelled (see `isolate`).
+    pub fn check_cancelled(&self) {
+        self.cancellation.check();
     }
 
     pub fn main_source(&self) -> &Source {
@@ -201,19 +210,27 @@ fn read_regular_file(path: &Path) -> FileResult<Vec<u8>> {
 }
 
 impl World for TypstyWorld {
+    // Every method starts by checking whether the render was cancelled: these are the points
+    // where a cancelled render stops.
+
     fn library(&self) -> &LazyHash<Library> {
+        self.check_cancelled();
         self.library.as_ref().unwrap_or(&LIBRARY)
     }
 
     fn book(&self) -> &LazyHash<FontBook> {
+        self.check_cancelled();
         self.fonts.book()
     }
 
     fn main(&self) -> FileId {
+        self.check_cancelled();
         self.main.id()
     }
 
     fn source(&self, id: FileId) -> FileResult<Source> {
+        self.check_cancelled();
+
         if id == self.main.id() {
             return Ok(self.main.clone());
         }
@@ -231,6 +248,8 @@ impl World for TypstyWorld {
     }
 
     fn file(&self, id: FileId) -> FileResult<Bytes> {
+        self.check_cancelled();
+
         if id == self.main.id() {
             return Ok(Bytes::from_string(self.main.clone()));
         }
@@ -242,12 +261,14 @@ impl World for TypstyWorld {
     }
 
     fn font(&self, index: usize) -> Option<Font> {
+        self.check_cancelled();
         self.fonts.font(index)
     }
 
     // Without an offset, Typst asks for the local date. The server's time zone is rarely what
     // a document wants, so UTC is used, and templates can ask for an offset explicitly.
     fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
+        self.check_cancelled();
         let offset = offset.map(time::Duration::from).unwrap_or_default();
         let now = self.now.checked_add(offset)?;
         Some(Datetime::Date(now.date()))
