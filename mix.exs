@@ -102,6 +102,7 @@ defmodule Typsty.MixProject do
       {:rustler, "~> 0.38", optional: true},
       {:telemetry, "~> 1.0"},
       {:nimble_pool, "~> 1.1"},
+      {:nimble_options, "~> 1.1"},
 
       # Development deps
       {:decimal, "~> 2.0 or ~> 3.0", only: [:dev, :test]},

@@ -55,10 +55,12 @@ defmodule Typsty.Formatter do
   end
 
   defp do_format(source, opts) do
+    typst_opts = Typsty.Options.formatter!(opts)
+
     format_opts = [
-      line_length: option!(opts, :typst_line_length, opts[:line_length] || @default_line_length, &positive_integer?/1),
-      indent: option!(opts, :typst_indent, 2, &positive_integer?/1),
-      wrap_text: option!(opts, :typst_wrap_text, false, &is_boolean/1)
+      line_length: typst_opts[:typst_line_length] || opts[:line_length] || @default_line_length,
+      indent: Keyword.get(typst_opts, :typst_indent, 2),
+      wrap_text: Keyword.get(typst_opts, :typst_wrap_text, false)
     ]
 
     case Typsty.format(source, format_opts) do
@@ -108,18 +110,6 @@ defmodule Typsty.Formatter do
   end
 
   defp count(text, pattern), do: length(:binary.matches(text, pattern))
-
-  defp option!(opts, name, default, valid?) do
-    value = Keyword.get(opts, name, default)
-
-    if valid?.(value) do
-      value
-    else
-      raise ArgumentError, "the #{inspect(name)} formatter option is invalid, got: #{inspect(value)}"
-    end
-  end
-
-  defp positive_integer?(value), do: is_integer(value) and value > 0
 
   # The template's position, to point syntax errors at the file being formatted. For a
   # sigil, the formatter is told its line, but not its column or indentation, so errors in

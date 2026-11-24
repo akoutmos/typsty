@@ -101,17 +101,13 @@ defmodule TypstyTest do
       assert {:ok, _pdf} = Typsty.to_pdf(template, %{b: 3})
     end
 
-    test "conforms to PDF standards" do
+    test "conforms to PDF standards, which are checked before rendering" do
       # PDF/A requires a date, which is the time of the render by default
       assert {:ok, pdf} = Typsty.to_pdf("#set document(title: [Doc])\nHello", %{}, pdf_standards: ["a-2b"])
       assert pdf =~ "pdfaid"
 
       assert {:error, %RenderError{diagnostics: [%{message: "PDF/A-2b error: missing document date"}]}} =
                Typsty.to_pdf("#set document(title: [Doc], date: none)\nHello", %{}, pdf_standards: ["a-2b"])
-
-      assert_raise ArgumentError, ~r/unknown PDF standard in the :pdf_standards option: "z-1"/, fn ->
-        Typsty.to_pdf("Hello", %{}, pdf_standards: ["z-1"])
-      end
 
       assert_raise ArgumentError, ~r/invalid :pdf_standards option/, fn ->
         Typsty.to_pdf("Hello", %{}, pdf_standards: ["a-2b", "a-3b"])
@@ -147,27 +143,60 @@ defmodule TypstyTest do
       assert Typsty.validate("\uFEFF= Title") == :ok
     end
 
-    test "raises for invalid options" do
-      assert_raise ArgumentError, ~r/unknown keys \[:bogus\]/, fn -> Typsty.to_pdf("x", %{}, bogus: 1) end
-      assert_raise ArgumentError, ~r/:ppi option must be a positive number/, fn -> Typsty.to_png("x", %{}, ppi: 0) end
+    test "raises for invalid options, saying which one" do
+      assert_raise ArgumentError, ~r/^unknown options \[:bogus\], valid options are: \[:files, :root/, fn ->
+        Typsty.to_pdf("x", %{}, bogus: 1)
+      end
 
-      assert_raise ArgumentError, ~r/:font_paths option must be a list of strings/, fn ->
+      # Config-only options can't be given to a render
+      assert_raise ArgumentError, ~r/^unknown options \[:max_concurrent_renders\]/, fn ->
+        Typsty.to_pdf("x", %{}, max_concurrent_renders: 2)
+      end
+
+      assert_raise ArgumentError, "invalid value for :ppi option: expected a positive number, got: 0", fn ->
+        Typsty.to_png("x", %{}, ppi: 0)
+      end
+
+      assert_raise ArgumentError, ~s|invalid value for :font_paths option: expected list, got: "fonts"|, fn ->
         Typsty.to_pdf("x", %{}, font_paths: "fonts")
       end
 
-      assert_raise ArgumentError, ~r/the options must be a keyword list/, fn -> Typsty.to_pdf("x", %{}, %{ppi: 1}) end
-      assert_raise ArgumentError, ~r/:root option must be a path/, fn -> Typsty.to_pdf("x", %{}, root: :foo) end
-
-      assert_raise ArgumentError, ~r/:timeout option must be a positive integer \(at most 4294967295\)/, fn ->
-        Typsty.to_pdf("x", %{}, timeout: 5_000_000_000)
+      assert_raise ArgumentError, ~r/^invalid list in :pdf_standards option: .* expected one of \["1.4"/, fn ->
+        Typsty.to_pdf("x", %{}, pdf_standards: ["z-1"])
       end
+
+      assert_raise ArgumentError, "the options must be a keyword list, got: %{ppi: 1}", fn ->
+        Typsty.to_pdf("x", %{}, %{ppi: 1})
+      end
+
+      assert_raise ArgumentError, "invalid value for :root option: expected a path (a string) or nil, got: :foo", fn ->
+        Typsty.to_pdf("x", %{}, root: :foo)
+      end
+
+      assert_raise ArgumentError,
+                   ~r/^invalid value for :timeout option: expected a positive integer .* \(at most 4294967295\)/,
+                   fn ->
+                     Typsty.to_pdf("x", %{}, timeout: 5_000_000_000)
+                   end
 
       assert_raise ArgumentError, ~r/:pool option names no running Typsty.Pool: :no_such_pool/, fn ->
         Typsty.to_pdf("x", %{}, pool: :no_such_pool)
       end
 
-      assert_raise ArgumentError, ~r/:pool option must be the name or pid of a Typsty.Pool, or nil/, fn ->
-        Typsty.to_pdf("x", %{}, pool: false)
+      assert_raise ArgumentError,
+                   ~r/^invalid value for :pool option: expected the name or pid of a Typsty.Pool, or nil/,
+                   fn ->
+                     Typsty.to_pdf("x", %{}, pool: false)
+                   end
+
+      assert_raise ArgumentError, ~r/^unknown options \[:indnet\]/, fn -> Typsty.format("x", indnet: 2) end
+
+      assert_raise ArgumentError, ~r/^invalid value for :line_length option: expected positive integer/, fn ->
+        Typsty.format("x", line_length: 0)
+      end
+
+      assert_raise ArgumentError, ~r/^unknown options \[:ppi\], valid options are: \[:font_paths/, fn ->
+        Typsty.font_families(ppi: 1)
       end
     end
   end
@@ -271,7 +300,12 @@ defmodule TypstyTest do
     end
 
     test "raises for invalid files" do
-      assert_raise ArgumentError, ~r/must map paths to binaries/, fn -> Typsty.to_pdf("x", %{}, files: %{logo: "y"}) end
+      assert_raise ArgumentError,
+                   ~r/^invalid value for :files option: expected paths \(strings\) mapped to binaries/,
+                   fn ->
+                     Typsty.to_pdf("x", %{}, files: %{logo: "y"})
+                   end
+
       assert_raise ArgumentError, ~r/invalid file path/, fn -> Typsty.to_pdf("x", %{}, files: %{"../up.txt" => "y"}) end
     end
   end

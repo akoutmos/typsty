@@ -217,7 +217,7 @@ defmodule Typsty.RobustnessTest do
       assert_render_error(Typsty.to_pdf(slow, %{}, timeout: 50), "didn't finish within the timeout (50 ms)")
       assert {:ok, _pdf} = Typsty.to_pdf("still works", %{}, timeout: :infinity)
 
-      assert_raise ArgumentError, ~r/:timeout option must be a positive integer/, fn ->
+      assert_raise ArgumentError, ~r/invalid value for :timeout option: expected a positive integer/, fn ->
         Typsty.to_pdf("x", %{}, timeout: 0)
       end
     end

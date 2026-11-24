@@ -36,6 +36,8 @@ The first release.
   formats Typst source.
 - PDF standards (such as PDF/A-2b and PDF/UA-1) with the `:pdf_standards` option, and the PNG resolution with `:ppi`.
 - Telemetry events for every render.
+- Options checked with NimbleOptions, in calls and in the application config (where unknown keys are typos), with
+  errors that name the option, and option docs and typespecs generated from the same schemas.
 - `Typsty.Pool`, a pool of worker processes to render in, with the `:pool` option (per render, or in the config). A
   render that runs past its timeout is stopped right away, a render can be given a memory limit (`:memory_limit`),
   and a worker that crashes takes nothing else down. Workers are replaced when they're stopped, can be recycled after

@@ -105,8 +105,35 @@ defmodule Typsty.CancellationTest do
   test "the limit must be a positive integer" do
     Application.put_env(:typsty, :max_concurrent_renders, 0)
 
-    assert_raise ArgumentError, ~r/:max_concurrent_renders config must be a positive integer/, fn ->
+    message =
+      "invalid value for :max_concurrent_renders option: expected positive integer, got: 0 " <>
+        "(in the :typsty application config)"
+
+    assert_raise ArgumentError, message, fn -> Typsty.to_pdf("x") end
+  end
+
+  # Here rather than with the other option tests, since they change the config, which this
+  # module's tests run on their own for
+  test "the config is checked too, catching typos, but not other modules' config" do
+    Application.put_env(:typsty, :font_path, ["fonts"])
+    on_exit(fn -> Application.delete_env(:typsty, :font_path) end)
+
+    assert_raise ArgumentError, ~r/^unknown options \[:font_path\], .* \(in the :typsty application config\)$/, fn ->
       Typsty.to_pdf("x")
     end
+
+    Application.delete_env(:typsty, :font_path)
+
+    # Rustler reads config :typsty, Typsty.Native
+    Application.put_env(:typsty, Typsty.Native, skip_compilation?: true)
+    on_exit(fn -> Application.delete_env(:typsty, Typsty.Native) end)
+    assert {:ok, _pdf} = Typsty.to_pdf("x")
+
+    # Options given to a render override the config
+    Application.put_env(:typsty, :ppi, 72)
+    on_exit(fn -> Application.delete_env(:typsty, :ppi) end)
+    assert {:ok, [small]} = Typsty.to_png("#set page(width: 1in, height: 1in)")
+    assert {:ok, [large]} = Typsty.to_png("#set page(width: 1in, height: 1in)", %{}, ppi: 144)
+    assert byte_size(large) > byte_size(small)
   end
 end

@@ -46,16 +46,7 @@ defmodule Typsty.Pool do
 
   ## Options
 
-  - `:name` - the name to register the pool under, to pass as the `:pool` option.
-  - `:size` - the number of workers, which is how many renders can run at once. Defaults to
-    the number of CPU cores (`System.schedulers_online/0`). A render waits for a free
-    worker, within its timeout.
-  - `:memory_limit` - the most memory, in bytes, each worker may use. A render that goes over
-    it fails, and its worker is replaced. Defaults to `nil`, for no limit. See below.
-  - `:max_renders` - replaces each worker after this many renders, which bounds the memory
-    a long-running worker holds on to, and gives it a fresh table of file paths (see
-    [Files](Typsty.html#module-files)). Defaults to `nil`, to keep workers for as long as
-    they work.
+  #{Typsty.Options.docs(:pool)}
 
   ## Memory
 
@@ -109,18 +100,22 @@ defmodule Typsty.Pool do
     }
   end
 
+  @typedoc "An option for `start_link/1`. See [Options](#module-options)."
+  @type option :: unquote(Typsty.Options.typespec(:pool))
+
   @doc """
-  Starts a pool. See the module documentation for the options.
+  Starts a pool. See [Options](#module-options) for the options.
 
-  Raises if the worker program can't run, before starting any workers.
+  Raises `ArgumentError` for invalid options, and raises if the worker program can't run,
+  before starting any workers.
   """
-  @spec start_link(keyword()) :: GenServer.on_start()
+  @spec start_link([option()]) :: GenServer.on_start()
   def start_link(opts) do
-    opts = Keyword.validate!(opts, [:name, size: System.schedulers_online(), memory_limit: nil, max_renders: nil])
+    opts = Typsty.Options.pool!(opts)
 
-    size = positive_integer!(opts[:size], :size)
-    memory_limit = opts[:memory_limit] && positive_integer!(opts[:memory_limit], :memory_limit)
-    max_renders = opts[:max_renders] && positive_integer!(opts[:max_renders], :max_renders)
+    size = Keyword.get_lazy(opts, :size, &System.schedulers_online/0)
+    memory_limit = opts[:memory_limit]
+    max_renders = opts[:max_renders]
 
     executable = executable!()
     args = if(memory_limit, do: ["--memory-limit", Integer.to_string(memory_limit)], else: [])
@@ -178,12 +173,6 @@ defmodule Typsty.Pool do
         raise "Typsty.Pool's worker program at #{executable} failed to start (#{describe_exit(status)}): " <>
                 String.trim(output)
     end
-  end
-
-  defp positive_integer!(value, _option) when is_integer(value) and value > 0, do: value
-
-  defp positive_integer!(value, option) do
-    raise ArgumentError, "the #{inspect(option)} option must be a positive integer, got: #{inspect(value)}"
   end
 
   @doc false

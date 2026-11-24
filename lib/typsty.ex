@@ -164,40 +164,14 @@ defmodule Typsty do
   config :typsty, font_paths: ["priv/fonts"], system_fonts: false
   ```
 
-  - `:files` - a map (or list of tuples) of paths to binaries, as above.
-  - `:root` - a directory to read the files that aren't in `:files` from. Documents can't
-    read outside it, even through symbolic links. Defaults to `nil`.
-  - `:font_paths` - directories to load fonts from, searched recursively. Defaults to `[]`.
-  - `:system_fonts` - whether to use the fonts installed on the system. Defaults to `true`.
-    Turn it off for documents that render the same on every machine.
-  - `:embedded_fonts` - whether to use the fonts that come with Typst (Libertinus Serif,
-    New Computer Modern, New Computer Modern Math and DejaVu Sans Mono). Defaults to `true`.
-  - `:package_paths` - directories with Typst packages, laid out as
-    `namespace/name/version`, like Typst's package cache. A template can import a package
-    from them with `#import "@preview/cetz:0.4.2"`. Packages are never downloaded while
-    rendering: fetch them ahead of time with `mix typsty.packages.get`. Defaults to `[]`.
-  - `:ppi` - for PNG, the resolution in pixels per inch. Defaults to `144`.
-  - `:pdf_standards` - for PDF, the standards to conform to, such as `["a-2b"]` or
-    `["ua-1"]`. Defaults to `[]`.
-  - `:timeout` - how long to wait for the render, in milliseconds (at most `4_294_967_295`),
-    or `:infinity`, including the time spent waiting for a free slot (see
-    `:max_concurrent_renders` below). Defaults to `60_000`. A render that times out returns
-    an error and is cancelled: it stops the next time Typst lays out content, loads a file
-    or a font, or exports a PNG or SVG page, which for most documents is within
-    milliseconds. A template doing pure computation (a long loop of arithmetic) keeps running
-    until it gets to one of those. In a `Typsty.Pool`, a render that times out is stopped
-    right away.
-  - `:pool` - the name or pid of a `Typsty.Pool` to render in, instead of rendering inside
-    the VM. Defaults to `nil`.
+  #{Typsty.Options.docs(:render)}
 
-  Renders also share one setting that can only be set in the application config:
+  These can only be set in the application config:
 
-  - `:max_concurrent_renders` - how many renders may run inside the VM at once, counting
-    renders that timed out and are still being cancelled. A render waits for a free slot,
-    within its timeout. This keeps renders that keep timing out from piling up in the
-    background. Defaults to the number of dirty CPU schedulers (normally the number of CPU
-    cores). See `running_renders/0`. Renders in a `Typsty.Pool` are limited by its size
-    instead.
+  #{Typsty.Options.docs(:config)}
+
+  Invalid options, in a call or in the config, raise `ArgumentError`, with a message that
+  says which option is wrong.
 
   Renders run on threads of their own, outside the BEAM's schedulers, and the process that
   asked for the render waits for a message, so a render never holds up a scheduler.
@@ -237,40 +211,21 @@ defmodule Typsty do
 
   require Logger
 
-  alias Typsty.{Diagnostic, Native, RenderError, SyntaxError, Template, Value}
+  alias Typsty.{Diagnostic, Native, Options, RenderError, SyntaxError, Template, Value}
 
   @template_extension ".typ"
-
-  @configurable_options [
-    :root,
-    :package_paths,
-    :font_paths,
-    :system_fonts,
-    :embedded_fonts,
-    :ppi,
-    :pdf_standards,
-    :timeout,
-    :pool
-  ]
-
-  @default_options [
-    files: [],
-    root: nil,
-    package_paths: [],
-    font_paths: [],
-    system_fonts: true,
-    embedded_fonts: true,
-    ppi: 144,
-    pdf_standards: [],
-    timeout: 60_000,
-    pool: nil
-  ]
 
   @typedoc "Assigns for a template: a map with atom or string keys."
   @type assigns :: map()
 
   @typedoc "A template: Typst source, or a template from the `~TYPST` sigil or `render/1`."
   @type template :: String.t() | Template.t()
+
+  @typedoc "An option for rendering. See [Options](#module-options)."
+  @type option :: unquote(Options.typespec(:render))
+
+  @typedoc "An option for `format/2`."
+  @type format_option :: unquote(Options.typespec(:format))
 
   @doc """
   Returns the template for the given assigns, as a `Typsty.Template` struct. Define it with
@@ -324,27 +279,27 @@ defmodule Typsty do
       @before_compile Typsty
 
       @doc "Renders the document as a PDF. See `Typsty.to_pdf/3` for the options."
-      @spec to_pdf(Typsty.assigns(), keyword()) :: {:ok, binary()} | {:error, Typsty.RenderError.t()}
+      @spec to_pdf(Typsty.assigns(), [Typsty.option()]) :: {:ok, binary()} | {:error, Typsty.RenderError.t()}
       def to_pdf(assigns, opts \\ []), do: Typsty.__render__(__MODULE__, :pdf, assigns, opts)
 
       @doc "Renders the document as a PDF, raising `Typsty.RenderError` if it fails."
-      @spec to_pdf!(Typsty.assigns(), keyword()) :: binary()
+      @spec to_pdf!(Typsty.assigns(), [Typsty.option()]) :: binary()
       def to_pdf!(assigns, opts \\ []), do: assigns |> to_pdf(opts) |> Typsty.__unwrap__!()
 
       @doc "Renders each page of the document as a PNG. See `Typsty.to_png/3` for the options."
-      @spec to_png(Typsty.assigns(), keyword()) :: {:ok, [binary()]} | {:error, Typsty.RenderError.t()}
+      @spec to_png(Typsty.assigns(), [Typsty.option()]) :: {:ok, [binary()]} | {:error, Typsty.RenderError.t()}
       def to_png(assigns, opts \\ []), do: Typsty.__render__(__MODULE__, :png, assigns, opts)
 
       @doc "Renders each page of the document as a PNG, raising `Typsty.RenderError` if it fails."
-      @spec to_png!(Typsty.assigns(), keyword()) :: [binary()]
+      @spec to_png!(Typsty.assigns(), [Typsty.option()]) :: [binary()]
       def to_png!(assigns, opts \\ []), do: assigns |> to_png(opts) |> Typsty.__unwrap__!()
 
       @doc "Renders each page of the document as an SVG. See `Typsty.to_svg/3` for the options."
-      @spec to_svg(Typsty.assigns(), keyword()) :: {:ok, [binary()]} | {:error, Typsty.RenderError.t()}
+      @spec to_svg(Typsty.assigns(), [Typsty.option()]) :: {:ok, [binary()]} | {:error, Typsty.RenderError.t()}
       def to_svg(assigns, opts \\ []), do: Typsty.__render__(__MODULE__, :svg, assigns, opts)
 
       @doc "Renders each page of the document as an SVG, raising `Typsty.RenderError` if it fails."
-      @spec to_svg!(Typsty.assigns(), keyword()) :: [binary()]
+      @spec to_svg!(Typsty.assigns(), [Typsty.option()]) :: [binary()]
       def to_svg!(assigns, opts \\ []), do: assigns |> to_svg(opts) |> Typsty.__unwrap__!()
 
       defoverridable to_pdf: 2, to_png: 2, to_svg: 2
@@ -489,30 +444,30 @@ defmodule Typsty do
 
   See [Options](#module-options) for the options.
   """
-  @spec to_pdf(template(), assigns(), keyword()) :: {:ok, binary()} | {:error, RenderError.t()}
+  @spec to_pdf(template(), assigns(), [option()]) :: {:ok, binary()} | {:error, RenderError.t()}
   def to_pdf(template, assigns \\ %{}, opts \\ []), do: template |> template(assigns) |> render(:pdf, opts, nil)
 
   @doc "Like `to_pdf/3`, but raises `Typsty.RenderError` if rendering fails."
-  @spec to_pdf!(template(), assigns(), keyword()) :: binary()
+  @spec to_pdf!(template(), assigns(), [option()]) :: binary()
   def to_pdf!(template, assigns \\ %{}, opts \\ []), do: template |> to_pdf(assigns, opts) |> __unwrap__!()
 
   @doc """
   Renders each page of a template as a PNG. Takes the same arguments as `to_pdf/3`, and the
   `:ppi` option sets the resolution.
   """
-  @spec to_png(template(), assigns(), keyword()) :: {:ok, [binary()]} | {:error, RenderError.t()}
+  @spec to_png(template(), assigns(), [option()]) :: {:ok, [binary()]} | {:error, RenderError.t()}
   def to_png(template, assigns \\ %{}, opts \\ []), do: template |> template(assigns) |> render(:png, opts, nil)
 
   @doc "Like `to_png/3`, but raises `Typsty.RenderError` if rendering fails."
-  @spec to_png!(template(), assigns(), keyword()) :: [binary()]
+  @spec to_png!(template(), assigns(), [option()]) :: [binary()]
   def to_png!(template, assigns \\ %{}, opts \\ []), do: template |> to_png(assigns, opts) |> __unwrap__!()
 
   @doc "Renders each page of a template as an SVG. Takes the same arguments as `to_pdf/3`."
-  @spec to_svg(template(), assigns(), keyword()) :: {:ok, [binary()]} | {:error, RenderError.t()}
+  @spec to_svg(template(), assigns(), [option()]) :: {:ok, [binary()]} | {:error, RenderError.t()}
   def to_svg(template, assigns \\ %{}, opts \\ []), do: template |> template(assigns) |> render(:svg, opts, nil)
 
   @doc "Like `to_svg/3`, but raises `Typsty.RenderError` if rendering fails."
-  @spec to_svg!(template(), assigns(), keyword()) :: [binary()]
+  @spec to_svg!(template(), assigns(), [option()]) :: [binary()]
   def to_svg!(template, assigns \\ %{}, opts \\ []), do: template |> to_svg(assigns, opts) |> __unwrap__!()
 
   @doc """
@@ -536,18 +491,16 @@ defmodule Typsty do
 
   ## Options
 
-  - `:line_length` - the maximum line length. Defaults to `98`, like `mix format`.
-  - `:indent` - the number of spaces to indent by. Defaults to `2`.
-  - `:wrap_text` - whether to wrap long lines of text in markup. Defaults to `false`.
+  #{Options.docs(:format)}
   """
-  @spec format(String.t(), keyword()) :: {:ok, String.t()} | {:error, [Diagnostic.t()]}
+  @spec format(String.t(), [format_option()]) :: {:ok, String.t()} | {:error, [Diagnostic.t()]}
   def format(source, opts \\ []) when is_binary(source) do
-    opts = Keyword.validate!(opts, line_length: 98, indent: 2, wrap_text: false)
+    opts = Options.format!(opts)
 
     Native.format(utf8!(source, "the Typst source"), %{
-      line_width: positive_integer!(opts[:line_length], :line_length),
-      indent_width: positive_integer!(opts[:indent], :indent),
-      wrap_text: boolean!(opts[:wrap_text], :wrap_text)
+      line_width: opts[:line_length],
+      indent_width: opts[:indent],
+      wrap_text: opts[:wrap_text]
     })
   end
 
@@ -559,10 +512,9 @@ defmodule Typsty do
   The fonts are scanned once for each combination of options and cached, so calling this
   when your application starts makes the first render faster.
   """
-  @spec font_families(keyword()) :: [String.t()]
+  @spec font_families([option()]) :: [String.t()]
   def font_families(opts \\ []) do
-    opts = opts |> Keyword.validate!([:font_paths, :system_fonts, :embedded_fonts]) |> with_defaults()
-    Native.font_families(font_options(opts))
+    opts |> Options.fonts!() |> font_options() |> Native.font_families()
   end
 
   @doc """
@@ -580,7 +532,7 @@ defmodule Typsty do
   def typst_version, do: Native.typst_version()
 
   @doc false
-  @spec __render__(module(), :pdf | :png | :svg, assigns(), keyword()) ::
+  @spec __render__(module(), :pdf | :png | :svg, assigns(), [option()]) ::
           {:ok, binary() | [binary()]} | {:error, RenderError.t()}
   def __render__(module, format, assigns, opts) do
     case module.render(assigns!(assigns)) do
@@ -643,26 +595,25 @@ defmodule Typsty do
     metadata = %{module: module, format: format, template: template}
 
     :telemetry.span([:typsty, :render], metadata, fn ->
-      opts = opts |> options!() |> with_defaults()
+      opts = Options.render!(opts)
       assigns = Value.assigns(template.assigns)
-      files = files!(opts[:files])
       pool = pool!(opts[:pool])
 
       native_opts = %{
         format: format,
-        root: root!(opts[:root]),
-        package_paths: paths!(opts[:package_paths], :package_paths),
+        root: opts[:root] && Path.expand(opts[:root]),
+        package_paths: Enum.map(opts[:package_paths], &Path.expand/1),
         fonts: font_options(opts),
-        ppi: opts[:ppi] |> positive_number!(:ppi) |> Kernel.*(1.0),
-        pdf_standards: strings!(opts[:pdf_standards], :pdf_standards),
-        timeout: timeout!(opts[:timeout]),
-        max_running: max_concurrent_renders!()
+        ppi: opts[:ppi] * 1.0,
+        pdf_standards: opts[:pdf_standards],
+        timeout: if(opts[:timeout] == :infinity, do: nil, else: opts[:timeout]),
+        max_running: opts[:max_concurrent_renders]
       }
 
-      case render_with(pool, template.source, assigns, files, native_opts) do
+      case render_with(pool, template.source, assigns, Keyword.get(opts, :files, []), native_opts) do
         {:ok, output, warnings} ->
           warnings = Enum.map(warnings, &Diagnostic.locate(&1, template))
-          log_warnings(warnings)
+          log_warnings(warnings, opts[:log_warnings])
           {{:ok, output}, Map.merge(metadata, %{result: :ok, diagnostics: warnings})}
 
         {:error, :invalid, message} ->
@@ -752,112 +703,23 @@ defmodule Typsty do
     end
   end
 
-  defp options!(opts) do
-    if Keyword.keyword?(opts) do
-      Keyword.validate!(opts, Keyword.keys(@default_options))
-    else
-      raise ArgumentError, "the options must be a keyword list, got: #{inspect(opts)}"
-    end
-  end
-
-  defp with_defaults(opts) do
-    config = :typsty |> Application.get_all_env() |> Keyword.take(@configurable_options)
-
-    @default_options
-    |> Keyword.merge(config)
-    |> Keyword.merge(opts)
-  end
-
   defp font_options(opts) do
     %{
-      font_paths: paths!(opts[:font_paths], :font_paths),
-      system_fonts: boolean!(opts[:system_fonts], :system_fonts),
-      embedded_fonts: boolean!(opts[:embedded_fonts], :embedded_fonts)
+      font_paths: Enum.map(opts[:font_paths], &Path.expand/1),
+      system_fonts: opts[:system_fonts],
+      embedded_fonts: opts[:embedded_fonts]
     }
   end
 
-  defp log_warnings(warnings) do
-    if Application.get_env(:typsty, :log_warnings, true) do
-      Enum.each(warnings, &log_warning/1)
-    end
-  end
+  defp log_warnings(warnings, true), do: Enum.each(warnings, &log_warning/1)
+  defp log_warnings(_warnings, false), do: :ok
 
   defp log_warning(warning), do: Logger.warning(fn -> "[Typsty] " <> Diagnostic.format(warning) end)
 
-  defp files!(files) when is_map(files) or is_list(files) do
-    Enum.map(files, fn
-      {path, contents} when is_binary(path) and is_binary(contents) ->
-        {path, contents}
-
-      other ->
-        raise ArgumentError, "the :files option must map paths to binaries, got: #{inspect(other, limit: 5)}"
-    end)
-  end
-
-  defp files!(files), do: raise(ArgumentError, "the :files option must be a map or a list, got: #{inspect(files)}")
-
-  defp paths!(paths, option) do
-    paths
-    |> strings!(option)
-    |> Enum.map(&Path.expand/1)
-  end
-
-  defp strings!(strings, option) do
-    if is_list(strings) and Enum.all?(strings, &is_binary/1) do
-      strings
-    else
-      raise ArgumentError, "the #{inspect(option)} option must be a list of strings, got: #{inspect(strings)}"
-    end
-  end
-
-  defp boolean!(value, _option) when is_boolean(value), do: value
-
-  defp boolean!(value, option),
-    do: raise(ArgumentError, "the #{inspect(option)} option must be a boolean, got: #{inspect(value)}")
-
-  defp positive_number!(value, _option) when is_number(value) and value > 0, do: value
-
-  defp positive_number!(value, option) do
-    raise ArgumentError, "the #{inspect(option)} option must be a positive number, got: #{inspect(value)}"
-  end
-
-  defp max_concurrent_renders! do
-    case Application.get_env(:typsty, :max_concurrent_renders, :erlang.system_info(:dirty_cpu_schedulers)) do
-      limit when is_integer(limit) and limit > 0 ->
-        limit
-
-      other ->
-        raise ArgumentError, "the :max_concurrent_renders config must be a positive integer, got: #{inspect(other)}"
-    end
-  end
-
-  # The longest a receive can wait
-  @max_timeout 4_294_967_295
-
-  defp timeout!(:infinity), do: nil
-  defp timeout!(timeout) when is_integer(timeout) and timeout > 0 and timeout <= @max_timeout, do: timeout
-
-  defp timeout!(timeout) do
-    raise ArgumentError,
-          "the :timeout option must be a positive integer (at most #{@max_timeout}) or :infinity, got: #{inspect(timeout)}"
-  end
-
-  defp root!(nil), do: nil
-
-  defp root!(root) when is_binary(root), do: Path.expand(root)
-
-  defp root!(root) do
-    raise ArgumentError, "the :root option must be a path (a string) or nil, got: #{inspect(root)}"
-  end
-
-  # A pool's name or pid: an atom, {:global, name} or {:via, module, name}
-  defguardp is_pool(pool)
-            when (is_atom(pool) and pool not in [true, false]) or is_pid(pool) or
-                   (is_tuple(pool) and tuple_size(pool) in [2, 3] and elem(pool, 0) in [:global, :via])
-
+  # The pool's pid. Options.render!/1 checked that it's a name or a pid
   defp pool!(nil), do: nil
 
-  defp pool!(pool) when is_pool(pool) do
+  defp pool!(pool) do
     case GenServer.whereis(pool) do
       pid when is_pid(pid) and node(pid) == node() ->
         pid
@@ -869,15 +731,5 @@ defmodule Typsty do
         raise ArgumentError,
               "the :pool option must be a Typsty.Pool on this node (its workers are local processes), got: #{inspect(pool)}"
     end
-  end
-
-  defp pool!(pool) do
-    raise ArgumentError, "the :pool option must be the name or pid of a Typsty.Pool, or nil, got: #{inspect(pool)}"
-  end
-
-  defp positive_integer!(value, _option) when is_integer(value) and value > 0, do: value
-
-  defp positive_integer!(value, option) do
-    raise ArgumentError, "the #{inspect(option)} option must be a positive integer, got: #{inspect(value)}"
   end
 end

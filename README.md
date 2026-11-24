@@ -528,6 +528,11 @@ config :typsty,
   packages: []
 ```
 
+Options are checked with [NimbleOptions](https://hex.pm/packages/nimble_options),
+in the config as well as in calls: an invalid value, or an unknown option (a
+typo such as `font_path`), raises an `ArgumentError` that names the option, and
+says when it comes from the config. See `Typsty` for each option.
+
 Paths are expanded relative to the current directory when a document renders,
 so in a release, set them in `config/runtime.exs` with `Application.app_dir/2`:
 

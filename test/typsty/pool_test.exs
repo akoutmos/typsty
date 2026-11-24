@@ -225,13 +225,25 @@ defmodule Typsty.PoolTest do
   end
 
   test "invalid options raise" do
-    assert_raise ArgumentError, ~r/:size option must be a positive integer/, fn -> Pool.start_link(size: 0) end
-
-    assert_raise ArgumentError, ~r/:memory_limit option must be a positive integer/, fn ->
-      Pool.start_link(memory_limit: -1)
+    assert_raise ArgumentError, "invalid value for :size option: expected positive integer, got: 0", fn ->
+      Pool.start_link(size: 0)
     end
 
-    assert_raise ArgumentError, ~r/:pool option must be the name or pid of a Typsty.Pool/, fn ->
+    assert_raise ArgumentError,
+                 "invalid value for :memory_limit option: expected a positive integer or nil, got: -1",
+                 fn ->
+                   Pool.start_link(memory_limit: -1)
+                 end
+
+    assert_raise ArgumentError, ~r/^unknown options \[:workers\], valid options are: \[:name, :size/, fn ->
+      Pool.start_link(workers: 2)
+    end
+
+    assert_raise ArgumentError, ~r/^invalid value for :name option: expected an atom, {:global, term}/, fn ->
+      Pool.start_link(name: "pool")
+    end
+
+    assert_raise ArgumentError, ~r/invalid value for :pool option: expected the name or pid of a Typsty.Pool/, fn ->
       Typsty.to_pdf("x", %{}, pool: "pool")
     end
   end

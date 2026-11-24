@@ -111,7 +111,7 @@ defmodule Typsty.FormatterTest do
   end
 
   test "raises for invalid options, naming the formatter's option" do
-    assert_raise ArgumentError, ~r/the :typst_line_length formatter option is invalid, got: 0/, fn ->
+    assert_raise ArgumentError, "invalid value for :typst_line_length option: expected positive integer, got: 0", fn ->
       Formatter.format("x", extension: ".typ", typst_line_length: 0)
     end
   end
