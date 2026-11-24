@@ -55,7 +55,18 @@ defmodule Typsty.PackagesTest do
       """,
       "lib.typ" => "#let x = 1"
     },
-    {"evil", "1.0.0"} => %{"../../escaped.typ" => "#let x = 1"}
+    {"evil", "1.0.0"} => %{"../../escaped.typ" => "#let x = 1"},
+    {"dot", "1.0.0"} => %{"." => "x"},
+    {"empty", "1.0.0"} => %{},
+    {"commented", "1.0.0"} => %{
+      "lib.typ" => """
+      // #import "@preview/nope:9.9.9"
+      /* #import "@preview/nope:8.8.8" */
+      #let x = 1
+      """,
+      # An example importing a package that doesn't exist
+      "examples/demo.typ" => ~s|#import "@preview/gone:1.0.0"|
+    }
   }
 
   @index [
@@ -84,7 +95,13 @@ defmodule Typsty.PackagesTest do
       end
     end
 
-    opts = [http_get: http_get, typst_version: "0.15.1", report: &send(test_pid, {:report, &1})]
+    opts = [
+      http_get: http_get,
+      typst_version: "0.15.1",
+      report: &send(test_pid, {:report, &1}),
+      warn: &send(test_pid, {:warn, &1})
+    ]
+
     %{dir: Path.join(tmp_dir, "packages"), opts: opts}
   end
 
@@ -144,8 +161,8 @@ defmodule Typsty.PackagesTest do
   test "warns about a package that needs a newer Typst", %{dir: dir, opts: opts} do
     Packages.get(["@preview/future:2.0.0"], dir, opts)
 
-    assert_received {:report,
-                     "  warning: @preview/future:2.0.0 requires Typst 99.0.0 or later, but Typsty uses Typst 0.15.1"}
+    assert_received {:warn,
+                     "warning: @preview/future:2.0.0 requires Typst 99.0.0 or later, but Typsty uses Typst 0.15.1"}
   end
 
   test "raises for packages that don't exist", %{dir: dir, opts: opts} do
@@ -175,6 +192,59 @@ defmodule Typsty.PackagesTest do
     assert Path.wildcard(Path.join(dir, "**/*escaped*")) == []
   end
 
+  test "ignores imports in comments, and only warns about missing packages that packages import",
+       %{dir: dir, opts: opts} do
+    assert [{{"preview", "commented", "1.0.0"}, :fetched, nil}] = Packages.get(["@preview/commented:1.0.0"], dir, opts)
+
+    assert_received {:warn,
+                     "warning: @preview/gone:1.0.0, which @preview/commented:1.0.0 imports, doesn't exist on Typst Universe"}
+
+    refute_received {:get, "https://packages.typst.org/preview/nope-" <> _}
+  end
+
+  test "raises for archives without files, or with files that aren't in the package", %{dir: dir, opts: opts} do
+    for package <- ["@preview/dot:1.0.0"] do
+      assert_raise Mix.Error, ~r/has a file outside the package/, fn -> Packages.get([package], dir, opts) end
+    end
+
+    # An empty package is saved as an empty directory
+    assert [{_, :fetched, nil}] = Packages.get(["@preview/empty:1.0.0"], dir, opts)
+    assert File.dir?(Path.join(dir, "preview/empty/1.0.0"))
+
+    opts = Keyword.put(opts, :http_get, fn _url -> {:ok, "not gzip"} end)
+
+    assert_raise Mix.Error, ~r/the archive of @preview\/shout:0.2.0 is invalid/, fn ->
+      Packages.get(["@preview/shout:0.2.0"], dir, opts)
+    end
+  end
+
+  test "extracts packages the same way whatever the current directory holds", %{dir: dir, opts: opts, tmp_dir: tmp_dir} do
+    # Archive entries were once checked against the current directory, following its links
+    project = Path.join(tmp_dir, "project")
+    File.mkdir_p!(Path.join(project, "elsewhere"))
+    File.ln_s!(Path.join(project, "elsewhere"), Path.join(project, "src"))
+
+    File.cd!(project, fn -> Packages.get(["@preview/shout:0.2.0"], dir, opts) end)
+    assert File.regular?(Path.join(dir, "preview/shout/0.2.0/src/shout.typ"))
+  end
+
+  test "runs at the same time don't break each other's packages", %{dir: dir, opts: opts} do
+    1..8
+    |> Task.async_stream(fn _ -> Packages.get(["@preview/greet:1.0.0"], dir, opts) end, max_concurrency: 8)
+    |> Enum.each(fn result -> assert {:ok, [_ | _]} = result end)
+
+    assert File.read!(Path.join(dir, "preview/greet/1.0.0/lib.typ")) =~ "#let greet"
+    assert Path.wildcard(Path.join(dir, "**/.*.tmp-*"), match_dot: true) == []
+  end
+
+  test "raises for an index that isn't a list of packages", %{dir: dir, opts: opts} do
+    opts = Keyword.put(opts, :http_get, fn _url -> {:ok, "<html>"} end)
+
+    assert_raise Mix.Error, ~r/the package index at .* isn't a list of packages/, fn ->
+      Packages.get(["@preview/greet"], dir, opts)
+    end
+  end
+
   test "raises for invalid packages", %{dir: dir, opts: opts} do
     assert_raise Mix.Error, ~r/invalid package "cetz". Packages look like @preview\/cetz:0.4.2/, fn ->
       Packages.get(["cetz"], dir, opts)
@@ -191,6 +261,12 @@ defmodule Typsty.PackagesTest do
 
     assert diagnostic.message == "package not found (searched for @preview/greet:1.0.0)"
     assert List.last(diagnostic.hints) =~ "download it with `mix typsty.packages.get @preview/greet:1.0.0`"
+    assert List.last(diagnostic.hints) =~ "The :package_paths option is empty"
+
+    assert {:error, %Typsty.RenderError{diagnostics: [diagnostic]}} =
+             Typsty.to_pdf(~S|#import "@preview/greet:1.0.0": greet|, %{}, package_paths: ["/no/such/dir"])
+
+    assert List.last(diagnostic.hints) =~ "Searched /no/such/dir (which doesn't exist)"
   end
 
   describe "mix typsty.packages.get" do
@@ -198,12 +274,31 @@ defmodule Typsty.PackagesTest do
       assert_raise Mix.Error, ~r/no packages to fetch/, fn -> Get.run([]) end
     end
 
-    test "fetches the packages in the config" do
-      Application.put_env(:typsty, :packages, ["not-a-package"])
+    test "checks the packages in the config before downloading anything" do
       on_exit(fn -> Application.delete_env(:typsty, :packages) end)
 
-      # Parsing the configured package fails before anything is downloaded
+      Application.put_env(:typsty, :packages, ["not-a-package"])
       assert_raise Mix.Error, ~r/invalid package "not-a-package"/, fn -> Get.run([]) end
+
+      Application.put_env(:typsty, :packages, [:cetz])
+      assert_raise Mix.Error, ~r/invalid package :cetz. Packages are strings/, fn -> Get.run([]) end
+
+      Application.put_env(:typsty, :packages, ["@preview/cetz"])
+      assert_raise Mix.Error, ~r/@preview\/cetz in the :packages config has no version/, fn -> Get.run([]) end
+    end
+
+    test "reports what it did", %{dir: dir, opts: opts} do
+      # Already downloaded, so the task doesn't need the network
+      Packages.get(["@preview/shout:0.2.0"], dir, opts)
+      Mix.shell(Mix.Shell.Process)
+      on_exit(fn -> Mix.shell(Mix.Shell.IO) end)
+
+      Get.run(["--path", dir, "@preview/shout:0.2.0"])
+
+      assert_received {:mix_shell, :info, ["* Already have @preview/shout:0.2.0"]}
+      assert_received {:mix_shell, :info, [summary]}
+      assert summary =~ "Downloaded 0 of 1 package into #{dir}."
+      assert summary =~ "config :typsty, package_paths:"
     end
   end
 
