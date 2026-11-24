@@ -30,7 +30,11 @@ typsty-*.tar
 
 # The NIF built from source, and Cargo's build artifacts
 /priv/native/
-/native/typsty_nif/target/
+/native/target/
+/native/*/target/
 
 # macOS Finder metadata
 .DS_Store
+
+# Precompiled NIF tarballs built by .github/scripts/build-native.sh
+/dist/

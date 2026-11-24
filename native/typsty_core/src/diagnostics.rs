@@ -1,41 +1,39 @@
-//! Turns Typst's errors and warnings into `Typsty.Diagnostic` structs.
+//! Typst's errors and warnings, with their locations, for `Typsty.Diagnostic` structs.
 
-use rustler::{NifMap, NifStruct, NifUnitEnum};
 use typst::diag::SourceDiagnostic;
 use typst::syntax::{DiagSpan, Source, SyntaxDiagnostic, VirtualRoot};
 use typst::WorldExt;
 
 use crate::world::TypstyWorld;
 
-// Diagnostics are built on the thread that runs Typst and encoded on the NIF's thread, so
-// they hold plain data rather than terms or atoms.
-#[derive(NifUnitEnum, Clone, Copy)]
+// Diagnostics are built on the thread that runs Typst, and encoded as terms by the NIF or
+// the worker, so they're plain data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
     Error,
     Warning,
 }
 
-#[derive(NifStruct)]
-#[module = "Typsty.Diagnostic"]
+#[derive(Clone, Debug)]
 pub struct Diagnostic {
-    severity: Severity,
-    message: String,
-    hints: Vec<String>,
-    /// `nil` for the template itself, otherwise the path of the file in the project, or
+    pub severity: Severity,
+    pub message: String,
+    pub hints: Vec<String>,
+    /// `None` for the template itself, otherwise the path of the file in the project, or
     /// `@namespace/name:version/path` for a file in a package.
-    file: Option<String>,
-    /// 1-based, or `nil` when the problem has no location.
-    line: Option<usize>,
-    column: Option<usize>,
-    trace: Vec<TracePoint>,
+    pub file: Option<String>,
+    /// 1-based, or `None` when the problem has no location.
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub trace: Vec<TracePoint>,
 }
 
-#[derive(NifMap)]
+#[derive(Clone, Debug)]
 pub struct TracePoint {
-    message: String,
-    file: Option<String>,
-    line: Option<usize>,
-    column: Option<usize>,
+    pub message: String,
+    pub file: Option<String>,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
 }
 
 impl Diagnostic {

@@ -1,0 +1,21 @@
+[package]
+name = "typsty_core"
+description = "Compiles and exports Typst documents for Typsty's NIF and worker"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+comemo.workspace = true
+typst.workspace = true
+typst-kit.workspace = true
+typst-layout.workspace = true
+typst-pdf.workspace = true
+typst-render.workspace = true
+typst-svg.workspace = true
+typstyle-core.workspace = true
+time.workspace = true
+# Typst's thread pool, configured with large stacks
+rayon.workspace = true
+# Reads image dimensions from headers, to reject decompression bombs before decoding
+imagesize.workspace = true

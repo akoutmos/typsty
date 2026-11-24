@@ -34,6 +34,7 @@
 - [Packages](#packages)
 - [Errors](#errors)
 - [Running Typst inside the BEAM](#running-typst-inside-the-beam)
+- [Rendering in separate processes](#rendering-in-separate-processes)
 - [Formatting](#formatting)
 - [Configuration](#configuration)
 - [Building the NIF from source](#building-the-nif-from-source)
@@ -376,9 +377,47 @@ whole VM down. It's built so that what you render with can't crash it:
 A template, though, is code. Like any code, it can loop for a long time or
 allocate as much memory as it asks for (`range(n)`, `"x" * n`, and so on), and
 if the machine runs out of memory, the VM goes down. Keep that in mind when a
-template uses data to decide how much work to do, and don't render templates
-written by untrusted users in your main VM: render them on a separate node or
-in a separate OS process instead.
+template uses data to decide how much work to do. When that's a risk, render in
+separate processes.
+
+## Rendering in separate processes
+
+`Typsty.Pool` runs renders in a pool of separate OS processes, which it can end
+at any moment. That gives you guarantees the NIF can't:
+
+- A render that runs past its timeout is **stopped right away**, whatever it's
+  doing, including pure computation.
+- A render can be given a **memory limit**, and is stopped when it goes over it.
+- A worker that crashes, for any reason, takes **nothing else down**.
+
+Add a pool to your supervision tree, and render with it:
+
+```elixir
+children = [
+  {Typsty.Pool, name: MyApp.TypstPool, size: 4, memory_limit: 1_000_000_000}
+]
+```
+
+```elixir
+MyApp.Invoice.to_pdf(assigns, pool: MyApp.TypstPool, timeout: 10_000)
+```
+
+Or render every document with it:
+
+```elixir
+config :typsty, pool: MyApp.TypstPool
+```
+
+Renders return exactly what they return without a pool: the same output and
+the same warnings and errors, pointing at the same lines. A worker that's
+stopped is replaced, and workers end when the pool stops, when the process
+rendering with them exits and when the VM exits.
+
+The pool's workers run `typsty_worker`, a program built from the same code as
+the NIF, which comes with it. Rendering in a worker copies the template, the
+variables, the files and the output between processes, and a worker that
+replaces one that was stopped starts with empty caches, so it's a little
+slower than the NIF. See `Typsty.Pool` for its options.
 
 ## Formatting
 
@@ -412,6 +451,7 @@ config :typsty,
   pdf_standards: [],
   timeout: 60_000,
   max_concurrent_renders: System.schedulers_online(),
+  pool: nil,
   log_warnings: true
 ```
 

@@ -139,7 +139,10 @@ defmodule Typsty do
     to `60_000`. A render that times out returns an error and is cancelled: it stops the
     next time Typst lays out content, loads a file or a font, or exports a page, which
     for most documents is within milliseconds. A template doing pure computation (a long
-    loop of arithmetic) keeps running until it gets to one of those.
+    loop of arithmetic) keeps running until it gets to one of those. In a `Typsty.Pool`, a
+    render that times out is stopped right away.
+  - `:pool` - a `Typsty.Pool` to render in, instead of rendering inside the VM. Defaults to
+    `nil`.
 
   Renders also share one setting that can only be set in the application config:
 
@@ -178,7 +181,8 @@ defmodule Typsty do
     :embedded_fonts,
     :ppi,
     :pdf_standards,
-    :timeout
+    :timeout,
+    :pool
   ]
 
   @default_options [
@@ -190,7 +194,8 @@ defmodule Typsty do
     embedded_fonts: true,
     ppi: 144,
     pdf_standards: [],
-    timeout: 60_000
+    timeout: 60_000,
+    pool: nil
   ]
 
   @typedoc "Assigns for a template: a map or keyword list with atom or string keys."
@@ -525,7 +530,7 @@ defmodule Typsty do
         max_running: max_concurrent_renders!()
       }
 
-      case Native.render(template.source, variables, files, native_opts) do
+      case render_with(opts[:pool], template.source, variables, files, native_opts) do
         {:ok, output, warnings} ->
           warnings = Enum.map(warnings, &Diagnostic.locate(&1, template))
           log_warnings(warnings)
@@ -558,6 +563,19 @@ defmodule Typsty do
       nil ->
         diagnostic
     end
+  end
+
+  defp render_with(nil, source, variables, files, native_opts) do
+    Native.render(source, variables, files, native_opts)
+  end
+
+  defp render_with(pool, source, variables, files, native_opts)
+       when is_atom(pool) or is_pid(pool) or (is_tuple(pool) and elem(pool, 0) in [:global, :via]) do
+    Typsty.Pool.__render__(pool, source, variables, files, native_opts)
+  end
+
+  defp render_with(pool, _source, _variables, _files, _native_opts) do
+    raise ArgumentError, "the :pool option must be the name or pid of a Typsty.Pool, got: #{inspect(pool)}"
   end
 
   defp with_defaults(opts) do

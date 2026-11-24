@@ -1,28 +1,14 @@
-//! Native functions for Typsty: compiling Typst documents to PDF, PNG and SVG, checking
-//! template syntax and formatting templates with typstyle.
+//! The NIF that renders Typst documents inside the BEAM, with `typsty_core`.
 //!
 //! Terms are decoded and encoded on the NIF's own thread, and everything Typst does runs on
-//! a separate thread with a large stack (see `isolate`).
+//! a separate thread with a large stack (see `typsty_core::isolate`).
 
-mod checks;
-mod diagnostics;
-mod export;
-mod fonts;
-mod isolate;
 mod value;
-mod world;
 
 use std::time::Duration;
 
-use rustler::{Atom, Binary, Encoder, Env, NewBinary, NifMap, Term};
-use typst::foundations::Dict;
-use typst::syntax::Source;
-use typst_layout::PagedDocument;
-
-use diagnostics::Diagnostic;
-use export::Output;
-use fonts::FontSettings;
-use world::{TypstyWorld, WorldOptions};
+use rustler::{Atom, Binary, Encoder, Env, NewBinary, NifMap, NifStruct, NifUnitEnum, Term};
+use typsty_core::{render, Failure, FontSettings, Format, Output, RenderJob};
 
 mod atoms {
     rustler::atoms! {
@@ -33,11 +19,6 @@ mod atoms {
         svg,
     }
 }
-
-/// How many compilations a memoized result survives without being used. Typst memoizes
-/// evaluation, layout, decoded images and rendered textures across compilations, which
-/// speeds up rendering the same template again; evicting old results keeps memory bounded.
-const CACHE_MAX_AGE: usize = 10;
 
 #[derive(NifMap)]
 struct FontOptions {
@@ -73,21 +54,61 @@ struct FormatOptions {
     wrap_text: bool,
 }
 
-#[derive(Clone, Copy)]
-enum Format {
-    Pdf,
-    Png,
-    Svg,
+#[derive(NifUnitEnum)]
+enum Severity {
+    Error,
+    Warning,
 }
 
-enum Failure {
-    /// The arguments are invalid, which is raised as an `ArgumentError`.
-    Invalid(String),
-    /// Typst reported errors, or the render failed.
-    Diagnostics(Vec<Diagnostic>),
+#[derive(NifStruct)]
+#[module = "Typsty.Diagnostic"]
+struct Diagnostic {
+    severity: Severity,
+    message: String,
+    hints: Vec<String>,
+    file: Option<String>,
+    line: Option<usize>,
+    column: Option<usize>,
+    trace: Vec<TracePoint>,
 }
 
-type Rendered = (Output, Vec<Diagnostic>);
+#[derive(NifMap)]
+struct TracePoint {
+    message: String,
+    file: Option<String>,
+    line: Option<usize>,
+    column: Option<usize>,
+}
+
+impl From<typsty_core::Diagnostic> for Diagnostic {
+    fn from(diagnostic: typsty_core::Diagnostic) -> Self {
+        Self {
+            severity: match diagnostic.severity {
+                typsty_core::Severity::Error => Severity::Error,
+                typsty_core::Severity::Warning => Severity::Warning,
+            },
+            message: diagnostic.message,
+            hints: diagnostic.hints,
+            file: diagnostic.file,
+            line: diagnostic.line,
+            column: diagnostic.column,
+            trace: diagnostic
+                .trace
+                .into_iter()
+                .map(|point| TracePoint {
+                    message: point.message,
+                    file: point.file,
+                    line: point.line,
+                    column: point.column,
+                })
+                .collect(),
+        }
+    }
+}
+
+fn diagnostics(diagnostics: Vec<typsty_core::Diagnostic>) -> Vec<Diagnostic> {
+    diagnostics.into_iter().map(Diagnostic::from).collect()
+}
 
 /// Compiles a template and exports it.
 ///
@@ -117,16 +138,13 @@ fn render<'a>(
         Err(message) => return (atoms::error(), message).encode(env),
     };
 
-    let files: Vec<(String, Vec<u8>)> = files
-        .into_iter()
-        .map(|(path, bytes)| (path, bytes.as_slice().to_vec()))
-        .collect();
-
-    let timeout = options.timeout.map(Duration::from_millis);
     let job = RenderJob {
         template,
         variables,
-        files,
+        files: files
+            .into_iter()
+            .map(|(path, bytes)| (path, bytes.as_slice().to_vec()))
+            .collect(),
         format,
         root: options.root,
         package_paths: options.package_paths,
@@ -135,83 +153,23 @@ fn render<'a>(
         pdf_standards: options.pdf_standards,
     };
 
-    let limit = Some(options.max_running);
-    let result = isolate::run(timeout, limit, move |cancellation| job.run(cancellation))
+    let timeout = options.timeout.map(Duration::from_millis);
+    let result = job
+        .render(timeout, Some(options.max_running))
         .unwrap_or_else(|failure| {
-            Err(Failure::Diagnostics(vec![Diagnostic::error(
+            Err(Failure::Diagnostics(vec![typsty_core::Diagnostic::error(
                 failure.message(),
             )]))
         });
 
     match result {
-        Ok((output, warnings)) => (atoms::ok(), encode_output(env, output), warnings).encode(env),
+        Ok((output, warnings)) => {
+            let output = encode_output(env, output);
+            (atoms::ok(), output, diagnostics(warnings)).encode(env)
+        }
         Err(Failure::Invalid(message)) => (atoms::error(), message).encode(env),
-        Err(Failure::Diagnostics(diagnostics)) => (atoms::error(), diagnostics).encode(env),
+        Err(Failure::Diagnostics(errors)) => (atoms::error(), diagnostics(errors)).encode(env),
     }
-}
-
-struct RenderJob {
-    template: String,
-    variables: Dict,
-    files: Vec<(String, Vec<u8>)>,
-    format: Format,
-    root: Option<String>,
-    package_paths: Vec<String>,
-    fonts: FontSettings,
-    ppi: f64,
-    pdf_standards: Vec<String>,
-}
-
-impl RenderJob {
-    fn run(self, cancellation: isolate::Cancellation) -> Result<Rendered, Failure> {
-        let world_options = WorldOptions {
-            files: self.files,
-            root: self.root,
-            package_paths: self.package_paths,
-            fonts: fonts::store(&self.fonts),
-            cancellation,
-        };
-
-        // Evicted after exporting (rendering PNGs memoizes textures), and also when a
-        // cancelled render unwinds
-        let _evict = EvictOnDrop;
-
-        let world = TypstyWorld::new(&self.template, self.variables, world_options)
-            .map_err(Failure::Invalid)?;
-
-        compile_and_export(&world, self.format, self.ppi, &self.pdf_standards)
-    }
-}
-
-struct EvictOnDrop;
-
-impl Drop for EvictOnDrop {
-    fn drop(&mut self) {
-        comemo::evict(CACHE_MAX_AGE);
-    }
-}
-
-fn compile_and_export(
-    world: &TypstyWorld,
-    format: Format,
-    ppi: f64,
-    pdf_standards: &[String],
-) -> Result<Rendered, Failure> {
-    let compiled = typst::compile::<PagedDocument>(world);
-    let warnings = diagnostics::from_sources(&compiled.warnings, world);
-
-    let document = compiled
-        .output
-        .map_err(|errors| Failure::Diagnostics(diagnostics::from_sources(&errors, world)))?;
-
-    let output = match format {
-        Format::Pdf => export::pdf(&document, pdf_standards, world),
-        Format::Png => export::png(&document, ppi, world),
-        Format::Svg => Ok(export::svg(&document, world)),
-    }
-    .map_err(Failure::Diagnostics)?;
-
-    Ok((output, warnings))
 }
 
 fn encode_output<'a>(env: Env<'a>, output: Output) -> Term<'a> {
@@ -235,81 +193,46 @@ fn binary<'a>(env: Env<'a>, bytes: &[u8]) -> Term<'a> {
 /// template.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn syntax_errors(template: String) -> Vec<Diagnostic> {
-    isolate::run(None, None, move |_cancellation| {
-        collect_syntax_errors(&template)
-    })
-    .unwrap_or_else(|failure| vec![Diagnostic::error(failure.message())])
-}
-
-fn collect_syntax_errors(template: &str) -> Vec<Diagnostic> {
-    let source = Source::detached(template);
-    let (errors, _warnings) = source.root().errors_and_warnings();
-
-    errors
-        .iter()
-        .map(|error| Diagnostic::from_syntax(error, &source))
-        .collect()
+    diagnostics(render::syntax_errors(template))
 }
 
 /// Formats a template with typstyle. Returns `{:error, diagnostics}` when the template has
 /// syntax errors, since it can't be formatted then.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn format<'a>(env: Env<'a>, template: String, options: FormatOptions) -> Term<'a> {
-    let config = typstyle_core::Config::new()
-        .with_width(options.line_width)
-        .with_tab_spaces(options.indent_width)
-        .with_wrap_text(options.wrap_text);
+    let formatted = render::format(
+        template,
+        options.line_width,
+        options.indent_width,
+        options.wrap_text,
+    );
 
-    let result = isolate::run(None, None, move |_cancellation| {
-        typstyle_core::Typstyle::new(config)
-            .format_text(template.as_str())
-            .render()
-            .map_err(|_| collect_syntax_errors(&template))
-    })
-    .unwrap_or_else(|failure| Err(vec![Diagnostic::error(failure.message())]));
-
-    match result {
+    match formatted {
         Ok(formatted) => (atoms::ok(), formatted).encode(env),
-        Err(diagnostics) => (atoms::error(), diagnostics).encode(env),
+        Err(errors) => (atoms::error(), diagnostics(errors)).encode(env),
     }
 }
 
 /// Scans for fonts (caching them for later renders) and returns the font families found.
 #[rustler::nif(schedule = "DirtyIo")]
 fn font_families(options: FontOptions) -> Vec<String> {
-    let store = fonts::store(&options.settings());
-    let mut families: Vec<String> = store
-        .book()
-        .families()
-        .map(|(family, _)| family.to_string())
-        .collect();
-
-    families.sort();
-    families.dedup();
-    families
+    render::font_families(&options.settings())
 }
 
 /// The number of renders running, including renders that timed out and are being cancelled.
 #[rustler::nif]
 fn running_renders() -> usize {
-    isolate::running_renders()
+    typsty_core::isolate::running_renders()
 }
 
 /// The version of the Typst compiler, such as "0.15.1".
 #[rustler::nif]
 fn typst_version() -> String {
-    let version = typst::utils::version();
-    format!(
-        "{}.{}.{}",
-        version.major(),
-        version.minor(),
-        version.patch()
-    )
+    typsty_core::typst_version()
 }
 
 fn load(_env: Env, _info: Term) -> bool {
-    isolate::init_panic_hook();
-    isolate::init_thread_pool();
+    typsty_core::init();
     true
 }
 

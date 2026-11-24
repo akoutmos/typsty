@@ -49,10 +49,16 @@ defmodule Typsty.MixProject do
   defp package do
     [
       name: "typsty",
-      # The NIF is downloaded precompiled, and built from these sources when TYPSTY_BUILD is set
-      # hex.pm shows the README from the package, so the images it references are packaged too.
+      # The NIF and the worker are downloaded precompiled, and built from the native/ workspace
+      # when TYPSTY_BUILD is set. hex.pm shows the README from the package, so the images it
+      # references are packaged too.
       files:
-        ~w(lib native/typsty_nif/.cargo native/typsty_nif/src native/typsty_nif/Cargo.toml native/typsty_nif/Cargo.lock) ++
+        ~w(lib native/Cargo.toml native/Cargo.lock native/.cargo) ++
+          for(
+            crate <- ~w(typsty_core typsty_nif typsty_worker),
+            path <- ~w(Cargo.toml src),
+            do: "native/#{crate}/#{path}"
+          ) ++
           ~w(images checksum-*.exs mix.exs .formatter.exs README.md LICENSE CHANGELOG.md VERSION),
       licenses: ["MIT"],
       maintainers: ["Alex Koutmos"],
@@ -72,7 +78,7 @@ defmodule Typsty.MixProject do
       assets: %{"images" => "images"},
       extras: ["README.md", "CHANGELOG.md"],
       groups_for_modules: [
-        Documents: [Typsty, Typsty.Template],
+        Documents: [Typsty, Typsty.Template, Typsty.Pool],
         Data: [Typsty.Encoder],
         Errors: [Typsty.RenderError, Typsty.SyntaxError, Typsty.Diagnostic],
         Tooling: [Typsty.Formatter, Typsty.Telemetry, Mix.Tasks.Typsty.Packages.Get]
@@ -94,6 +100,7 @@ defmodule Typsty.MixProject do
       {:rustler_precompiled, "~> 0.8"},
       {:rustler, "~> 0.38", optional: true},
       {:telemetry, "~> 1.0"},
+      {:nimble_pool, "~> 1.1"},
 
       # Development deps
       {:decimal, "~> 2.0 or ~> 3.0", only: [:dev, :test]},

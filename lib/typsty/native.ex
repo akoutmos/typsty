@@ -25,6 +25,13 @@ defmodule Typsty.Native do
       x86_64-pc-windows-msvc
     )
 
+  # Built from source, RustlerPrecompiled doesn't load a precompiled NIF. The worker for
+  # Typsty.Pool is built then too (precompiled downloads include it).
+  if not Module.defines?(__MODULE__, {:load_rustler_precompiled, 0}) do
+    for source <- Typsty.WorkerBuild.sources(), do: @external_resource(source)
+    Typsty.WorkerBuild.build!()
+  end
+
   def render(_template, _variables, _files, _options), do: :erlang.nif_error(:nif_not_loaded)
   def syntax_errors(_template), do: :erlang.nif_error(:nif_not_loaded)
   def format(_template, _options), do: :erlang.nif_error(:nif_not_loaded)

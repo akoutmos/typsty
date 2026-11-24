@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Typsty.Pool`, a pool of worker processes to render in, with the `:pool` option (per render, or in the config). A
+  render that runs past its timeout is stopped right away, a render can be given a memory limit (`:memory_limit`),
+  and a worker that crashes takes nothing else down. Workers are replaced when they're stopped, can be recycled after
+  a number of renders (`:max_renders`), and end with the pool, with the process rendering with them, and with the VM.
+  Renders return exactly what they return in the NIF. The worker program is built from the same code as the NIF, and
+  precompiled downloads include it.
+
 - Document modules with `use Typsty`: `render/1` with the `~TYPST` sigil, or a colocated `.typ` template (or one
   given with the `:template` option), and generated `to_pdf/2`, `to_png/2` and `to_svg/2`, with bang variants.
 - `Typsty.to_pdf/3`, `Typsty.to_png/3` and `Typsty.to_svg/3` for templates and Typst source.
