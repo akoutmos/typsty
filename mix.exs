@@ -75,15 +75,15 @@ defmodule Typsty.MixProject do
         Documents: [Typsty, Typsty.Template],
         Data: [Typsty.Encoder],
         Errors: [Typsty.RenderError, Typsty.SyntaxError, Typsty.Diagnostic],
-        Tooling: [Typsty.Formatter, Typsty.Telemetry]
+        Tooling: [Typsty.Formatter, Typsty.Telemetry, Mix.Tasks.Typsty.Packages.Get]
       ]
     ]
   end
 
   defp dialyzer do
     [
-      # The formatter plugin implements a Mix behaviour
-      plt_add_apps: [:mix],
+      # The formatter plugin and the packages task use Mix, and the task downloads with :httpc
+      plt_add_apps: [:mix, :inets, :ssl, :public_key],
       plt_file: {:no_warn, "priv/plts/dialyzer.plt"}
     ]
   end

@@ -274,4 +274,16 @@ fn font_families(options: FontOptions) -> Vec<String> {
     families
 }
 
+/// The version of the Typst compiler, such as "0.15.1".
+#[rustler::nif]
+fn typst_version() -> String {
+    let version = typst::utils::version();
+    format!(
+        "{}.{}.{}",
+        version.major(),
+        version.minor(),
+        version.patch()
+    )
+}
+
 rustler::init!("Elixir.Typsty.Native");

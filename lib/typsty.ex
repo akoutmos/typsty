@@ -129,8 +129,8 @@ defmodule Typsty do
     New Computer Modern, New Computer Modern Math and DejaVu Sans Mono). Defaults to `true`.
   - `:package_paths` - directories with Typst packages, laid out as
     `namespace/name/version`, like Typst's package cache. A template can import a package
-    from them with `#import "@preview/cetz:0.4.2"`. Packages aren't downloaded. Defaults
-    to `[]`.
+    from them with `#import "@preview/cetz:0.4.2"`. Packages are never downloaded while
+    rendering: fetch them ahead of time with `mix typsty.packages.get`. Defaults to `[]`.
   - `:ppi` - for PNG, the resolution in pixels per inch. Defaults to `144`.
   - `:pdf_standards` - for PDF, the standards to conform to, such as `["a-2b"]` or
     `["ua-1"]`. Defaults to `[]`.
@@ -431,6 +431,12 @@ defmodule Typsty do
     Native.font_families(font_options(opts))
   end
 
+  @doc """
+  Returns the version of the Typst compiler that Typsty uses, such as `"0.15.1"`.
+  """
+  @spec typst_version() :: String.t()
+  def typst_version, do: Native.typst_version()
+
   @doc false
   @spec __render__(module(), :pdf | :png | :svg, assigns(), keyword()) ::
           {:ok, binary() | [binary()]} | {:error, RenderError.t()}
@@ -495,12 +501,29 @@ defmodule Typsty do
           raise ArgumentError, message
 
         {:error, diagnostics} ->
-          diagnostics = Enum.map(diagnostics, &Diagnostic.locate(&1, template))
+          diagnostics = Enum.map(diagnostics, &(&1 |> Diagnostic.locate(template) |> package_hint()))
 
           {{:error, %RenderError{diagnostics: diagnostics}},
            Map.merge(metadata, %{result: :error, diagnostics: diagnostics})}
       end
     end)
+  end
+
+  # A package from Typst Universe that isn't in the :package_paths directories
+  @missing_package ~r/package not found \(searched for (@preview\/[^\s)]+)\)/
+
+  defp package_hint(%Diagnostic{message: message, hints: hints} = diagnostic) do
+    case Regex.run(@missing_package, message) do
+      [_, spec] ->
+        hint =
+          "download it with `mix typsty.packages.get #{spec}`, " <>
+            "and add the directory it's saved in to the :package_paths option"
+
+        %{diagnostic | hints: hints ++ [hint]}
+
+      nil ->
+        diagnostic
+    end
   end
 
   defp with_defaults(opts) do

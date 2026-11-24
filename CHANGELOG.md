@@ -19,7 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can also be read from a `:root` directory.
 - Fonts from the system, from Typst's embedded fonts and from `:font_paths`, scanned once per font configuration and
   cached. `Typsty.font_families/1` lists the font families and warms the cache.
-- Typst packages from local `:package_paths` directories.
+- Typst packages from local `:package_paths` directories, and `mix typsty.packages.get` to download packages from
+  Typst Universe into the project (with the packages they import), as arguments or from `config :typsty, packages:`.
+  Rendering never downloads packages, and a missing package's error says how to fetch it.
+- `Typsty.typst_version/0`.
 - Template syntax checked at compile time, with `Typsty.SyntaxError` pointing at the line and column in the module or
   `.typ` file. `Typsty.validate/1` checks Typst source at runtime.
 - `Typsty.RenderError` with Typst's diagnostics (message, hints, location and trace), mapped to the lines of the

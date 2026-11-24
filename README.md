@@ -264,33 +264,47 @@ helps when a font isn't being picked up.
 
 ## Packages
 
-Templates can import [Typst packages](https://typst.app/universe) from the
-directories given with `:package_paths`, laid out as `namespace/name/version`,
-like Typst's own package directories:
+Templates can import [Typst packages](https://typst.app/universe). Download them
+into your project with `mix typsty.packages.get`:
+
+```shell
+mix typsty.packages.get @preview/cetz:0.4.2
+```
 
 ```
-priv/typst/packages/
-├── preview/
-│   └── cetz/
-│       └── 0.4.2/
-└── local/
-    └── letterhead/
-        └── 1.0.0/
+* Fetched @preview/cetz:0.4.2
+* Fetched @preview/oxifmt:1.0.0 (imported by @preview/cetz:0.4.2)
 ```
+
+Packages are saved in `priv/typst/packages` (change it with `--path`), laid out
+as `namespace/name/version` like Typst's own package directories, so they ship
+with your releases. Packages that a package imports are fetched too, and a
+package given without a version (`@preview/cetz`) gets its latest version that
+works with the Typst version Typsty uses (`Typsty.typst_version/0`).
+
+Point the `:package_paths` option at the directory, in `config/runtime.exs`:
 
 ```elixir
-config :typsty, package_paths: ["priv/typst/packages"]
+config :typsty, package_paths: [Application.app_dir(:my_app, "priv/typst/packages")]
 ```
 
 ```typst
-#import "@preview/cetz:0.4.2"
+#import "@preview/cetz:0.4.2": canvas, draw
 ```
 
-Typsty doesn't download packages while rendering, so documents never wait on the
-network and always use the package versions you ship. Packages you have used
-with the Typst CLI are in its cache directory (such as `~/.cache/typst/packages`
-on Linux and `~/Library/Caches/typst/packages` on macOS), which can be copied
-into your application or listed in `:package_paths`.
+To keep the list of packages in your repository, for CI and Docker builds, list
+them in your config and run the task without arguments:
+
+```elixir
+# config/config.exs
+config :typsty, packages: ["@preview/cetz:0.4.2"]
+```
+
+Typsty never downloads packages while rendering, so documents don't wait on the
+network and always use the package versions you ship. A template that imports a
+package that isn't there fails with an error that says which package to fetch.
+Your own packages can go in the same directories, under a namespace such as
+`local`.
 
 ## Errors
 
