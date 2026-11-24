@@ -1,6 +1,7 @@
 //! The environment a document is compiled in: its source, variables, files and fonts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use typst::diag::{FileError, FileResult, PackageError};
@@ -13,11 +14,26 @@ use typst_kit::files::FsRoot;
 use typst_kit::fonts::FontStore;
 use typst_kit::packages::FsPackages;
 
+use crate::checks;
+
 /// The path of the main source file in the project.
 pub const MAIN_PATH: &str = "/main.typ";
 
 /// The id of the main source file.
-pub static MAIN_ID: LazyLock<FileId> = LazyLock::new(|| project_file(MAIN_PATH).unwrap());
+pub static MAIN_ID: LazyLock<FileId> = LazyLock::new(|| {
+    FileId::new(RootedPath::new(
+        VirtualRoot::Project,
+        VirtualPath::new(MAIN_PATH).unwrap(),
+    ))
+});
+
+/// Typst gives every file path an id that lasts for the life of the VM, and it can only
+/// make 65,535 of them: after that, it panics, and every later compilation fails until the
+/// VM restarts. So the paths given in `:files` are capped below that, leaving room for the
+/// files Typst reads itself (imports, packages and files read from disk).
+const MAX_FILE_PATHS: usize = 50_000;
+
+static FILE_PATHS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// The standard library for documents without variables.
 static LIBRARY: LazyLock<LazyHash<Library>> = LazyLock::new(|| LazyHash::new(Library::default()));
@@ -34,12 +50,13 @@ pub struct TypstyWorld {
     main: Source,
     /// The number of lines added before the template to bind its variables.
     preamble_lines: usize,
-    /// The files given to the render, which take precedence over the root directory.
-    files: HashMap<FileId, Bytes>,
+    /// The files given to the render, which take precedence over the root directory. A file
+    /// that failed the checks in `checks` holds its error.
+    files: HashMap<FileId, FileResult<Bytes>>,
     root: Option<FsRoot>,
     packages: Vec<FsPackages>,
     /// Files read from the root directory or from packages, and parsed sources.
-    loaded: Mutex<HashMap<FileId, Bytes>>,
+    loaded: Mutex<HashMap<FileId, FileResult<Bytes>>>,
     sources: Mutex<HashMap<FileId, Source>>,
     now: time::OffsetDateTime,
 }
@@ -79,7 +96,7 @@ impl TypstyWorld {
 
         let mut files = HashMap::with_capacity(options.files.len());
         for (path, bytes) in options.files {
-            let id = project_file(&path).map_err(|_| format!("invalid file path: {path:?}"))?;
+            let id = project_file(&path)?;
 
             if id == *MAIN_ID {
                 return Err(format!(
@@ -87,7 +104,10 @@ impl TypstyWorld {
                 ));
             }
 
-            files.insert(id, Bytes::new(bytes));
+            let checked = checks::check(&bytes)
+                .map(|()| Bytes::new(bytes))
+                .map_err(|problem| FileError::Other(Some(problem.into())));
+            files.insert(id, checked);
         }
 
         Ok(Self {
@@ -128,10 +148,16 @@ impl TypstyWorld {
     /// package directory.
     fn load(&self, id: FileId) -> FileResult<Bytes> {
         let mut loaded = self.loaded.lock().map_err(|_| FileError::AccessDenied)?;
-        if let Some(bytes) = loaded.get(&id) {
-            return Ok(bytes.clone());
+        if let Some(result) = loaded.get(&id) {
+            return result.clone();
         }
 
+        let result = self.read(id);
+        loaded.insert(id, result.clone());
+        result
+    }
+
+    fn read(&self, id: FileId) -> FileResult<Bytes> {
         let root = match id.root() {
             VirtualRoot::Project => self.root.clone().ok_or_else(|| {
                 FileError::Other(Some(
@@ -146,15 +172,32 @@ impl TypstyWorld {
                 .packages
                 .iter()
                 .find_map(|packages| packages.obtain(spec))
-                .ok_or_else(|| {
-                    FileError::Package(PackageError::NotFound(spec.clone()))
-                })?,
+                .ok_or_else(|| FileError::Package(PackageError::NotFound(spec.clone())))?,
         };
 
-        let bytes = root.load(id.vpath())?;
-        loaded.insert(id, bytes.clone());
-        Ok(bytes)
+        let path = root.resolve(id.vpath())?;
+        let bytes = read_regular_file(&path)?;
+        checks::check(&bytes).map_err(|problem| FileError::Other(Some(problem.into())))?;
+        Ok(Bytes::new(bytes))
     }
+}
+
+/// Reads a file, refusing anything but regular files (following symlinks): reading a device
+/// such as /dev/zero never ends, and reading a FIFO can block forever.
+fn read_regular_file(path: &Path) -> FileResult<Vec<u8>> {
+    let metadata = std::fs::metadata(path).map_err(|error| FileError::from_io(error, path))?;
+
+    if metadata.is_dir() {
+        return Err(FileError::IsDirectory);
+    }
+
+    if !metadata.is_file() {
+        return Err(FileError::Other(Some(
+            format!("{} is not a regular file", path.display()).into(),
+        )));
+    }
+
+    std::fs::read(path).map_err(|error| FileError::from_io(error, path))
 }
 
 impl World for TypstyWorld {
@@ -193,7 +236,7 @@ impl World for TypstyWorld {
         }
 
         match self.files.get(&id) {
-            Some(bytes) => Ok(bytes.clone()),
+            Some(result) => result.clone(),
             None => self.load(id),
         }
     }
@@ -211,8 +254,23 @@ impl World for TypstyWorld {
     }
 }
 
-fn project_file(path: &str) -> Result<FileId, ()> {
-    let vpath = VirtualPath::new(path).map_err(|_| ())?;
+/// The id of a file given in `:files`, within the cap on file paths.
+fn project_file(path: &str) -> Result<FileId, String> {
+    let vpath = VirtualPath::new(path).map_err(|_| format!("invalid file path: {path:?}"))?;
+
+    let mut paths = FILE_PATHS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !paths.contains(vpath.get_with_slash()) {
+        if paths.len() >= MAX_FILE_PATHS {
+            return Err(format!(
+                "too many distinct file paths: Typst keeps every file path for the life of the VM, and this one would be more than {MAX_FILE_PATHS}. Use stable file names, like logo.png, rather than a new name for every render"
+            ));
+        }
+
+        paths.insert(vpath.get_with_slash().to_string());
+    }
+
     Ok(FileId::new(RootedPath::new(VirtualRoot::Project, vpath)))
 }
 

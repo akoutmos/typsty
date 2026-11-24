@@ -10,6 +10,10 @@ defmodule Typsty.Value do
   #
   # Atoms become strings, tuples become lists, and structs go through Typsty.Encoder.
 
+  # Typst recurses into values when it hashes, compares and prints them, so deeply nested
+  # data is refused (the native code has the same limit)
+  @max_depth 256
+
   @max_int 9_223_372_036_854_775_807
   @min_int -9_223_372_036_854_775_808
 
@@ -48,6 +52,7 @@ defmodule Typsty.Value do
 
   defp encode(value, path) when is_list(value) do
     if not proper?(value), do: invalid!(path, "is an improper list")
+    depth!(path)
 
     value
     |> Enum.with_index()
@@ -90,6 +95,8 @@ defmodule Typsty.Value do
   end
 
   defp encode(value, path) when is_map(value) do
+    depth!(path)
+
     Enum.reduce(value, %{}, fn {key, item}, acc ->
       key = key!(key, path)
 
@@ -105,12 +112,25 @@ defmodule Typsty.Value do
     invalid!(path, "is #{inspect(value)}, which can't be passed to Typst")
   end
 
-  defp key!(key, _path) when is_binary(key), do: key
+  defp key!(key, path) when is_binary(key) do
+    if String.valid?(key) do
+      key
+    else
+      invalid!(path, "has a key that isn't valid UTF-8: #{inspect(key)}")
+    end
+  end
+
   defp key!(key, _path) when is_atom(key) and key not in [nil, true, false], do: Atom.to_string(key)
   defp key!(key, _path) when is_integer(key), do: Integer.to_string(key)
 
   defp key!(key, path) do
     invalid!(path, "has the key #{inspect(key)}. Keys must be atoms, strings or integers")
+  end
+
+  defp depth!(path) do
+    if length(path) >= @max_depth do
+      invalid!(path, "is nested too deeply: lists and maps can be nested at most #{@max_depth} levels deep")
+    end
   end
 
   defp proper?([]), do: true
@@ -143,10 +163,21 @@ defmodule Typsty.Value do
 
   defp describe([]), do: "the value"
 
-  defp describe(path) do
-    path
-    |> Enum.reverse()
-    |> Enum.reduce("", fn
+  # Deeply nested paths are shortened to their start and end
+  defp describe(path) when length(path) > 12 do
+    {last, rest} = Enum.split(path, 4)
+    describe(Enum.take(rest, -6)) <> "…" <> (last |> Enum.reverse() |> join_path(true))
+  end
+
+  defp describe(path), do: path |> Enum.reverse() |> join_path(false)
+
+  defp join_path(segments, continued?) do
+    initial = if continued?, do: :continued, else: ""
+
+    segments
+    |> Enum.reduce(initial, fn
+      index, :continued when is_integer(index) -> "[#{index}]"
+      key, :continued -> "." <> key
       index, "" when is_integer(index) -> "[#{index}]"
       index, acc when is_integer(index) -> acc <> "[#{index}]"
       key, "" -> key

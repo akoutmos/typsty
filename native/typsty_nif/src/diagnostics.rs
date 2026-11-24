@@ -1,23 +1,24 @@
 //! Turns Typst's errors and warnings into `Typsty.Diagnostic` structs.
 
-use rustler::{Atom, NifMap, NifStruct};
-use typst::diag::{Severity, SourceDiagnostic};
+use rustler::{NifMap, NifStruct, NifUnitEnum};
+use typst::diag::SourceDiagnostic;
 use typst::syntax::{DiagSpan, Source, SyntaxDiagnostic, VirtualRoot};
 use typst::WorldExt;
 
 use crate::world::TypstyWorld;
 
-mod atoms {
-    rustler::atoms! {
-        error,
-        warning,
-    }
+// Diagnostics are built on the thread that runs Typst and encoded on the NIF's thread, so
+// they hold plain data rather than terms or atoms.
+#[derive(NifUnitEnum, Clone, Copy)]
+pub enum Severity {
+    Error,
+    Warning,
 }
 
 #[derive(NifStruct)]
 #[module = "Typsty.Diagnostic"]
 pub struct Diagnostic {
-    severity: Atom,
+    severity: Severity,
     message: String,
     hints: Vec<String>,
     /// `nil` for the template itself, otherwise the path of the file in the project, or
@@ -41,7 +42,7 @@ impl Diagnostic {
     /// A diagnostic without a location, for problems that aren't in a Typst file.
     pub fn error(message: impl Into<String>) -> Self {
         Self {
-            severity: atoms::error(),
+            severity: Severity::Error,
             message: message.into(),
             hints: Vec::new(),
             file: None,
@@ -53,8 +54,8 @@ impl Diagnostic {
 
     pub fn from_source(diagnostic: &SourceDiagnostic, world: &TypstyWorld) -> Self {
         let severity = match diagnostic.severity {
-            Severity::Error => atoms::error(),
-            Severity::Warning => atoms::warning(),
+            typst::diag::Severity::Error => Severity::Error,
+            typst::diag::Severity::Warning => Severity::Warning,
         };
         let (file, line, column) = locate(diagnostic.span, world);
 
@@ -98,9 +99,9 @@ impl Diagnostic {
 
         Self {
             severity: if diagnostic.is_error {
-                atoms::error()
+                Severity::Error
             } else {
-                atoms::warning()
+                Severity::Warning
             },
             message: diagnostic.message.to_string(),
             hints: diagnostic

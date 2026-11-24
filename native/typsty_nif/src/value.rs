@@ -26,15 +26,26 @@ mod atoms {
 
 type Result<T> = std::result::Result<T, String>;
 
+/// How deeply lists and maps may be nested. This conversion runs on a scheduler thread, with
+/// a small stack, and Typst also recurses into values when it hashes, compares and prints
+/// them. `Typsty.Value` enforces the same limit with a better error message.
+pub const MAX_DEPTH: usize = 256;
+
 /// Converts the variables map into a dictionary of Typst values.
 pub fn to_dict(term: Term) -> Result<Dict> {
-    match to_value(term)? {
+    match to_value(term, 0)? {
         Value::Dict(dict) => Ok(dict),
         _ => Err(invalid("the variables must be a map")),
     }
 }
 
-fn to_value(term: Term) -> Result<Value> {
+fn to_value(term: Term, depth: usize) -> Result<Value> {
+    if depth > MAX_DEPTH {
+        return Err(invalid(&format!(
+            "lists and maps can be nested at most {MAX_DEPTH} levels deep"
+        )));
+    }
+
     match term.get_type() {
         TermType::Atom => {
             if let Ok(boolean) = term.decode::<bool>() {
@@ -61,7 +72,10 @@ fn to_value(term: Term) -> Result<Value> {
         }
         TermType::List => {
             let items: Vec<Term> = term.decode().map_err(|_| invalid("improper list"))?;
-            let array = items.into_iter().map(to_value).collect::<Result<Array>>()?;
+            let array = items
+                .into_iter()
+                .map(|item| to_value(item, depth + 1))
+                .collect::<Result<Array>>()?;
             Ok(Value::Array(array))
         }
         TermType::Map => {
@@ -70,7 +84,7 @@ fn to_value(term: Term) -> Result<Value> {
                 let key: &str = key
                     .decode()
                     .map_err(|_| invalid("map keys must be strings"))?;
-                dict.insert(Str::from(key), to_value(value)?);
+                dict.insert(Str::from(key), to_value(value, depth + 1)?);
             }
             Ok(Value::Dict(dict))
         }
@@ -110,7 +124,7 @@ fn tagged(term: Term) -> Result<Value> {
 
         return Decimal::from_str(string).map(Value::Decimal).map_err(|_| {
             invalid(&format!(
-                "the decimal {string} doesn't fit in a Typst decimal (at most 28 significant digits)"
+                "the decimal {string} doesn't fit in a Typst decimal, which has about 28 significant digits and at most 28 decimal places"
             ))
         });
     } else {

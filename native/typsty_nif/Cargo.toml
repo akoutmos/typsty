@@ -20,8 +20,14 @@ typst-render = "0.15.1"
 typst-svg = "0.15.1"
 typstyle-core = "0.15.3"
 time = "0.3"
+# Typst's thread pool, configured with large stacks
+rayon = "1"
+# Reads image dimensions from headers, to reject decompression bombs before decoding
+imagesize = "0.14"
 
 [profile.release]
+# Panics must unwind, so that they become errors instead of aborting the VM
+panic = "unwind"
 # Smaller and faster NIFs, at the cost of longer release builds
 lto = true
 codegen-units = 1

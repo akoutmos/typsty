@@ -31,4 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   formats Typst source.
 - PDF standards (such as PDF/A-2b and PDF/UA-1) with the `:pdf_standards` option, and the PNG resolution with `:ppi`.
 - Telemetry events for every render.
+- Protection for the VM: Typst runs on its own thread with a large stack (as does its thread pool), so deep
+  recursion can't overflow a scheduler's stack, and panics become `Typsty.RenderError`s. Renders time out after 60
+  seconds by default (`:timeout`). Variables are nested at most 256 levels deep, images claiming more than 134
+  megapixels and SVG/XML files nested more than 1,024 levels deep are refused before Typst decodes them, only regular
+  files are read from disk, PNG export refuses pages that would need more than 2^28 pixels, and distinct file paths
+  are capped at 50,000.
 - Precompiled NIFs for macOS, Linux (glibc and musl) and Windows, with RustlerPrecompiled.

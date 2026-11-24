@@ -2683,6 +2683,8 @@ name = "typsty_nif"
 version = "0.1.0"
 dependencies = [
  "comemo",
+ "imagesize",
+ "rayon",
  "rustler",
  "time",
  "typst",

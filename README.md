@@ -33,6 +33,7 @@
 - [Fonts](#fonts)
 - [Packages](#packages)
 - [Errors](#errors)
+- [Running Typst inside the BEAM](#running-typst-inside-the-beam)
 - [Formatting](#formatting)
 - [Configuration](#configuration)
 - [Building the NIF from source](#building-the-nif-from-source)
@@ -332,6 +333,40 @@ Exception.message(error)
 Typst's warnings, such as an unknown font family, are logged. Every render also
 emits [telemetry](https://hexdocs.pm/telemetry) events (see `Typsty.Telemetry`).
 
+## Running Typst inside the BEAM
+
+Typsty runs Typst in a NIF, inside your VM, so a crash in it would take the
+whole VM down. It's built so that what you render with can't crash it:
+
+- **Typst runs on its own thread**, with a 256 MiB stack (reserved address
+  space, not memory), and so does Typst's thread pool. Deeply nested content
+  can't overflow the small stacks of the BEAM's schedulers, panics in Typst
+  are returned as a `Typsty.RenderError`, and Typst's own limits (parsing,
+  call and layout depth) get a chance to stop runaway recursion.
+- **Renders time out** after 60 seconds by default (`:timeout`), so a render
+  that never finishes doesn't hold a scheduler forever. Typst can't be
+  interrupted, so the render keeps running in the background until it ends.
+- **Data is checked before Typst gets it.** Variables can be nested at most
+  256 levels deep. Images whose header claims more than 134 megapixels are
+  refused before they're decoded (a small file can claim to be enormous), as
+  are SVG and XML files nested more than 1,024 levels deep. Files are only
+  read from `:root` and package directories if they're regular files, so a
+  symlink to `/dev/zero` or a FIFO can't hang a render.
+- **PNG export is checked before rasterizing.** A page, and the images,
+  gradients and tilings on it, may use at most 2^28 pixels (1 GiB), so an
+  extreme `:ppi` or content far larger than the page returns an error instead
+  of an allocation that would fail.
+- **File paths are capped** at 50,000 distinct paths in `:files` for the life
+  of the VM, since Typst keeps every path it sees and breaks for good after
+  65,535 of them.
+
+A template, though, is code. Like any code, it can loop for a long time or
+allocate as much memory as it asks for (`range(n)`, `"x" * n`, and so on), and
+if the machine runs out of memory, the VM goes down. Keep that in mind when a
+template uses data to decide how much work to do, and don't render templates
+written by untrusted users in your main VM: render them on a separate node or
+in a separate OS process instead.
+
 ## Formatting
 
 `Typsty.Formatter` is a `mix format` plugin that formats `~TYPST` sigils and
@@ -362,6 +397,7 @@ config :typsty,
   package_paths: [],
   ppi: 144,
   pdf_standards: [],
+  timeout: 60_000,
   log_warnings: true
 ```
 

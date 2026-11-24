@@ -134,6 +134,10 @@ defmodule Typsty do
   - `:ppi` - for PNG, the resolution in pixels per inch. Defaults to `144`.
   - `:pdf_standards` - for PDF, the standards to conform to, such as `["a-2b"]` or
     `["ua-1"]`. Defaults to `[]`.
+  - `:timeout` - how long to wait for the render, in milliseconds, or `:infinity`. Defaults
+    to `60_000`. Typst can't be interrupted, so a render that times out keeps running in
+    the background until it finishes, but the caller gets an error and the scheduler that
+    ran it is free again.
 
   Fonts are scanned once for each combination of `:font_paths`, `:system_fonts` and
   `:embedded_fonts` and then cached, so only the first render with given font settings
@@ -156,7 +160,16 @@ defmodule Typsty do
 
   @template_extension ".typ"
 
-  @configurable_options [:root, :package_paths, :font_paths, :system_fonts, :embedded_fonts, :ppi, :pdf_standards]
+  @configurable_options [
+    :root,
+    :package_paths,
+    :font_paths,
+    :system_fonts,
+    :embedded_fonts,
+    :ppi,
+    :pdf_standards,
+    :timeout
+  ]
 
   @default_options [
     files: [],
@@ -166,7 +179,8 @@ defmodule Typsty do
     system_fonts: true,
     embedded_fonts: true,
     ppi: 144,
-    pdf_standards: []
+    pdf_standards: [],
+    timeout: 60_000
   ]
 
   @typedoc "Assigns for a template: a map or keyword list with atom or string keys."
@@ -488,7 +502,8 @@ defmodule Typsty do
         package_paths: paths!(opts[:package_paths], :package_paths),
         fonts: font_options(opts),
         ppi: opts[:ppi] |> positive_number!(:ppi) |> Kernel.*(1.0),
-        pdf_standards: strings!(opts[:pdf_standards], :pdf_standards)
+        pdf_standards: strings!(opts[:pdf_standards], :pdf_standards),
+        timeout: timeout!(opts[:timeout])
       }
 
       case Native.render(template.source, variables, files, native_opts) do
@@ -585,6 +600,13 @@ defmodule Typsty do
 
   defp positive_number!(value, option) do
     raise ArgumentError, "the #{inspect(option)} option must be a positive number, got: #{inspect(value)}"
+  end
+
+  defp timeout!(:infinity), do: nil
+  defp timeout!(timeout) when is_integer(timeout) and timeout > 0, do: timeout
+
+  defp timeout!(timeout) do
+    raise ArgumentError, "the :timeout option must be a positive integer or :infinity, got: #{inspect(timeout)}"
   end
 
   defp positive_integer!(value, _option) when is_integer(value) and value > 0, do: value
