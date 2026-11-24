@@ -30,7 +30,7 @@
 - [Installation](#installation)
 - [Level Up Your Elixir Skills!](#level-up-your-elixir-skills)
 - [Using Typsty](#using-typsty)
-- [Variables](#variables)
+- [Assigns](#assigns)
 - [Files](#files)
 - [Fonts](#fonts)
 - [Packages](#packages)
@@ -114,17 +114,17 @@ defmodule MyApp.Invoice do
     #set page(paper: "us-letter")
     #image("logo.png", width: 3cm)
 
-    = Invoice #number
+    = Invoice #assigns.number
 
-    Billed to #customer.name on #issued_on.display("[month repr:long] [day], [year]").
+    Billed to #assigns.customer.name on #assigns.issued_on.display("[month repr:long] [day], [year]").
 
     #table(
       columns: (1fr, auto),
       [*Item*], [*Price*],
-      ..items.map(item => (item.name, [\$#item.price])).flatten(),
+      ..assigns.items.map(item => (item.name, [\$#item.price])).flatten(),
     )
 
-    *Total: \$#items.map(item => item.price).sum()*
+    *Total: \$#assigns.items.map(item => item.price).sum()*
     """
   end
 end
@@ -163,18 +163,22 @@ render a string of Typst source with `Typsty.to_pdf/3`, `Typsty.to_png/3` and
 `Typsty.to_svg/3`, and check it with `Typsty.validate/1`:
 
 ```elixir
-{:ok, pdf} = Typsty.to_pdf("= Hello #name", %{name: "World"})
-{:ok, [page]} = Typsty.to_png("= Hello #name", %{name: "World"}, ppi: 300)
+{:ok, pdf} = Typsty.to_pdf("= Hello #assigns.name", %{name: "World"})
+{:ok, [page]} = Typsty.to_png("= Hello #assigns.name", %{name: "World"}, ppi: 300)
 ```
 
 The assigns are always a map, and the options come after them.
 
-## Variables
+## Assigns
 
-The assigns become regular Typst variables in the template: `number`, `customer`
-and `items` above. Typst gets the data itself rather than code generated from
-it, so nothing needs escaping, and the template can loop over lists, read
-fields, do arithmetic and format dates:
+The template reads the assigns from a dictionary named `assigns`, the way a
+LiveView's `@number` is `assigns.number`: `assigns.number`, `assigns.customer`
+and `assigns.items` above. You can tell at a glance what came from Elixir and
+what the template defines, and an assign can't shadow anything in Typst (an
+assign named `title` is `assigns.title`, and `title` is still Typst's). Typst
+gets the data itself rather than code generated from it, so nothing needs
+escaping, and the template can loop over lists, read fields, do arithmetic and
+format dates:
 
 | Elixir                                           | Typst                                       |
 | ------------------------------------------------ | ------------------------------------------- |
@@ -187,6 +191,14 @@ fields, do arithmetic and format dates:
 | `Date`, `Time`, `NaiveDateTime`, `DateTime`      | `datetime` (`DateTime` keeps its wall time) |
 | `Decimal`                                        | `decimal`                                   |
 | other structs                                    | `dictionary`, or see `Typsty.Encoder`       |
+
+The assigns are a map with atom or string keys. A template reads keys that
+aren't Typst identifiers with `at` (`assigns.at("invoice number")`), and assigns
+that may be missing with a default:
+
+```typst
+#let subtitle = assigns.at("subtitle", default: none)
+```
 
 Keyword lists are lists of tuples, so they become arrays of pairs: pass maps for
 dictionaries. Typst's datetimes have no time zone or fractions of a second, so
@@ -201,17 +213,9 @@ defimpl Typsty.Encoder, for: MyApp.Money do
 end
 ```
 
-The variables are bound at the top of the template, like `#let` bindings, so
-they're only visible in the template itself. A variable named after something in
-Typst's standard library (such as `title`) shadows it there, but not in imported
-files and packages, and `std.title` still reaches the original (unless a
-variable is named `std`). Other files can
-read the variables from `sys.inputs`, which is also how a template can make one
-optional:
-
-```typst
-#let subtitle = sys.inputs.at("subtitle", default: none)
-```
+`assigns` is bound at the top of the template, like a `#let` binding, so it's
+only visible in the template itself. Files it imports, and packages, can read
+the same dictionary from `sys.inputs`.
 
 `render/1` gets the assigns first, so it can compute values for the template
 with all of Elixir:
@@ -221,7 +225,7 @@ def render(assigns) do
   assigns = Map.put(assigns, :due_on, Date.add(assigns.issued_on, 30))
 
   ~TYPST"""
-  Due on #due_on.display()
+  Due on #assigns.due_on.display()
   """
 end
 ```
@@ -342,7 +346,7 @@ A syntax error fails the build with a `Typsty.SyntaxError`:
                  ^
 ```
 
-Errors that depend on the data, such as a missing variable or a value of the
+Errors that depend on the data, such as a missing assign or a value of the
 wrong type, are returned as a `Typsty.RenderError` with the diagnostics Typst
 reported, pointing at the line in your module or `.typ` file:
 
@@ -351,7 +355,7 @@ reported, pointing at the line in your module or `.typ` file:
 Exception.message(error)
 #=> failed to render the Typst document:
 #=>
-#=> lib/my_app/invoice.ex:11:16: unknown variable: customer
+#=> lib/my_app/invoice.ex:11:24: dictionary does not contain key "customer"
 ```
 
 The error's `:reason` tells Typst's errors (`:typst`) apart from renders that
@@ -392,7 +396,7 @@ whole VM down. It's built so that the data you render with can't crash it:
   cancelled. New renders wait for a slot within their timeout, so renders that
   keep timing out can't pile up in the background. `Typsty.running_renders/0`
   reports how many are running.
-- **Data is checked before Typst gets it.** Variables can be nested at most
+- **Data is checked before Typst gets it.** Assigns can be nested at most
   256 levels deep. Images whose header claims more than 134 megapixels are
   refused before they're decoded (a small file can claim to be enormous), as
   are SVG and XML files nested more than 1,024 levels deep, compressed SVGs
@@ -454,7 +458,7 @@ them; see `Typsty.Pool`.
 
 The pool's workers run `typsty_worker`, a program built from the same code as
 the NIF, which comes with it. Rendering in a worker copies the template, the
-variables, the files and the output between processes, and a worker that
+assigns, the files and the output between processes, and a worker that
 replaces one that was stopped starts with empty caches, so it's a little
 slower than the NIF. See `Typsty.Pool` for its options.
 

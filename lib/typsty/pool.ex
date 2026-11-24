@@ -80,7 +80,7 @@ defmodule Typsty.Pool do
   stops, and when the VM exits, so workers never outlive what they're working for. A render
   that runs past its timeout ends its worker itself, too.
 
-  Rendering in a worker costs a little more than in the NIF: the template, the variables,
+  Rendering in a worker costs a little more than in the NIF: the template, the assigns,
   the files and the output are copied between processes, and a worker that replaces one
   that was ended starts with empty caches.
   """
@@ -193,13 +193,13 @@ defmodule Typsty.Pool do
           {:ok, binary() | [binary()], [Diagnostic.t()]}
           | {:error, :typst, [Diagnostic.t()]}
           | {:error, atom(), String.t()}
-  def __render__(pool, template, variables, files, options) do
+  def __render__(pool, template, assigns, files, options) do
     deadline = options.timeout && System.monotonic_time(:millisecond) + options.timeout
 
     NimblePool.checkout!(
       pool,
       :render,
-      fn {pool_pid, _ref}, worker -> render_in(worker, pool_pid, {template, variables, files, options}, deadline) end,
+      fn {pool_pid, _ref}, worker -> render_in(worker, pool_pid, {template, assigns, files, options}, deadline) end,
       options.timeout || :infinity
     )
   catch
@@ -218,17 +218,17 @@ defmodule Typsty.Pool do
     end
   end
 
-  defp send_request(port, {template, variables, files, options}, remaining, monitor, worker)
+  defp send_request(port, {template, assigns, files, options}, remaining, monitor, worker)
        when remaining == :infinity or remaining > 0 do
     timeout = if remaining == :infinity, do: nil, else: remaining
-    request = {:render, template, variables, files, %{options | timeout: timeout}}
+    request = {:render, template, assigns, files, %{options | timeout: timeout}}
     Port.command(port, :erlang.term_to_iovec(request))
 
     await(port, monitor, worker, remaining, options.timeout)
   end
 
   # The deadline passed while waiting for a worker
-  defp send_request(_port, {_template, _variables, _files, options}, _expired, _monitor, _worker) do
+  defp send_request(_port, {_template, _assigns, _files, options}, _expired, _monitor, _worker) do
     {:reply, busy(options.timeout)}
   end
 

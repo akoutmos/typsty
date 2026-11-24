@@ -1,4 +1,4 @@
-//! The environment a document is compiled in: its source, variables, files and fonts.
+//! The environment a document is compiled in: its source, assigns, files and fonts.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -56,57 +56,40 @@ static HIGHEST_FILE_ID: AtomicU16 = AtomicU16::new(0);
 
 static GIVEN_PATHS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// The standard library for documents without variables.
+/// The standard library for documents without assigns.
 static LIBRARY: LazyLock<LazyHash<Library>> = LazyLock::new(|| LazyHash::new(Library::default()));
 
-/// Words that can't be used as variable names.
-const KEYWORDS: &[&str] = &[
-    "none", "auto", "true", "false", "not", "and", "or", "let", "set", "show", "context", "if",
-    "else", "for", "in", "while", "break", "continue", "return", "import", "include", "as",
-];
+/// The line added before the template, which binds its assigns. The assigns are passed in
+/// `sys.inputs`, and bound to the `assigns` variable at the top of the main file. Like a
+/// `let` binding in the template itself, it's only visible in the main file: imported files
+/// and packages don't see it (they can read `sys.inputs`).
+const PREAMBLE: &str = "#let assigns = sys.inputs\n";
 
 /// What a document reads, checked before its render starts (see `Prepared::new`).
 pub struct Prepared {
     library: Option<LazyHash<Library>>,
     main: Source,
-    preamble_lines: usize,
     files: HashMap<FileId, Bytes>,
     root: Option<FsRoot>,
     packages: Vec<FsPackages>,
 }
 
 impl Prepared {
-    /// Checks the variable names and file paths, which is quick: fonts and files are only
-    /// read when the document renders. The error describes invalid arguments.
+    /// Checks the file paths, which is quick: fonts and files are only read when the
+    /// document renders. The error describes invalid arguments.
     pub fn new(
         template: &str,
-        variables: Dict,
+        assigns: Dict,
         files: Vec<(String, Vec<u8>)>,
         root: Option<String>,
         package_paths: Vec<String>,
     ) -> Result<Self, String> {
-        // The variables are passed in sys.inputs, and bound as regular variables at the top of
-        // the main file. Like `let` bindings in the template itself, they're only visible in
-        // the main file: they don't shadow the standard library in imported files and packages
-        let (library, preamble, preamble_lines) = if variables.is_empty() {
-            (None, String::new(), 0)
+        let library = if assigns.is_empty() {
+            None
         } else {
-            let names = variables
-                .iter()
-                .map(|(name, _)| {
-                    if is_variable_name(name) {
-                        Ok(name.as_str())
-                    } else {
-                        Err(format!(
-                            "invalid variables: {name:?} is not a valid Typst variable name"
-                        ))
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let preamble = format!("#let ({},) = sys.inputs\n", names.join(", "));
-            let library = Library::builder().with_inputs(variables).build();
-            (Some(LazyHash::new(library)), preamble, 1)
+            Some(LazyHash::new(
+                Library::builder().with_inputs(assigns).build(),
+            ))
         };
 
         let mut given = HashMap::with_capacity(files.len());
@@ -135,8 +118,7 @@ impl Prepared {
 
         Ok(Self {
             library,
-            main: Source::new(*MAIN_ID, preamble + strip_bom(template)),
-            preamble_lines,
+            main: Source::new(*MAIN_ID, format!("{PREAMBLE}{}", strip_bom(template))),
             files: given,
             root,
             packages: package_paths.into_iter().map(FsPackages::new).collect(),
@@ -148,8 +130,6 @@ pub struct TypstyWorld {
     library: Option<LazyHash<Library>>,
     fonts: Arc<FontStore>,
     main: Source,
-    /// The number of lines added before the template to bind its variables.
-    preamble_lines: usize,
     /// The files given to the render, which take precedence over the root directory.
     files: HashMap<FileId, Bytes>,
     root: Option<FsRoot>,
@@ -172,7 +152,6 @@ impl TypstyWorld {
             library: prepared.library,
             fonts,
             main: prepared.main,
-            preamble_lines: prepared.preamble_lines,
             files: prepared.files,
             root: prepared.root,
             packages: prepared.packages,
@@ -194,8 +173,9 @@ impl TypstyWorld {
         &self.main
     }
 
+    /// The number of lines added before the template (see `PREAMBLE`).
     pub fn preamble_lines(&self) -> usize {
-        self.preamble_lines
+        PREAMBLE.lines().count()
     }
 
     /// The time the document is rendered at, in UTC.
@@ -434,11 +414,6 @@ fn given_file(path: &str) -> Result<FileId, String> {
 /// Typst's parser doesn't skip a byte order mark, which would become part of the first line.
 pub fn strip_bom(text: &str) -> &str {
     text.strip_prefix('\u{feff}').unwrap_or(text)
-}
-
-fn is_variable_name(name: &str) -> bool {
-    // `_` is an identifier, but binding it discards the value
-    name != "_" && typst::syntax::is_ident(name) && !KEYWORDS.contains(&name)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

@@ -87,7 +87,7 @@ defmodule Typsty.Formatter do
     end
   end
 
-  # A sigil on one line, like ~TYPST"*#name*", stays on one line, and is left as it is when
+  # A sigil on one line, like ~TYPST"*#assigns.name*", stays on one line, and is left as it is when
   # formatting would add its closing delimiter, which would have to be escaped
   defp single_line(formatted, source, opening_delimiter) do
     formatted = String.trim_trailing(formatted, "\n")

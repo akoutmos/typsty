@@ -6,7 +6,7 @@
 //! each response on stdout, is a 4-byte big-endian length followed by a term in Erlang's
 //! external term format. Requests are rendered one at a time:
 //!
-//! - request: `{:render, template, variables, files, options}`, with the variables as
+//! - request: `{:render, template, assigns, files, options}`, with the assigns as
 //!   `Typsty.Value` builds them for the NIF, the options the NIF takes, and a `:timeout` in
 //!   milliseconds or `nil`
 //! - response: what the NIF sends: `{:ok, output, warnings}`, `{:error, :typst, diagnostics}`
@@ -238,7 +238,7 @@ fn parse_request(term: Term) -> Result<(RenderJob, Option<Duration>), String> {
     let Term::Tuple(elements) = term else {
         return Err(invalid());
     };
-    let Ok([Term::Atom(tag), template, variables, files, Term::Map(options)]) =
+    let Ok([Term::Atom(tag), template, assigns, files, Term::Map(options)]) =
         <[Term; 5]>::try_from(elements)
     else {
         return Err(invalid());
@@ -295,7 +295,7 @@ fn parse_request(term: Term) -> Result<(RenderJob, Option<Duration>), String> {
 
     let job = RenderJob {
         template: string(&template)?,
-        variables: value::to_dict(&variables)?,
+        assigns: value::to_dict(&assigns)?,
         files,
         format,
         root: optional_string(option("root")?)?,

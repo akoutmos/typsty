@@ -1,1 +1,1 @@
-Receipt for #customer: #read("note.txt")
+Receipt for #assigns.customer: #read("note.txt")

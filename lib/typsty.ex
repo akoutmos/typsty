@@ -1,7 +1,7 @@
 defmodule Typsty do
   @moduledoc """
   Render [Typst](https://typst.app) documents to PDF, PNG and SVG, with Elixir data passed
-  to the template as regular Typst variables.
+  to the template as Typst values, in its `assigns` dictionary.
 
   ## Document modules
 
@@ -15,12 +15,12 @@ defmodule Typsty do
       ~TYPST\"\"\"
       #set page(paper: "us-letter")
 
-      = Invoice #number
+      = Invoice #assigns.number
 
       #table(
         columns: (1fr, auto),
         [*Item*], [*Price*],
-        ..items.map(item => (item.name, [\\$#item.price])).flatten(),
+        ..assigns.items.map(item => (item.name, [\\$#item.price])).flatten(),
       )
       \"\"\"
     end
@@ -47,11 +47,13 @@ defmodule Typsty do
   your file. Run `mix format` with `Typsty.Formatter` to format them with
   [typstyle](https://github.com/typstyle-rs/typstyle).
 
-  ## Variables
+  ## Assigns
 
-  The assigns become regular Typst variables in the template: `number` and `items` above.
-  Typst gets the data itself, not code generated from it, so nothing needs escaping, and the
-  template can loop over lists, read fields and do arithmetic:
+  The template reads the assigns from a dictionary named `assigns`, like a LiveView's
+  `@number` is `assigns.number`: `assigns.number` and `assigns.items` above. That keeps what
+  comes from Elixir apart from what the template defines, and never shadows anything in
+  Typst. Typst gets the data itself, not code generated from it, so nothing needs escaping,
+  and the template can loop over lists, read fields and do arithmetic:
 
   | Elixir                                    | Typst                                  |
   | ----------------------------------------- | -------------------------------------- |
@@ -65,9 +67,13 @@ defmodule Typsty do
   | `Decimal`                                 | `decimal`                              |
   | other structs                             | see `Typsty.Encoder`                   |
 
-  The assigns are a map. Its keys must be valid Typst identifiers (`invoice_number` or
-  `invoice-number`, but not `invoice number`, `for` or `_`). The keys of maps inside the data
-  can be atoms, strings or integers.
+  The assigns are a map with atom or string keys, and the keys of maps inside the data can be
+  atoms, strings or integers. A template reads keys that aren't identifiers with `at`
+  (`assigns.at("invoice number")`), and assigns that may be missing with a default:
+
+  ```typst
+  #let subtitle = assigns.at("subtitle", default: none)
+  ```
 
   A few things to know about the conversion:
 
@@ -79,16 +85,9 @@ defmodule Typsty do
     document should show first).
   - Typst's decimals have 28 significant digits, at most 28 of them after the decimal point.
 
-  Like `let` bindings in the template, the variables are only visible in the template
-  itself, so they never shadow Typst's standard library in imported files or packages. A
-  variable named after a standard library function (such as `title`) shadows it in the
-  template only; the function is still available as `std.title` (unless a variable is named
-  `std`). Other files can read the variables from `sys.inputs`, which is also how a template
-  can make a variable optional:
-
-  ```typst
-  #let subtitle = sys.inputs.at("subtitle", default: none)
-  ```
+  `assigns` is bound at the top of the template, like a `let` binding, so it's only visible
+  in the template itself. Files it imports, and packages, can read the same dictionary from
+  `sys.inputs`.
 
   `render/1` gets the assigns before the template does, so it can compute values for it:
 
@@ -97,7 +96,7 @@ defmodule Typsty do
     assigns = Map.put(assigns, :total, Enum.sum_by(assigns.items, & &1.price))
 
     ~TYPST\"\"\"
-    Total: #total
+    Total: #assigns.total
     \"\"\"
   end
   ```
@@ -189,7 +188,7 @@ defmodule Typsty do
   be rendered, with a `:reason` that tells Typst's errors apart from timeouts and the like
   (see `Typsty.RenderError`). They raise `ArgumentError` for invalid arguments: invalid
   options, assigns that aren't a map, or data that can't be passed to Typst (see
-  [Variables](#module-variables)).
+  [Assigns](#module-assigns)).
 
   ## What a template can do
 
@@ -401,8 +400,8 @@ defmodule Typsty do
   @doc """
   The `~TYPST` sigil for writing Typst templates inline.
 
-  Like `~H`, it requires a variable named `assigns` in scope, which becomes the template's
-  variables, and it returns a `Typsty.Template` struct. The template's syntax is checked when
+  Like `~H`, it requires a variable named `assigns` in scope, which the template reads as
+  its `assigns` dictionary, and it returns a `Typsty.Template` struct. The template's syntax is checked when
   it's compiled.
 
   `mix format` formats the template with `Typsty.Formatter`. Use the `noformat` modifier to
@@ -456,11 +455,11 @@ defmodule Typsty do
   Renders a template as a PDF.
 
   The template is a `Typsty.Template` (from the `~TYPST` sigil or a module's `render/1`), or
-  a string of Typst source. The assigns become the template's variables; for a
-  `Typsty.Template`, they're merged into the assigns it already has.
+  a string of Typst source. The template reads the assigns from its `assigns` dictionary; for
+  a `Typsty.Template`, they're merged into the assigns it already has.
 
   ```elixir
-  {:ok, pdf} = Typsty.to_pdf("= Hello #name", %{name: "World"})
+  {:ok, pdf} = Typsty.to_pdf("= Hello #assigns.name", %{name: "World"})
   ```
 
   See [Options](#module-options) for the options.
@@ -620,7 +619,7 @@ defmodule Typsty do
 
     :telemetry.span([:typsty, :render], metadata, fn ->
       opts = opts |> options!() |> with_defaults()
-      variables = Value.variables(template.assigns)
+      assigns = Value.assigns(template.assigns)
       files = files!(opts[:files])
       pool = pool!(opts[:pool])
 
@@ -635,7 +634,7 @@ defmodule Typsty do
         max_running: max_concurrent_renders!()
       }
 
-      case render_with(pool, template.source, variables, files, native_opts) do
+      case render_with(pool, template.source, assigns, files, native_opts) do
         {:ok, output, warnings} ->
           warnings = Enum.map(warnings, &Diagnostic.locate(&1, template))
           log_warnings(warnings)
@@ -690,17 +689,17 @@ defmodule Typsty do
 
   defp describe_path(path), do: if(File.dir?(path), do: path, else: "#{path} (which doesn't exist)")
 
-  defp render_with(nil, source, variables, files, native_opts) do
+  defp render_with(nil, source, assigns, files, native_opts) do
     reference = make_ref()
 
-    case Native.start_render(reference, source, variables, files, native_opts) do
+    case Native.start_render(reference, source, assigns, files, native_opts) do
       {:ok, job} -> await(reference, job, native_opts.timeout, native_opts.max_running)
       {:error, _reason, _message} = error -> error
     end
   end
 
-  defp render_with(pool, source, variables, files, native_opts) do
-    Typsty.Pool.__render__(pool, source, variables, files, native_opts)
+  defp render_with(pool, source, assigns, files, native_opts) do
+    Typsty.Pool.__render__(pool, source, assigns, files, native_opts)
   end
 
   # The render's thread sends its result. Holding on to the job until then keeps the render

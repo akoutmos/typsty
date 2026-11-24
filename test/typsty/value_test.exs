@@ -54,16 +54,16 @@ defmodule Typsty.ValueTest do
   test "converts basic values" do
     assert_typst(
       ~S"""
-      #assert.eq(none_value, none)
-      #assert.eq(yes, true)
-      #assert.eq(no, false)
-      #assert.eq(type(an_integer), int)
-      #assert.eq(an_integer, -42)
-      #assert.eq(big, 9223372036854775807)
-      #assert.eq(type(a_float), float)
-      #assert.eq(a_float, 1.5)
-      #assert.eq(string, "héllo ✓")
-      #assert.eq(atom, "paid")
+      #assert.eq(assigns.none_value, none)
+      #assert.eq(assigns.yes, true)
+      #assert.eq(assigns.no, false)
+      #assert.eq(type(assigns.an_integer), int)
+      #assert.eq(assigns.an_integer, -42)
+      #assert.eq(assigns.big, 9223372036854775807)
+      #assert.eq(type(assigns.a_float), float)
+      #assert.eq(assigns.a_float, 1.5)
+      #assert.eq(assigns.string, "héllo ✓")
+      #assert.eq(assigns.atom, "paid")
       """,
       %{
         none_value: nil,
@@ -81,13 +81,13 @@ defmodule Typsty.ValueTest do
   test "converts lists, tuples and maps" do
     assert_typst(
       ~S"""
-      #assert.eq(list, (1, "two", (3,)))
-      #assert.eq(empty, ())
-      #assert.eq(tuple, (1, 2))
-      #assert.eq(map.name, "Widget")
-      #assert.eq(map.at("2024"), "integer key")
-      #assert.eq(map.at("string key"), 1)
-      #assert.eq(map.nested.deep, (true,))
+      #assert.eq(assigns.list, (1, "two", (3,)))
+      #assert.eq(assigns.empty, ())
+      #assert.eq(assigns.tuple, (1, 2))
+      #assert.eq(assigns.map.name, "Widget")
+      #assert.eq(assigns.map.at("2024"), "integer key")
+      #assert.eq(assigns.map.at("string key"), 1)
+      #assert.eq(assigns.map.nested.deep, (true,))
       """,
       %{
         list: [1, "two", [3]],
@@ -101,12 +101,12 @@ defmodule Typsty.ValueTest do
   test "converts dates and times" do
     assert_typst(
       ~S"""
-      #assert.eq(date, datetime(year: 2026, month: 11, day: 23))
-      #assert.eq(time, datetime(hour: 9, minute: 30, second: 15))
-      #assert.eq(naive, datetime(year: 2026, month: 11, day: 23, hour: 9, minute: 30, second: 15))
-      #assert.eq(utc, datetime(year: 2026, month: 11, day: 23, hour: 9, minute: 30, second: 15))
-      #assert.eq(new-york, datetime(year: 2026, month: 11, day: 23, hour: 4, minute: 30, second: 15))
-      #assert.eq(date.display("[month repr:long] [day], [year]"), "November 23, 2026")
+      #assert.eq(assigns.date, datetime(year: 2026, month: 11, day: 23))
+      #assert.eq(assigns.time, datetime(hour: 9, minute: 30, second: 15))
+      #assert.eq(assigns.naive, datetime(year: 2026, month: 11, day: 23, hour: 9, minute: 30, second: 15))
+      #assert.eq(assigns.utc, datetime(year: 2026, month: 11, day: 23, hour: 9, minute: 30, second: 15))
+      #assert.eq(assigns.new-york, datetime(year: 2026, month: 11, day: 23, hour: 4, minute: 30, second: 15))
+      #assert.eq(assigns.date.display("[month repr:long] [day], [year]"), "November 23, 2026")
       """,
       %{
         date: ~D[2026-11-23],
@@ -134,12 +134,12 @@ defmodule Typsty.ValueTest do
   test "converts decimals" do
     assert_typst(
       ~S"""
-      #assert.eq(type(price), decimal)
-      #assert.eq(price, decimal("19.99"))
-      #assert.eq(price + tax, decimal("21.59"))
-      #assert.eq(negative, decimal("-0.005"))
-      #assert.eq(large, decimal("1200"))
-      #assert.eq(zero, decimal("0.00"))
+      #assert.eq(type(assigns.price), decimal)
+      #assert.eq(assigns.price, decimal("19.99"))
+      #assert.eq(assigns.price + assigns.tax, decimal("21.59"))
+      #assert.eq(assigns.negative, decimal("-0.005"))
+      #assert.eq(assigns.large, decimal("1200"))
+      #assert.eq(assigns.zero, decimal("0.00"))
       """,
       %{
         price: Decimal.new("19.99"),
@@ -164,8 +164,8 @@ defmodule Typsty.ValueTest do
   test "converts structs with Typsty.Encoder, or as maps" do
     assert_typst(
       ~S"""
-      #assert.eq(point, (x: 1, y: 2))
-      #assert.eq(price, "10 USD")
+      #assert.eq(assigns.point, (x: 1, y: 2))
+      #assert.eq(assigns.price, "10 USD")
       """,
       %{point: %Point{x: 1, y: 2}, price: %Money{amount: 10, currency: "USD"}}
     )
@@ -178,19 +178,19 @@ defmodule Typsty.ValueTest do
   end
 
   test "raises for values that can't be converted, with their path" do
-    assert_raise ArgumentError, ~r/invalid variables: items\[1\].owner is #PID/, fn ->
+    assert_raise ArgumentError, ~r/^assigns.items\[1\].owner is #PID/, fn ->
       Typsty.to_pdf("x", %{items: [%{}, %{owner: self()}]})
     end
 
-    assert_raise ArgumentError, ~r/invalid variables: logo is a binary that isn't valid UTF-8/, fn ->
+    assert_raise ArgumentError, ~r/^assigns.logo is a binary that isn't valid UTF-8/, fn ->
       Typsty.to_pdf("x", %{logo: <<0xFF, 0xFE>>})
     end
 
-    assert_raise ArgumentError, ~r/invalid variables: list is an improper list/, fn ->
+    assert_raise ArgumentError, ~r/^assigns.list is an improper list/, fn ->
       Typsty.to_pdf("x", %{list: [1 | 2]})
     end
 
-    assert_raise ArgumentError, ~r/invalid variables: map has the key 1.5/, fn ->
+    assert_raise ArgumentError, ~r/^assigns.map has the key 1.5/, fn ->
       Typsty.to_pdf("x", %{map: %{1.5 => 1}})
     end
 
@@ -198,7 +198,7 @@ defmodule Typsty.ValueTest do
       Typsty.to_pdf("x", %{map: %{:a => 1, "a" => 2}})
     end
 
-    assert_raise ArgumentError, ~r/the assigns has two keys that are both "name"/, fn ->
+    assert_raise ArgumentError, ~r/^assigns has two keys that are both "name"/, fn ->
       Typsty.to_pdf("x", %{:name => 1, "name" => 2})
     end
 
@@ -210,7 +210,7 @@ defmodule Typsty.ValueTest do
       Typsty.to_pdf("x", %{ping: %Ping{}})
     end
 
-    assert_raise ArgumentError, ~r/invalid variables: nested is a Typsty.Template/, fn ->
+    assert_raise ArgumentError, ~r/^assigns.nested is a Typsty.Template/, fn ->
       Typsty.to_pdf("x", %{nested: Greeting.render(%{name: "x"})})
     end
 
@@ -226,7 +226,7 @@ defmodule Typsty.ValueTest do
     for decimal <- [huge, tiny] do
       {micros, _} =
         :timer.tc(fn ->
-          assert_raise ArgumentError, ~r/invalid variables: amount is a decimal with an exponent of/, fn ->
+          assert_raise ArgumentError, ~r/^assigns.amount is a decimal with an exponent of/, fn ->
             Typsty.to_pdf("x", %{amount: decimal})
           end
         end)

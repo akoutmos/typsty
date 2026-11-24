@@ -50,7 +50,7 @@ defmodule Typsty.Native do
     Typsty.WorkerBuild.build!()
   end
 
-  def start_render(_reference, _template, _variables, _files, _options), do: :erlang.nif_error(:nif_not_loaded)
+  def start_render(_reference, _template, _assigns, _files, _options), do: :erlang.nif_error(:nif_not_loaded)
   def cancel_render(_job), do: :erlang.nif_error(:nif_not_loaded)
   def syntax_errors(_template), do: :erlang.nif_error(:nif_not_loaded)
   def format(_template, _options), do: :erlang.nif_error(:nif_not_loaded)

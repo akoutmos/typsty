@@ -17,10 +17,10 @@ defmodule Typsty.PoolTest do
   end
 
   # Raw results, before Typsty turns them into {:ok, _} and RenderErrors
-  defp native(source, variables, files, options) do
+  defp native(source, assigns, files, options) do
     reference = make_ref()
 
-    case Typsty.Native.start_render(reference, source, variables, files, options) do
+    case Typsty.Native.start_render(reference, source, assigns, files, options) do
       {:ok, _job} ->
         receive do
           {^reference, result} -> result
@@ -31,8 +31,8 @@ defmodule Typsty.PoolTest do
     end
   end
 
-  defp pooled(pool, source, variables, files, options),
-    do: Pool.__render__(GenServer.whereis(pool), source, variables, files, options)
+  defp pooled(pool, source, assigns, files, options),
+    do: Pool.__render__(GenServer.whereis(pool), source, assigns, files, options)
 
   defp options(format, overrides \\ %{}) do
     Map.merge(
@@ -72,17 +72,17 @@ defmodule Typsty.PoolTest do
       large_map = Map.new(1..40, &{"k#{&1}", &1})
 
       cases = [
-        {"#set document(date: none)\n= Hello #name\n#for (k, v) in d [#k=#v ]",
+        {"#set document(date: none)\n= Hello #assigns.name\n#for (k, v) in assigns.d [#k=#v ]",
          %{"name" => "World", "d" => %{"b" => 2, "a" => 1, "c" => [3, 4.5, nil, true]}}, []},
-        {"#set document(date: none)\n#d.keys().join(\",\")", %{"d" => large_map}, []},
-        {"#set document(date: none)\n#set text(font: \"No Such Font\")\n#d.display() #t #dt #x",
-         Typsty.Value.variables(%{
+        {"#set document(date: none)\n#assigns.d.keys().join(\",\")", %{"d" => large_map}, []},
+        {"#set document(date: none)\n#set text(font: \"No Such Font\")\n#assigns.d.display() #assigns.t #assigns.dt #assigns.x",
+         Typsty.Value.assigns(%{
            d: ~D[2026-11-24],
            t: ~T[10:11:12],
            dt: ~N[2026-11-24 10:11:12],
            x: Decimal.new("-12.50")
          }), []},
-        {"#set document(date: none)\n#n #m #a #l.len()",
+        {"#set document(date: none)\n#assigns.n #assigns.m #assigns.a #assigns.l.len()",
          %{
            "n" => 9_223_372_036_854_775_807,
            "m" => -9_223_372_036_854_775_808,
@@ -93,14 +93,15 @@ defmodule Typsty.PoolTest do
          [{"a.typ", "text"}, {"i.png", png}]},
         {"line 1\n#nobody\n#import \"lib.typ\": f\n#f()", %{}, [{"lib.typ", "#let f() = missing"}]},
         {"#for i in range(10001) { context read(str(i)) }", %{}, []},
-        {"x", %{"bad name" => 1}, []},
+        {"#assigns.at(\"bad name\")", %{"bad name" => 1}, []},
+        {"x", %{"bad" => "\xFF"}, []},
         {"x", %{"v" => {:decimal, "1E+40"}}, []},
         {"x", %{}, [{"../x", "x"}]}
       ]
 
-      for {source, variables, files} <- cases, format <- [:pdf, :png, :svg] do
-        assert pooled(pool, source, variables, files, options(format)) ==
-                 native(source, variables, files, options(format)),
+      for {source, assigns, files} <- cases, format <- [:pdf, :png, :svg] do
+        assert pooled(pool, source, assigns, files, options(format)) ==
+                 native(source, assigns, files, options(format)),
                "#{format} render of #{inspect(source)} differs"
       end
     end
@@ -119,9 +120,13 @@ defmodule Typsty.PoolTest do
       assert {:ok, [_png]} = Invoice.to_png(%{number: 7, items: items}, pool: pool)
     end
 
-    test "invalid variables raise, as they do without a pool", %{pool: pool} do
-      assert_raise ArgumentError, ~r/"bad name" is not a valid Typst variable name/, fn ->
-        Typsty.to_pdf("x", %{"bad name" => 1}, pool: pool)
+    test "invalid assigns raise, as they do without a pool", %{pool: pool} do
+      assert_raise ArgumentError, ~r/^assigns.v is a binary that isn't valid UTF-8/, fn ->
+        Typsty.to_pdf("x", %{v: <<0xFF>>}, pool: pool)
+      end
+
+      assert_raise ArgumentError, ~r/doesn't fit in a Typst decimal/, fn ->
+        Typsty.to_pdf("x", %{v: Decimal.new("1E+35")}, pool: pool)
       end
     end
 
@@ -136,7 +141,7 @@ defmodule Typsty.PoolTest do
     test "concurrent renders sharing names don't affect each other", %{pool: pool} do
       render = fn id, pool ->
         files = %{"lib.typ" => ~s(#let tag = "lib-#{id}"), "data.json" => JSON.encode!(%{id: id})}
-        source = ~s|#import "lib.typ": tag\n#assert.eq(json("data.json").id, id)\n= #tag #name|
+        source = ~s|#import "lib.typ": tag\n#assert.eq(json("data.json").id, assigns.id)\n= #tag #assigns.name|
         Typsty.to_svg(source, %{id: id, name: "Name #{id}"}, files: files, pool: pool)
       end
 

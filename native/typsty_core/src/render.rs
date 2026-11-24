@@ -40,7 +40,7 @@ pub type Rendered = (Output, Vec<Diagnostic>);
 /// A render's arguments, as the NIF and the worker receive them.
 pub struct RenderJob {
     pub template: String,
-    pub variables: Dict,
+    pub assigns: Dict,
     pub files: Vec<(String, Vec<u8>)>,
     pub format: Format,
     pub root: Option<String>,
@@ -65,7 +65,7 @@ impl RenderJob {
 
         let world = Prepared::new(
             &self.template,
-            self.variables,
+            self.assigns,
             self.files,
             self.root,
             self.package_paths,

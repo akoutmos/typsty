@@ -3,7 +3,7 @@ defmodule Typsty.RenderError do
   Rendering a document failed.
 
   - `:reason` - why it failed:
-    - `:typst` - Typst reported errors: the template uses a variable that wasn't given, a
+    - `:typst` - Typst reported errors: the template uses an assign that wasn't given, a
       value has the wrong type, a file, font or package is missing, and so on. For a
       template rendered from a string, this includes syntax errors (templates in document
       modules are checked when they compile).

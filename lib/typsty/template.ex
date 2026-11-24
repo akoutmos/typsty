@@ -1,12 +1,13 @@
 defmodule Typsty.Template do
   @moduledoc """
-  A Typst template with the variables to render it with.
+  A Typst template with the assigns to render it with.
 
   The `~TYPST` sigil and the `render/1` of a document module return this struct. Pass it to
   `Typsty.to_pdf/3`, `Typsty.to_png/3` or `Typsty.to_svg/3` to render it.
 
   - `:source` - the Typst source.
-  - `:assigns` - the variables to render it with.
+  - `:assigns` - the assigns to render it with, which the template reads from its `assigns`
+    dictionary.
   - `:file` - the file it's in, which errors point at, or `nil` for a template built from a
     string (its errors point at lines of the string).
 

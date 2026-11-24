@@ -1,13 +1,13 @@
 #set page(width: 10cm, height: auto)
 
-= Invoice #number
+= Invoice #assigns.number
 
 #table(
   columns: (1fr, auto),
   [*Item*], [*Price*],
-  ..items.map(item => (item.name, [#item.price])).flatten(),
+  ..assigns.items.map(item => (item.name, [#item.price])).flatten(),
 )
 
-#let total = items.map(item => item.price).sum()
+#let total = assigns.items.map(item => item.price).sum()
 #assert.eq(type(total), decimal)
 Total: #total

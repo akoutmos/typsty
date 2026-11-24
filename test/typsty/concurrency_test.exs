@@ -15,19 +15,19 @@ defmodule Typsty.ConcurrencyTest do
       #import "lib.typ": tag
 
       #let data = json("data.json")
-      #assert.eq(data.id, id)
-      #assert.eq(tag, "lib-" + str(id))
+      #assert.eq(data.id, assigns.id)
+      #assert.eq(tag, "lib-" + str(assigns.id))
 
       #image("logo.png", width: 2cm)
 
-      = Invoice #id for #customer.name
+      = Invoice #assigns.id for #assigns.customer.name
 
       #table(
         columns: (1fr, auto),
-        ..items.map(item => (item.name, [#item.price])).flatten(),
+        ..assigns.items.map(item => (item.name, [#item.price])).flatten(),
       )
 
-      Total: #items.map(item => item.price).sum()
+      Total: #assigns.items.map(item => item.price).sum()
       Notes: #data.notes.join(", ")
       """
     end
@@ -95,7 +95,7 @@ defmodule Typsty.ConcurrencyTest do
         # The same file name with different contents, some of them broken
         broken? = rem(id, 3) == 0
         lib = if broken?, do: "#let tag = missing-#{id}", else: ~s(#let tag = "ok-#{id}")
-        source = ~s(#import "lib.typ": tag\n#tag #value-#{rem(id, 2)})
+        source = ~s(#import "lib.typ": tag\n#tag #assigns.value-#{rem(id, 2)})
         {id, broken?, source, lib}
       end
 

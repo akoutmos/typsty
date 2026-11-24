@@ -16,9 +16,9 @@ defmodule Typsty.RobustnessTest do
   describe "deeply nested data" do
     test "is refused before it reaches Typst" do
       error = assert_raise ArgumentError, fn -> Typsty.to_pdf("#v", %{v: nest_list(10_000, 1)}) end
-      assert error.message =~ "v[0][0][0][0][0]…[0][0][0][0] is nested too deeply"
+      assert error.message =~ "assigns.v[0][0][0][0][0]…[0][0][0][0] is nested too deeply"
 
-      assert {:ok, _pdf} = Typsty.to_pdf("#v.len()", %{v: nest_list(200, 1)})
+      assert {:ok, _pdf} = Typsty.to_pdf("#assigns.v.len()", %{v: nest_list(200, 1)})
     end
   end
 

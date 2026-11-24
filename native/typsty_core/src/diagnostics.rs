@@ -134,7 +134,7 @@ fn range(span: DiagSpan, source: &Source) -> Option<std::ops::Range<usize>> {
 }
 
 /// The file, line and column (both 1-based) of a span. Lines in the template don't count
-/// the preamble that binds the variables.
+/// the preamble that binds the assigns.
 fn locate(span: DiagSpan, world: &TypstyWorld) -> (Option<String>, Option<usize>, Option<usize>) {
     let Some(id) = span.id() else {
         return (None, None, None);

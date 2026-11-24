@@ -147,7 +147,7 @@ fn start_render<'a>(
     env: Env<'a>,
     reference: Term<'a>,
     template: String,
-    variables: Term<'a>,
+    assigns: Term<'a>,
     files: Vec<(String, Binary<'a>)>,
     options: RenderOptions,
 ) -> Term<'a> {
@@ -164,14 +164,14 @@ fn start_render<'a>(
         None => return invalid("unknown format".into()),
     };
 
-    let variables = match value::to_dict(variables) {
-        Ok(variables) => variables,
+    let assigns = match value::to_dict(assigns) {
+        Ok(assigns) => assigns,
         Err(message) => return invalid(message),
     };
 
     let job = RenderJob {
         template,
-        variables,
+        assigns,
         files: files
             .into_iter()
             .map(|(path, bytes)| (path, bytes.as_slice().to_vec()))

@@ -125,7 +125,7 @@ defmodule Typsty.PackagesTest do
 
     source = ~S"""
     #import "@preview/greet:1.0.0": greet
-    #assert.eq(greet(name), "HELLO WORLD")
+    #assert.eq(greet(assigns.name), "HELLO WORLD")
     """
 
     assert {:ok, _pdf} = Typsty.to_pdf(source, %{name: "World"}, package_paths: [dir])

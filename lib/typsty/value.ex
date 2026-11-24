@@ -1,7 +1,8 @@
 defmodule Typsty.Value do
   @moduledoc false
 
-  # Converts Elixir data into the terms the NIF turns into Typst values:
+  # Converts the assigns into the terms the NIF turns into Typst values, which templates read
+  # from the `assigns` dictionary:
   #
   # - nil, true and false
   # - integers, floats and UTF-8 strings
@@ -25,11 +26,14 @@ defmodule Typsty.Value do
   # implementations that encode as each other can't loop forever
   @max_encodings 32
 
-  @doc false
-  @spec variables(map()) :: %{String.t() => term()}
-  def variables(assigns) when is_map(assigns) and not is_struct(assigns), do: encode(assigns, [], 0)
+  # Keys that templates can read as fields (assigns.name), rather than with assigns.at("...")
+  @field ~r/^[a-zA-Z_][a-zA-Z0-9_-]*$/
 
-  def variables(assigns) do
+  @doc false
+  @spec assigns(map()) :: %{String.t() => term()}
+  def assigns(assigns) when is_map(assigns) and not is_struct(assigns), do: encode(assigns, [], 0)
+
+  def assigns(assigns) do
     raise ArgumentError, "the assigns must be a map, got: #{inspect(assigns)}"
   end
 
@@ -183,30 +187,20 @@ defmodule Typsty.Value do
   end
 
   defp invalid!(path, problem) do
-    raise ArgumentError, "invalid variables: #{describe(path)} #{problem}"
+    raise ArgumentError, "#{describe(path)} #{problem}"
   end
 
-  defp describe([]), do: "the assigns"
-
-  # Deeply nested paths are shortened to their start and end
+  # Where the value is, as a template reads it, such as assigns.items[1].name. The path is
+  # innermost first. Deeply nested paths are shortened to their start and end.
   defp describe(path) when length(path) > 12 do
-    {last, rest} = Enum.split(path, 4)
-    describe(Enum.take(rest, -6)) <> "…" <> (last |> Enum.reverse() |> join_path(true))
+    {innermost, rest} = Enum.split(path, 4)
+    describe(Enum.take(rest, -6)) <> "…" <> segments(innermost)
   end
 
-  defp describe(path), do: path |> Enum.reverse() |> join_path(false)
+  defp describe(path), do: "assigns" <> segments(path)
 
-  defp join_path(segments, continued?) do
-    initial = if continued?, do: :continued, else: ""
+  defp segments(path), do: path |> Enum.reverse() |> Enum.map_join(&segment/1)
 
-    segments
-    |> Enum.reduce(initial, fn
-      index, :continued when is_integer(index) -> "[#{index}]"
-      key, :continued -> "." <> key
-      index, "" when is_integer(index) -> "[#{index}]"
-      index, acc when is_integer(index) -> acc <> "[#{index}]"
-      key, "" -> key
-      key, acc -> acc <> "." <> key
-    end)
-  end
+  defp segment(index) when is_integer(index), do: "[#{index}]"
+  defp segment(key), do: if(key =~ @field, do: "." <> key, else: ".at(#{inspect(key)})")
 end

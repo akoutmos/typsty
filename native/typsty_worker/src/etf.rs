@@ -7,7 +7,7 @@
 use std::fmt;
 use std::io::{self, Write};
 
-/// How deeply terms may be nested. Variables are nested at most 256 levels deep, and the
+/// How deeply terms may be nested. Assigns are nested at most 256 levels deep, and the
 /// request wraps them in a few more.
 const MAX_DEPTH: usize = 300;
 

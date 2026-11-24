@@ -14,9 +14,10 @@ The first release.
 - Document modules with `use Typsty`: `render/1` with the `~TYPST` sigil, or a colocated `.typ` template (or one
   given with the `:template` option), and generated `to_pdf/2`, `to_png/2` and `to_svg/2`, with bang variants.
 - `Typsty.to_pdf/3`, `Typsty.to_png/3` and `Typsty.to_svg/3` for templates and Typst source.
-- Assigns (a map) become regular Typst variables in the template, passed as Typst values rather than generated code:
-  strings, numbers, booleans, `nil`, lists, tuples, maps (as dictionaries sorted by key), dates and times, and
-  decimals. Structs are passed as dictionaries, or as `Typsty.Encoder` encodes them.
+- The assigns (a map) are passed to the template as a dictionary named `assigns` (`#assigns.name`), as Typst values
+  rather than generated code, so they never shadow anything in Typst: strings, numbers, booleans, `nil`, lists,
+  tuples, maps (as dictionaries sorted by key), dates and times, and decimals. Structs are passed as dictionaries, or
+  as `Typsty.Encoder` encodes them.
 - A virtual file system: images, data files and `.typ` files are passed as binaries with the `:files` option. Files
   can also be read from a `:root` directory, which documents can't read outside of, even through symbolic links.
 - Fonts from the system, from Typst's embedded fonts and from `:font_paths`, scanned once per font configuration and
@@ -49,7 +50,7 @@ The first release.
     Typst. A render is cancelled too when the process waiting for it exits. At most `:max_concurrent_renders` renders
     run at once, counting cancelled renders still winding down, and `Typsty.running_renders/0` reports how many are
     running.
-  - Variables are nested at most 256 levels deep.
+  - Assigns are nested at most 256 levels deep.
   - Files are checked before Typst decodes them: images claiming more than 134 megapixels, SVG and XML files nested
     more than 1,024 levels deep, compressed SVGs expanding past 128 MiB and XML entities that nest or expand past
     16 MiB are refused, as are PDF files (which renders in a `Typsty.Pool` can read). Only regular files are read from

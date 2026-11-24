@@ -13,47 +13,48 @@ defmodule TypstyTest do
       assert {:ok, "%PDF-" <> _} = Typsty.to_pdf("= Hello")
     end
 
-    test "binds the assigns as variables" do
-      assert {:ok, _pdf} = Typsty.to_pdf(~s|#assert.eq(name, "World")|, %{name: "World"})
-      assert {:ok, _pdf} = Typsty.to_pdf(~s|#assert.eq(name, "World")|, %{"name" => "World"})
+    test "passes the assigns in the assigns dictionary" do
+      assert {:ok, _pdf} = Typsty.to_pdf(~s|#assert.eq(assigns.name, "World")|, %{name: "World"})
+      assert {:ok, _pdf} = Typsty.to_pdf(~s|#assert.eq(assigns.name, "World")|, %{"name" => "World"})
+      assert {:ok, _pdf} = Typsty.to_pdf(~s|#assert.eq(assigns, (:))|)
     end
 
-    test "binds kebab-case variable names" do
-      assert {:ok, _pdf} = Typsty.to_pdf("#assert.eq(invoice-number, 7)", %{"invoice-number" => 7})
-    end
-
-    test "makes the variables available in sys.inputs" do
+    test "takes any key, including ones that aren't Typst identifiers" do
       source = ~S"""
-      #assert.eq(sys.inputs.name, "World")
-      #assert.eq(sys.inputs.at("missing", default: none), none)
+      #assert.eq(assigns.invoice-number, 7)
+      #assert.eq(assigns.at("invoice number"), 8)
+      #assert.eq(assigns.for, 9)
+      #assert.eq(assigns.at("_"), 10)
+      #assert.eq(assigns.at("missing", default: none), none)
       """
 
-      assert {:ok, _pdf} = Typsty.to_pdf(source, %{name: "World"})
+      assigns = %{"invoice-number" => 7, "invoice number" => 8, for: 9, _: 10}
+      assert {:ok, _pdf} = Typsty.to_pdf(source, assigns)
     end
 
-    test "shadows standard library names in the template only" do
+    test "doesn't shadow anything in Typst" do
       source = ~S"""
-      #assert.eq(title, "My title")
-      #std.title[Still a function]
+      #assert.eq(type(title), function)
+      #assert.eq(assigns.title, "My title")
+      #title[#assigns.title]
       #import "helper.typ": shout
       #assert.eq(shout("x"), "X")
       """
 
-      # The imported file still sees the standard library's title and upper
+      # Imported files don't see the assigns variable, but can read sys.inputs
       helper = ~S"""
-      #let shout(text) = { assert.eq(type(title), function); upper(text) }
+      #let shout(text) = { assert.eq(sys.inputs.title, "My title"); upper(text) }
       """
 
-      assert {:ok, _pdf} =
-               Typsty.to_pdf(source, %{title: "My title", upper: "shadowed"}, files: %{"helper.typ" => helper})
+      assert {:ok, _pdf} = Typsty.to_pdf(source, %{title: "My title", upper: "x"}, files: %{"helper.typ" => helper})
     end
 
-    test "points errors at lines of the template, not counting the variables" do
+    test "points errors at lines of the template, not counting the line that binds the assigns" do
       assert {:error, %RenderError{diagnostics: [diagnostic]}} =
-               Typsty.to_pdf("first line\nsecond #nmae", %{name: "World"})
+               Typsty.to_pdf("first line\nsecond #assigns.nmae", %{name: "World"})
 
-      assert %Diagnostic{severity: :error, message: "unknown variable: nmae", file: nil, line: 2, column: 9} =
-               diagnostic
+      assert %Diagnostic{severity: :error, file: nil, line: 2, column: 17} = diagnostic
+      assert diagnostic.message =~ ~s(dictionary does not contain key "nmae")
     end
 
     test "returns errors with hints" do
@@ -65,7 +66,7 @@ defmodule TypstyTest do
     end
 
     test "merges the assigns into a template's assigns" do
-      template = %Template{source: "#assert.eq((a, b), (1, 3))", assigns: %{a: 1, b: 2}}
+      template = %Template{source: "#assert.eq((assigns.a, assigns.b), (1, 3))", assigns: %{a: 1, b: 2}}
       assert {:ok, _pdf} = Typsty.to_pdf(template, %{b: 3})
     end
 
@@ -83,21 +84,6 @@ defmodule TypstyTest do
 
       assert_raise ArgumentError, ~r/invalid :pdf_standards option/, fn ->
         Typsty.to_pdf("Hello", %{}, pdf_standards: ["a-2b", "a-3b"])
-      end
-    end
-
-    test "raises for invalid variable names" do
-      assert_raise ArgumentError, ~r/"invoice number" is not a valid Typst variable name/, fn ->
-        Typsty.to_pdf("x", %{"invoice number" => 1})
-      end
-
-      assert_raise ArgumentError, ~r/"for" is not a valid Typst variable name/, fn ->
-        Typsty.to_pdf("x", %{for: 1})
-      end
-
-      # Binding `_` would discard the value
-      assert_raise ArgumentError, ~r/"_" is not a valid Typst variable name/, fn ->
-        Typsty.to_pdf("x", %{_: 1})
       end
     end
 
@@ -276,7 +262,7 @@ defmodule TypstyTest do
 
       source = ~S"""
       #import "@local/greet:0.1.0": greet
-      #assert.eq(greet(name), "Hello World")
+      #assert.eq(greet(assigns.name), "Hello World")
       """
 
       assert {:ok, _pdf} = Typsty.to_pdf(source, %{name: "World"}, package_paths: [packages])
@@ -347,7 +333,7 @@ defmodule TypstyTest do
       Application.put_env(:typsty, :log_warnings, true)
       on_exit(fn -> Application.put_env(:typsty, :log_warnings, false) end)
 
-      source = "#set text(font: family)\nHello"
+      source = "#set text(font: assigns.family)\nHello"
       opts = [system_fonts: false, embedded_fonts: false, font_paths: [fonts]]
       assert capture_log(fn -> assert {:ok, _pdf} = Typsty.to_pdf(source, %{family: family}, opts) end) == ""
     end

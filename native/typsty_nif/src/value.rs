@@ -13,11 +13,11 @@ mod atoms {
 
 type Result<T> = std::result::Result<T, String>;
 
-/// Converts the variables map into a dictionary of Typst values.
+/// Converts the assigns map into a dictionary of Typst values.
 pub fn to_dict(term: Term) -> Result<Dict> {
     match to_value(term, 0)? {
         Value::Dict(dict) => Ok(dict),
-        _ => Err(invalid("the variables must be a map")),
+        _ => Err(invalid("the assigns must be a map")),
     }
 }
 

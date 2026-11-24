@@ -52,7 +52,7 @@ Hello|)
   end
 
   test "emits an exception event when rendering raises" do
-    assert_raise ArgumentError, fn -> Typsty.to_png("x", %{"bad name" => 1}) end
+    assert_raise ArgumentError, fn -> Typsty.to_png("x", %{logo: <<0xFF>>}) end
     assert_received {[:typsty, :render, :exception], _measurements, %{format: :png, kind: :error}}
   end
 end

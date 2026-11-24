@@ -28,7 +28,7 @@ pub fn dict(mut entries: Vec<(Str, Value)>) -> Dict {
 }
 
 pub fn invalid(message: &str) -> String {
-    format!("invalid variables: {message}")
+    format!("invalid assigns: {message}")
 }
 
 /// The error for data nested deeper than `MAX_DEPTH`.
