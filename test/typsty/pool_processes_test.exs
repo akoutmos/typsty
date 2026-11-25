@@ -30,9 +30,16 @@ defmodule Typsty.PoolProcessesTest do
     |> Enum.sort()
   end
 
-  # Waits until the pool has no idle workers. NimblePool keeps them in a queue.
+  # Waits until a worker is checked out: NimblePool keeps its checked out workers with the
+  # requests it served
   defp wait_until_busy(pool) do
-    assert eventually(fn -> :queue.len(:sys.get_state(pool).resources) == 0 end)
+    assert eventually(fn ->
+             pool
+             |> :sys.get_state()
+             |> Map.fetch!(:requests)
+             |> Map.values()
+             |> Enum.any?(&match?({_, _, :state, _}, &1))
+           end)
   end
 
   defp eventually(fun, tries \\ 200) do

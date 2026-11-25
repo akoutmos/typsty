@@ -97,6 +97,9 @@ pub fn stop(message: String) -> ! {
 
 /// Runs the work, turning panics and unwinding into an `Interrupted`.
 fn catch<T>(work: impl FnOnce() -> T) -> Result<T, Interrupted> {
+    // A location left by an earlier panic on this thread doesn't belong to this one
+    PANIC_LOCATION.with(|cell| cell.borrow_mut().take());
+
     catch_unwind(AssertUnwindSafe(work)).map_err(|payload| {
         if payload.is::<Cancelled>() {
             return Interrupted::Cancelled;
@@ -203,9 +206,10 @@ pub fn running_renders() -> usize {
 }
 
 /// Starts a render on a thread of its own, once fewer than `limit` renders are running, and
-/// returns right away. `deliver` is called on the render's thread with the result, unless the
-/// render was abandoned first. It's called while the render's phase is locked, so once
-/// `Ticket::abandon` returns `Phase::Finished`, `deliver` has returned.
+/// returns right away. `deliver` is called with the result, unless the render was abandoned
+/// first, on a thread that isn't the caller's (normally the render's own). It's called while
+/// the render's phase is locked, so once `Ticket::abandon` returns `Phase::Finished`,
+/// `deliver` has returned.
 ///
 /// Fails if the render could start right away, but its thread couldn't be started.
 pub fn start<T, W, D>(limit: usize, work: W, deliver: D) -> Result<Ticket, String>
@@ -248,18 +252,30 @@ where
         }
     };
 
-    if let Some(job) = ready {
-        // This runs on the caller's thread (a scheduler, for the NIF), where the result can't
-        // be handed over: the error is returned instead
-        if let Err((_job, error)) = launch(job) {
+    match ready.map(launch) {
+        Some(Launched::Started) => {}
+        Some(Launched::Skipped) => {
             lock(&QUEUE).running -= 1;
-            return Err(format!("couldn't start a thread to render on: {error}"));
+            launch_waiting(false);
         }
+        // This runs on the caller's thread (a scheduler, for the NIF), where a result can't
+        // be handed over: the error is returned instead. Renders queued in the meantime are
+        // started
+        Some(Launched::Failed(_job, error)) => {
+            lock(&QUEUE).running -= 1;
+            launch_waiting(false);
+            return Err(Interrupted::NoThread(error).message());
+        }
+        // Queued. Slots may be free with renders still waiting, after a thread couldn't be
+        // started, so they're started now if they can be
+        None => launch_waiting(false),
     }
 
     Ok(Ticket(shared))
 }
 
+/// Hands the result over, unless the render was abandoned. A `deliver` that panics leaves
+/// the render abandoned rather than finished, since its result wasn't handed over.
 fn hand_over<T>(
     shared: &Shared,
     result: Result<T, Interrupted>,
@@ -267,20 +283,30 @@ fn hand_over<T>(
 ) {
     let mut phase = lock(&shared.phase);
     if *phase != Phase::Abandoned {
-        *phase = Phase::Finished;
-        deliver(result);
+        let delivered = catch_unwind(AssertUnwindSafe(|| deliver(result))).is_ok();
+        *phase = if delivered {
+            Phase::Finished
+        } else {
+            Phase::Abandoned
+        };
     }
 }
 
-/// Runs a job that has taken one of the running slots, on a new thread. Gives the job back
-/// if the thread can't be started.
-fn launch(job: Job) -> Result<(), (Job, String)> {
+enum Launched {
+    Started,
+    /// The job was abandoned while it waited: its slot must be given back.
+    Skipped,
+    /// The thread couldn't be started, with the error.
+    Failed(Job, String),
+}
+
+/// Runs a job that has taken one of the running slots, on a new thread, which gives the slot
+/// back when it ends.
+fn launch(job: Job) -> Launched {
     {
         let mut phase = lock(&job.shared.phase);
         if *phase == Phase::Abandoned {
-            drop(phase);
-            release_slot();
-            return Ok(());
+            return Launched::Skipped;
         }
         *phase = Phase::Running;
     }
@@ -293,36 +319,56 @@ fn launch(job: Job) -> Result<(), (Job, String)> {
         .name("typsty".into())
         .stack_size(STACK_SIZE)
         .spawn(move || {
+            // Gives the slot back however the render ends
+            let _slot = SlotGuard;
             let job = lock(&for_thread).take();
             if let Some(job) = job {
                 (job.run)(None);
             }
-            release_slot();
         });
 
     match spawned {
-        Ok(_handle) => Ok(()),
+        Ok(_handle) => Launched::Started,
         Err(error) => match lock(&slot).take() {
-            Some(job) => Err((job, error.to_string())),
-            None => Ok(()),
+            Some(job) => Launched::Failed(job, error.to_string()),
+            None => Launched::Started,
         },
     }
 }
 
-/// Gives back a running slot, and starts the next render that may run. Runs on a render's
-/// thread, as it ends.
-fn release_slot() {
-    let next = {
-        let mut queue = lock(&QUEUE);
-        queue.running -= 1;
-        next_job(&mut queue)
-    };
+struct SlotGuard;
 
-    if let Some(job) = next {
-        if let Err((job, error)) = launch(job) {
-            // Handed over from this thread, which isn't a scheduler
-            (job.run)(Some(error));
-            release_slot();
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        lock(&QUEUE).running -= 1;
+        launch_waiting(true);
+    }
+}
+
+/// Starts the queued renders that may run now. `deliver_failures` says whether this thread
+/// may hand over the failure of a render whose thread can't be started; on a scheduler
+/// thread it can't, so the render goes back to the front of the queue, to be retried when
+/// another render starts or ends.
+fn launch_waiting(deliver_failures: bool) {
+    loop {
+        let Some(job) = next_job(&mut lock(&QUEUE)) else {
+            return;
+        };
+
+        match launch(job) {
+            Launched::Started => {}
+            Launched::Skipped => lock(&QUEUE).running -= 1,
+            Launched::Failed(job, error) if deliver_failures => {
+                lock(&QUEUE).running -= 1;
+                (job.run)(Some(error));
+            }
+            Launched::Failed(job, _error) => {
+                *lock(&job.shared.phase) = Phase::Queued;
+                let mut queue = lock(&QUEUE);
+                queue.running -= 1;
+                queue.waiting.push_front(job);
+                return;
+            }
         }
     }
 }

@@ -15,7 +15,7 @@ use rustler::{
     ResourceArc, Term,
 };
 use typsty_core::isolate::{self, Interrupted, Phase, Ticket};
-use typsty_core::{render, FontSettings, Format, Output, RenderJob, Rendered};
+use typsty_core::{render, FontSettings, Format, Output, PrepareError, RenderJob, Rendered};
 
 mod atoms {
     rustler::atoms! {
@@ -132,8 +132,10 @@ impl Drop for Job {
     }
 }
 
-/// Starts compiling and exporting a template, and returns `{:ok, job}` right away, or
-/// `{:error, :invalid, message}` when the arguments are invalid.
+/// Starts compiling and exporting a template, and returns `{:ok, job}` right away. Returns
+/// `{:error, :invalid, message}` when the arguments are invalid, `{:error, :typst,
+/// diagnostics}` when they go over one of Typsty's limits, and `{:error, :crashed, message}`
+/// when the render's thread can't be started.
 ///
 /// The result is sent to the calling process as `{reference, result}`, where the result is
 /// `{:ok, output, warnings}` (the output is a binary for PDF, and a list of binaries, one per
@@ -186,7 +188,11 @@ fn start_render<'a>(
 
     let job = match job.prepare() {
         Ok(job) => job,
-        Err(message) => return invalid(message),
+        Err(PrepareError::Invalid(message)) => return invalid(message),
+        Err(PrepareError::Refused(message)) => {
+            let errors = diagnostics(vec![typsty_core::Diagnostic::error(message)]);
+            return (atoms::error(), atoms::typst(), errors).encode(env);
+        }
     };
 
     // The result is encoded on the render's thread, before it's handed over, so that
@@ -335,6 +341,12 @@ fn format<'a>(env: Env<'a>, template: String, options: FormatOptions) -> Term<'a
     }
 }
 
+/// The packages a Typst file imports or includes, such as `"@preview/oxifmt:1.0.0"`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn package_imports(text: String) -> Vec<String> {
+    render::package_imports(text)
+}
+
 /// Scans for fonts (caching them for later renders) and returns the font families found.
 #[rustler::nif(schedule = "DirtyIo")]
 fn font_families(options: FontOptions) -> Vec<String> {
@@ -355,8 +367,8 @@ fn typst_version() -> String {
 }
 
 fn load(_env: Env, _info: Term) -> bool {
-    // PDF files are refused inside the VM (see `typsty_core::checks`)
-    typsty_core::init(typsty_core::Config { pdf_files: false });
+    // Inside the BEAM, files that are unsafe to decode are refused (see `typsty_core::checks`)
+    typsty_core::init(typsty_core::Config { isolated: false });
     true
 }
 

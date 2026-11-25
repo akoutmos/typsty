@@ -27,6 +27,7 @@ defmodule Typsty.WorkerBuild do
     [
       "Cargo.toml",
       "Cargo.lock",
+      ".cargo/config.toml",
       "typsty_worker/Cargo.toml",
       "typsty_worker/src/**/*.rs",
       "typsty_core/Cargo.toml",
@@ -49,11 +50,17 @@ defmodule Typsty.WorkerBuild do
 
         # Copied next to it and renamed into place, rather than copied over it: a running
         # worker's program can't be overwritten on Linux ("text file busy"), but it can be
-        # replaced
-        temporary = destination <> ".tmp"
-        File.cp!(executable!(output), temporary)
-        File.chmod!(temporary, 0o755)
-        File.rename!(temporary, destination)
+        # replaced. The copy's name is unique, for builds that run at the same time
+        temporary = "#{destination}.#{System.unique_integer([:positive])}-#{System.pid()}.tmp"
+
+        try do
+          File.cp!(executable!(output), temporary)
+          File.chmod!(temporary, 0o755)
+          File.rename!(temporary, destination)
+        after
+          File.rm(temporary)
+        end
+
         Mix.Project.build_structure()
 
       {_output, status} ->

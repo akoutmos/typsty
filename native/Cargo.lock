@@ -2683,9 +2683,13 @@ name = "typsty_core"
 version = "0.1.0"
 dependencies = [
  "comemo",
+ "data-url",
  "flate2",
  "imagesize",
+ "libc",
+ "memchr",
  "rayon",
+ "roxmltree 0.21.2",
  "time",
  "typst",
  "typst-kit",

@@ -16,20 +16,22 @@ pub use diagnostics::{Diagnostic, Severity, TracePoint};
 pub use export::Output;
 pub use fonts::FontSettings;
 pub use render::{Format, PreparedJob, RenderJob, Rendered};
+pub use world::PrepareError;
 
 /// What's safe to do where the code runs.
 pub struct Config {
-    /// Whether documents may read PDF files, which is only safe in a process of its own (see
-    /// `checks::allow_pdf_files`).
-    pub pdf_files: bool,
+    /// Whether the process is one of its own, which a crash only ends (Typsty.Pool's
+    /// worker), rather than the BEAM. Documents may then read files that are unsafe to
+    /// decode inside the BEAM (see `checks::isolate`).
+    pub isolated: bool,
 }
 
 /// Sets up what the rest of this crate relies on: Typst's thread pool with large stacks, and
 /// a panic hook that keeps panics in Typst's threads (which become errors) off stderr. Call
 /// it once, before rendering.
 pub fn init(config: Config) {
-    if config.pdf_files {
-        checks::allow_pdf_files();
+    if config.isolated {
+        checks::isolate();
     }
 
     isolate::init_panic_hook();

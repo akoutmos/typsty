@@ -203,13 +203,13 @@ fn locate(span: DiagSpan, world: &TypstyWorld) -> (Option<String>, Option<usize>
     };
 
     let position = world.range(span).and_then(|range| {
-        let source = if main {
-            world.main_source().clone()
+        let lines = if main {
+            world.main_source().lines().clone()
         } else {
-            typst::World::source(world, id).ok()?
+            world.lines(id)?
         };
 
-        source.lines().byte_to_line_column(range.start)
+        lines.byte_to_line_column(range.start)
     });
 
     match position {

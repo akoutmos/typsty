@@ -131,6 +131,27 @@ defmodule Typsty.DocumentTest do
       end
     end
 
+    test "requires render/1 to be public, and not combined with a :template", %{tmp_dir: dir} do
+      assert_raise CompileError, ~r/defines render\/1 as private: it must be public/, fn ->
+        compile!(dir, "private.ex", """
+        defmodule Typsty.Test.Private do
+          use Typsty
+          defp render(assigns), do: ~TYPST"Hello"
+          def preview, do: render(%{})
+        end
+        """)
+      end
+
+      assert_raise CompileError, ~r/defines render\/1 and has a template/, fn ->
+        compile!(dir, "explicit.ex", """
+        defmodule Typsty.Test.Explicit do
+          use Typsty, template: "missing.typ"
+          def render(assigns), do: ~TYPST"Hello"
+        end
+        """)
+      end
+    end
+
     test "the sigil requires assigns", %{tmp_dir: dir} do
       assert_raise CompileError, ~r/~TYPST requires a variable named "assigns"/, fn ->
         compile!(dir, "no_assigns.ex", """

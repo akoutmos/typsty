@@ -18,9 +18,18 @@ defmodule Typsty.Value do
   @max_int 9_223_372_036_854_775_807
   @min_int -9_223_372_036_854_775_808
 
-  # Typst's decimals have about 28 significant digits; the exponents of decimals that could
-  # fit are well within these bounds, which keep huge exponents from being written out
+  # Typst's decimals are integers below 2^96 (about 28 digits) scaled by up to 28 decimal
+  # places. Their exponents are well within these bounds, which keep huge exponents from
+  # being written out
   @max_decimal_exponent 40
+  @max_decimal_integer Integer.pow(2, 96)
+  @max_decimal_places 28
+
+  # Typst's dates go from year -9999 to 9999
+  @max_year 9999
+
+  # A range is passed as a list of its numbers, which a range can make enormous
+  @max_range_size 1_000_000
 
   # How many structs Typsty.Encoder may turn into other structs in a row, so that two
   # implementations that encode as each other can't loop forever
@@ -65,8 +74,9 @@ defmodule Typsty.Value do
 
   defp encode(value, path, encodings) when is_tuple(value), do: value |> Tuple.to_list() |> encode(path, encodings)
 
-  defp encode(%Date{} = date, _path, _encodings) do
+  defp encode(%Date{} = date, path, _encodings) do
     %Date{year: year, month: month, day: day} = Date.convert!(date, Calendar.ISO)
+    year!(year, path)
     {:date, year, month, day}
   end
 
@@ -75,8 +85,9 @@ defmodule Typsty.Value do
     {:time, hour, minute, second}
   end
 
-  defp encode(%NaiveDateTime{} = datetime, _path, _encodings) do
+  defp encode(%NaiveDateTime{} = datetime, path, _encodings) do
     datetime = NaiveDateTime.convert!(datetime, Calendar.ISO)
+    year!(datetime.year, path)
     {:datetime, datetime.year, datetime.month, datetime.day, datetime.hour, datetime.minute, datetime.second}
   end
 
@@ -89,16 +100,25 @@ defmodule Typsty.Value do
       not is_integer(coef) ->
         invalid!(path, "is a decimal that isn't a number (#{coef}), which Typst decimals can't represent")
 
-      exp > @max_decimal_exponent or exp < -(@max_decimal_exponent + length(Integer.digits(coef))) ->
+      exp > @max_decimal_exponent or exp < -(@max_decimal_exponent + length(Integer.digits(coef))) or
+        coef * Integer.pow(10, max(exp, 0)) >= @max_decimal_integer or -exp > @max_decimal_places ->
         invalid!(
           path,
-          "is a decimal with an exponent of #{exp}, which doesn't fit in a Typst decimal " <>
-            "(about 28 significant digits, at most 28 of them after the decimal point)"
+          "is a decimal that doesn't fit in a Typst decimal (about 28 significant digits, " <>
+            "at most 28 of them after the decimal point)"
         )
 
       true ->
         {:decimal, decimal_string(sign, coef, exp)}
     end
+  end
+
+  defp encode(%Range{} = range, path, _encodings) do
+    if Range.size(range) > @max_range_size do
+      invalid!(path, "is a range of #{Range.size(range)} numbers, more than #{@max_range_size}. Pass a list")
+    end
+
+    encode(Enum.to_list(range), path, 0)
   end
 
   defp encode(%Typsty.Template{}, path, _encodings) do
@@ -114,6 +134,15 @@ defmodule Typsty.Value do
   end
 
   defp encode(%module{} = struct, path, encodings) do
+    if Typsty.Encoder.impl_for(struct) == nil do
+      invalid!(
+        path,
+        "is a #{inspect(module)} struct, which can only be passed to a template when it implements " <>
+          "Typsty.Encoder: add @derive Typsty.Encoder (or @derive {Typsty.Encoder, only: [...]}) to " <>
+          "its module, or pass a map of the fields the template needs"
+      )
+    end
+
     case Typsty.Encoder.encode(struct) do
       %^module{} -> invalid!(path, "is a #{inspect(module)} struct that Typsty.Encoder encodes as itself")
       encoded -> encode(encoded, path, encodings + 1)
@@ -154,6 +183,12 @@ defmodule Typsty.Value do
       path,
       "has the key #{inspect(key)}. Keys must be strings, integers, or atoms other than nil, true and false"
     )
+  end
+
+  defp year!(year, _path) when year in -@max_year..@max_year//1, do: :ok
+
+  defp year!(year, path) do
+    invalid!(path, "is in the year #{year}, but Typst's dates go from the year -#{@max_year} to #{@max_year}")
   end
 
   defp depth!(path) do

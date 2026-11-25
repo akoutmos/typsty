@@ -36,8 +36,6 @@ defmodule Typsty.Formatter do
 
   @behaviour Mix.Tasks.Format
 
-  @default_line_length 98
-
   @heredoc_delimiters [~s("""), ~s(''')]
 
   @impl Mix.Tasks.Format
@@ -57,10 +55,13 @@ defmodule Typsty.Formatter do
   defp do_format(source, opts) do
     typst_opts = Typsty.Options.formatter!(opts)
 
+    # Typsty.format/2's defaults, except that the line length follows the formatter's own
+    defaults = Typsty.Options.format_defaults()
+
     format_opts = [
-      line_length: typst_opts[:typst_line_length] || opts[:line_length] || @default_line_length,
-      indent: Keyword.get(typst_opts, :typst_indent, 2),
-      wrap_text: Keyword.get(typst_opts, :typst_wrap_text, false)
+      line_length: typst_opts[:typst_line_length] || opts[:line_length] || defaults[:line_length],
+      indent: Keyword.get(typst_opts, :typst_indent, defaults[:indent]),
+      wrap_text: Keyword.get(typst_opts, :typst_wrap_text, defaults[:wrap_text])
     ]
 
     case Typsty.format(source, format_opts) do

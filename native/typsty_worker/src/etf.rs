@@ -238,10 +238,16 @@ impl Reader<'_> {
     }
 }
 
+/// The length of the term in the external term format, which a frame's 4-byte length must
+/// hold.
+pub fn frame_length(term: &Term) -> usize {
+    1 + encoded_length(term)
+}
+
 /// Writes the term in the external term format, prefixed with its length as 4 bytes
 /// (`{:packet, 4}`). Binaries are written as they are, without copying them into a buffer.
 pub fn write_frame(term: &Term, out: &mut impl Write) -> io::Result<()> {
-    let length = 1 + encoded_length(term);
+    let length = frame_length(term);
     let length = u32::try_from(length)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "response too large"))?;
 

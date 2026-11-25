@@ -9,7 +9,7 @@ use crate::diagnostics::{self, Diagnostic};
 use crate::export::{self, Output};
 use crate::fonts::{self, FontSettings};
 use crate::isolate::{self, Cancellation};
-use crate::world::{self, Prepared, TypstyWorld};
+use crate::world::{self, PrepareError, Prepared, TypstyWorld};
 
 /// How many compilations a memoized result survives without being used. Typst memoizes
 /// evaluation, layout, decoded images and rendered textures across compilations, which
@@ -52,19 +52,20 @@ pub struct RenderJob {
 
 impl RenderJob {
     /// Checks the arguments, which is quick, so that invalid ones are reported before the
-    /// render waits for its turn. The error describes the invalid argument.
-    pub fn prepare(self) -> Result<PreparedJob, String> {
-        let pdf_standards = export::pdf_standards(&self.pdf_standards)?;
+    /// render waits for its turn.
+    pub fn prepare(self) -> Result<PreparedJob, PrepareError> {
+        let pdf_standards =
+            export::pdf_standards(&self.pdf_standards).map_err(PrepareError::Invalid)?;
 
         if !(self.ppi.is_finite() && self.ppi > 0.0) {
-            return Err(format!(
+            return Err(PrepareError::Invalid(format!(
                 "the :ppi option must be a positive number, got: {}",
                 self.ppi
-            ));
+            )));
         }
 
         let world = Prepared::new(
-            &self.template,
+            self.template,
             self.assigns,
             self.files,
             self.root,
@@ -174,6 +175,44 @@ pub fn format(
             })
     })
     .unwrap_or_else(|interrupted| Err(vec![Diagnostic::error(interrupted.message())]))
+}
+
+/// The packages a Typst file imports or includes, such as `@preview/oxifmt:1.0.0`, found by
+/// parsing it: imports in comments, strings and raw text don't count.
+pub fn package_imports(text: String) -> Vec<String> {
+    use std::str::FromStr;
+    use typst::syntax::ast::{self, Expr};
+    use typst::syntax::package::PackageSpec;
+
+    isolate::run(move || {
+        let root = typst::syntax::parse(world::strip_bom(&text));
+        let mut specs = Vec::new();
+
+        // Walked with a stack rather than recursively, since the tree can be deep
+        let mut nodes = vec![&root];
+        while let Some(node) = nodes.pop() {
+            let source = node
+                .cast::<ast::ModuleImport>()
+                .map(|import| import.source())
+                .or_else(|| {
+                    node.cast::<ast::ModuleInclude>()
+                        .map(|include| include.source())
+                });
+
+            if let Some(Expr::Str(string)) = source {
+                if let Ok(spec) = PackageSpec::from_str(&string.get()) {
+                    specs.push(spec.to_string());
+                }
+            }
+
+            nodes.extend(node.children());
+        }
+
+        specs.sort();
+        specs.dedup();
+        specs
+    })
+    .unwrap_or_default()
 }
 
 /// Scans for fonts (caching them for later renders) and returns the font families found.

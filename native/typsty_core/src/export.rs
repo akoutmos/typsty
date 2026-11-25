@@ -14,8 +14,8 @@ use crate::world::TypstyWorld;
 /// The most pixels rasterizing a page may take, for the page itself and for the images,
 /// gradients and tilings on it: 2^28 pixels, which is 1 GiB of textures. Typst sizes these by
 /// the content, so content placed far outside the page, or an extreme `:ppi`, could otherwise
-/// ask for more memory than exists, and a failed allocation aborts the VM. (Encoding the page
-/// as a PNG takes memory on top of this.)
+/// ask for more memory than exists, and a failed allocation aborts the VM. (Resizing images
+/// and encoding the page take memory on top of this, a few times as much at worst.)
 pub const MAX_PNG_PIXELS: f64 = (1u64 << 28) as f64;
 
 pub enum Output {
@@ -147,6 +147,12 @@ fn check_raster_size(page: &Page, pixel_per_pt: f64) -> Result<(), String> {
         (size.x.to_pt() * pixel_per_pt).round().max(1.0),
         (size.y.to_pt() * pixel_per_pt).round().max(1.0),
     )?;
+
+    // The page's own fill is painted like a shape the size of the page
+    if let Some(fill) = page.fill_or_white() {
+        let page_size = (size.x.to_pt(), size.y.to_pt());
+        check_paint(&fill, page_size, false, size, pixel_per_pt, &mut budget)?;
+    }
 
     let scale = Transform::scale(Ratio::new(pixel_per_pt), Ratio::new(pixel_per_pt));
     walk(&page.frame, scale, size, pixel_per_pt, &mut budget)

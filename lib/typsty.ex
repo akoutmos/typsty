@@ -77,7 +77,8 @@ defmodule Typsty do
 
   A few things to know about the conversion:
 
-  - Dictionaries are sorted by key, since Elixir maps have no order.
+  - Dictionaries are sorted by key, since Elixir maps have no order. The keys are strings, so
+    integer keys sort as text (`"10"` before `"2"`).
   - Keyword lists are lists of tuples, so they become arrays of `(key, value)` pairs; pass
     maps for dictionaries. Charlists are lists of integers too.
   - Typst's datetimes have no fractions of a second or time zones: times are truncated to
@@ -112,7 +113,7 @@ defmodule Typsty do
   #line-items(assigns.items)
   ```
 
-  (Imported files and packages can also read the assigns from `sys.inputs`.)
+  (Imported files can also read the assigns from `sys.inputs.assigns`.)
 
   `render/1` gets the assigns before the template does, so it can compute values for it:
 
@@ -140,20 +141,23 @@ defmodule Typsty do
   #image("logo.png", width: 4cm)
   ```
 
-  Paths are relative to the project root (`"logo.png"` and `"/logo.png"` are the same file).
-  To also read files from a directory, set `:root`; files given with `:files` take
-  precedence. Without `:root`, the document can only read the files it's given.
+  Paths are relative to the project root (`"logo.png"` and `"/logo.png"` are the same file),
+  and `main.typ` is the template itself. To also read files from a directory, set `:root`;
+  files given with `:files` take precedence. Without `:root`, the document can only read
+  the files it's given. Files read from `:root` may be at most 512 MiB.
 
   Typst keeps every file path it sees for the life of the VM, and has room for 65,535 of
   them. Use stable names, like `logo.png` or `photos/1.jpg`, rather than a unique name per
-  render. Typsty stops a render that reads more than 10,000 different files, refuses new
-  paths in `:files` once 50,000 have been given, and stops renders that need a new path
-  once Typst's table is nearly full. Rendering in a `Typsty.Pool` with `:max_renders` starts
-  each worker with an empty table. Typst keeps label names for the life of the VM too, so
-  make labels from fixed names, not from data such as ids.
+  render: a template that builds paths from data (`image("photos/" + assigns.id)`) uses a new
+  one for every id. Typsty stops a render that reads more than 10,000 different files, and
+  stops renders that need a new path once Typst's table is nearly full, which inside the VM
+  lasts until it restarts. A `Typsty.Pool` replaces a worker whose table is nearly full.
+  Typst keeps label names and bibliography keys for the life of the VM too, so make labels
+  from fixed names, not from data such as ids.
 
-  Documents rendered inside the VM can't read PDF files (as images, for example): a
-  malformed PDF can crash the VM. Render them in a `Typsty.Pool`, which can.
+  Documents rendered inside the VM can't read PDF files (as images, for example), or SVG
+  images that contain other SVG images: decoding them can crash the VM. Render them in a
+  `Typsty.Pool`, which can.
 
   ## Options
 
@@ -161,7 +165,8 @@ defmodule Typsty do
   application config, as defaults for every render:
 
   ```elixir
-  config :typsty, font_paths: ["priv/fonts"], system_fonts: false
+  # config/runtime.exs
+  config :typsty, font_paths: [Application.app_dir(:my_app, "priv/fonts")], system_fonts: false
   ```
 
   #{Typsty.Options.docs(:render)}
@@ -179,7 +184,7 @@ defmodule Typsty do
   Fonts are scanned once for each combination of `:font_paths`, `:system_fonts` and
   `:embedded_fonts` and then cached, so only the first render with given font settings
   pays for scanning them. Call `font_families/1` when your application starts to scan them
-  ahead of time.
+  ahead of time. (A `Typsty.Pool` worker scans its own when it starts.)
 
   ## Errors
 
@@ -191,13 +196,28 @@ defmodule Typsty do
 
   ## What a template can do
 
-  Typsty protects the VM from the data a document is rendered with: values, files and
-  images are checked before Typst gets them, and renders run with large stacks, away from
-  the schedulers. A template, though, is code. A template that loops forever is stopped at
-  its timeout only when it next calls into Typst, and one that asks for an enormous amount
-  of memory (`"a" * 1000000000000`) makes the allocation fail, which ends the VM. Render
-  templates you don't control, such as ones your users write, in a `Typsty.Pool`, where
-  such a render only ends its worker.
+  Renders run with large stacks, away from the schedulers, and Typsty protects the VM from
+  the data a document is rendered with:
+
+  - **Assigns** are converted to Typst values, with limits on how deeply they nest and on
+    the size of numbers and dates. A template can't do anything with them that it couldn't
+    do with values it wrote itself.
+  - **Files** (in `:files`, or under `:root`) are checked before Typst decodes them, for the
+    files known to crash or hang its decoders: images that claim to be enormous, compressed
+    SVGs and XML entities that expand without bound, deeply nested XML, CBOR that declares
+    billions of items, deeply nested bibliographies, PDFs. Typst decodes many formats with
+    many libraries, though, and the checks can't promise that every hostile file is caught.
+    **Render documents that read files from people you don't trust, such as uploads, in a
+    `Typsty.Pool` with a `:memory_limit`.** Only the files a document reads are checked:
+    data a template turns into bytes itself (`image(bytes(assigns.svg))`) isn't, so pass
+    such data as a file. An SVG can read other files in the project too, by linking them,
+    so don't give documents a `:root` that holds other people's files.
+
+  A template, though, is code. A template that loops forever is stopped at its timeout only
+  when it next calls into Typst, and one that asks for an enormous amount of memory
+  (`"a" * 1000000000000`) makes the allocation fail, which ends the VM. Render templates you
+  don't control, such as ones your users write, in a `Typsty.Pool` with a `:memory_limit`,
+  where such a render only ends its worker.
 
   ## Warnings
 
@@ -227,6 +247,9 @@ defmodule Typsty do
   @typedoc "An option for `format/2`."
   @type format_option :: unquote(Options.typespec(:format))
 
+  @typedoc "An option for `font_families/1`: the font options for rendering."
+  @type font_option :: unquote(Options.typespec(:fonts))
+
   @doc """
   Returns the template for the given assigns, as a `Typsty.Template` struct. Define it with
   the `~TYPST` sigil, or leave it out and put the template in a `.typ` file next to the
@@ -240,8 +263,8 @@ defmodule Typsty do
   ## Options
 
   - `:template` - the template file, relative to the module's file. Defaults to the
-    module's file name with the `.typ` extension. Only used when the module doesn't define
-    `render/1`.
+    module's file name with the `.typ` extension. A module that defines `render/1` can't
+    have a template.
 
   ## Overriding the generated functions
 
@@ -425,10 +448,26 @@ defmodule Typsty do
   end
 
   defp validate!(%Template{source: source} = template) do
-    case Native.syntax_errors(source) do
+    case syntax_errors(source) do
       [] -> :ok
+      :unavailable -> :ok
       diagnostics -> SyntaxError.raise!(diagnostics, template)
     end
+  end
+
+  # When cross-compiling (for Nerves, say), the NIF is built for another machine and can't
+  # load where the code compiles: templates are then compiled without checking their syntax
+  defp syntax_errors(source) do
+    Native.syntax_errors(source)
+  rescue
+    error in [UndefinedFunctionError, ErlangError] ->
+      if match?(%UndefinedFunctionError{module: Native}, error) or
+           match?(%ErlangError{original: :nif_not_loaded}, error) do
+        IO.warn("Typsty can't check templates' syntax, since its NIF couldn't be loaded (cross-compiling?)", [])
+        :unavailable
+      else
+        reraise error, __STACKTRACE__
+      end
   end
 
   @doc """
@@ -512,7 +551,7 @@ defmodule Typsty do
   The fonts are scanned once for each combination of options and cached, so calling this
   when your application starts makes the first render faster.
   """
-  @spec font_families([option()]) :: [String.t()]
+  @spec font_families([font_option()]) :: [String.t()]
   def font_families(opts \\ []) do
     opts |> Options.fonts!() |> font_options() |> Native.font_families()
   end
@@ -553,8 +592,13 @@ defmodule Typsty do
     %Template{source: utf8!(source, "the Typst source"), assigns: assigns!(assigns)}
   end
 
-  defp template(%Template{} = template, assigns) do
+  defp template(%Template{source: source} = template, assigns) when is_binary(source) do
+    utf8!(source, "the template's source")
     %{template | assigns: Map.merge(assigns!(template.assigns), assigns!(assigns))}
+  end
+
+  defp template(%Template{source: source}, _assigns) do
+    raise ArgumentError, "the template's source must be a string, got: #{inspect(source)}"
   end
 
   defp template(module, _assigns) when is_atom(module) and module not in [nil, true, false] do
@@ -585,8 +629,8 @@ defmodule Typsty do
 
   defp assigns!(assigns) when is_list(assigns) do
     raise ArgumentError,
-          "the assigns must be a map, got a list: #{inspect(assigns)}. " <>
-            "Options go in the argument after the assigns, like Typsty.to_png(source, %{}, ppi: 300)"
+          "the assigns must be a map, got a list: #{inspect(assigns)}. Options go after the assigns: " <>
+            "MyApp.Invoice.to_png(%{}, ppi: 300) for a document module, Typsty.to_png(source, %{}, ppi: 300) otherwise"
   end
 
   defp assigns!(assigns), do: raise(ArgumentError, "the assigns must be a map, got: #{inspect(assigns)}")
@@ -598,17 +642,7 @@ defmodule Typsty do
       opts = Options.render!(opts)
       assigns = Value.assigns(template.assigns)
       pool = pool!(opts[:pool])
-
-      native_opts = %{
-        format: format,
-        root: opts[:root] && Path.expand(opts[:root]),
-        package_paths: Enum.map(opts[:package_paths], &Path.expand/1),
-        fonts: font_options(opts),
-        ppi: opts[:ppi] * 1.0,
-        pdf_standards: opts[:pdf_standards],
-        timeout: if(opts[:timeout] == :infinity, do: nil, else: opts[:timeout]),
-        max_running: opts[:max_concurrent_renders]
-      }
+      native_opts = __native_options__(opts, format)
 
       case render_with(pool, template.source, assigns, Keyword.get(opts, :files, []), native_opts) do
         {:ok, output, warnings} ->
@@ -625,6 +659,37 @@ defmodule Typsty do
           {{:error, error}, Map.merge(metadata, %{result: :error, reason: reason, diagnostics: diagnostics})}
       end
     end)
+  end
+
+  # Sending a checkout to another kind of process would crash it
+  defp pool_process!(pid, pool) do
+    case Process.info(pid, :dictionary) do
+      {:dictionary, dictionary} ->
+        if dictionary[:"$initial_call"] != {NimblePool, :init, 1} do
+          raise ArgumentError, "the :pool option must be a Typsty.Pool, got: #{inspect(pool)}"
+        end
+
+        pid
+
+      nil ->
+        raise ArgumentError, "the :pool option (or the :pool config) names no running Typsty.Pool: #{inspect(pool)}"
+    end
+  end
+
+  @doc false
+  # The options as the NIF and the pool's workers take them, from validated options
+  @spec __native_options__(keyword(), :pdf | :png | :svg) :: map()
+  def __native_options__(opts, format) do
+    %{
+      format: format,
+      root: opts[:root] && Path.expand(opts[:root]),
+      package_paths: Enum.map(opts[:package_paths], &Path.expand/1),
+      fonts: font_options(opts),
+      ppi: opts[:ppi] * 1.0,
+      pdf_standards: opts[:pdf_standards],
+      timeout: if(opts[:timeout] == :infinity, do: nil, else: opts[:timeout]),
+      max_running: opts[:max_concurrent_renders]
+    }
   end
 
   defp diagnostics(:typst, diagnostics, template, native_opts) do
@@ -656,8 +721,19 @@ defmodule Typsty do
   end
 
   defp package_hint(spec, package_paths) do
-    "download it with `mix typsty.packages.get #{spec}`, and add the directory it's saved in " <>
-      "to the :package_paths option. #{searched(package_paths)}"
+    # A directory that has the package one level down names the namespace's directory,
+    # rather than the one that holds it
+    [_, namespace, name, version] = Regex.run(~r/^@([^\/]+)\/([^:]+):(.+)$/, spec)
+
+    case Enum.find(package_paths, &File.dir?(Path.join([&1, name, version]))) do
+      nil ->
+        "download it with `mix typsty.packages.get #{spec}`, and add the directory it's saved in " <>
+          "to the :package_paths option. #{searched(package_paths)}"
+
+      path ->
+        "#{path} has the package, but :package_paths must name the directory that holds " <>
+          "#{namespace}/: #{Path.dirname(path)}"
+    end
   end
 
   defp searched([]), do: "The :package_paths option is empty, so no directories were searched"
@@ -699,6 +775,10 @@ defmodule Typsty do
             receive do
               {^reference, result} -> result
             end
+
+          # The render ended, but its result couldn't be sent (a bug)
+          :abandoned ->
+            {:error, :crashed, "the render ended, but its result couldn't be sent"}
         end
     end
   end
@@ -722,10 +802,10 @@ defmodule Typsty do
   defp pool!(pool) do
     case GenServer.whereis(pool) do
       pid when is_pid(pid) and node(pid) == node() ->
-        pid
+        pool_process!(pid, pool)
 
       nil ->
-        raise ArgumentError, "the :pool option names no running Typsty.Pool: #{inspect(pool)}"
+        raise ArgumentError, "the :pool option (or the :pool config) names no running Typsty.Pool: #{inspect(pool)}"
 
       _remote ->
         raise ArgumentError,

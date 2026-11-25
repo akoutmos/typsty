@@ -3,7 +3,25 @@ defmodule Typsty.ValueTest do
 
   defmodule Point do
     @moduledoc false
+    @derive Typsty.Encoder
     defstruct [:x, :y]
+  end
+
+  defmodule Customer do
+    @moduledoc false
+    @derive {Typsty.Encoder, only: [:name]}
+    defstruct [:name, :password_hash]
+  end
+
+  defmodule Secret do
+    @moduledoc false
+    @derive {Typsty.Encoder, except: [:token]}
+    defstruct [:id, :token]
+  end
+
+  defmodule Plain do
+    @moduledoc false
+    defstruct [:value]
   end
 
   defmodule Money do
@@ -161,14 +179,49 @@ defmodule Typsty.ValueTest do
     end
   end
 
-  test "converts structs with Typsty.Encoder, or as maps" do
+  test "converts structs that implement or derive Typsty.Encoder" do
     assert_typst(
       ~S"""
       #assert.eq(assigns.point, (x: 1, y: 2))
       #assert.eq(assigns.price, "10 USD")
+      #assert.eq(assigns.customer, (name: "Ada"))
+      #assert.eq(assigns.secret, (id: 7))
+      #assert.eq(assigns.set, ("a", "b"))
+      #assert.eq(assigns.range, (1, 2, 3))
       """,
-      %{point: %Point{x: 1, y: 2}, price: %Money{amount: 10, currency: "USD"}}
+      %{
+        point: %Point{x: 1, y: 2},
+        price: %Money{amount: 10, currency: "USD"},
+        customer: %Customer{name: "Ada", password_hash: "x"},
+        secret: %Secret{id: 7, token: "x"},
+        set: MapSet.new(["b", "a"]),
+        range: 1..3
+      }
     )
+  end
+
+  test "refuses structs that don't implement Typsty.Encoder, rather than pass their fields" do
+    assert_raise ArgumentError, ~r/^assigns.plain is a Typsty.ValueTest.Plain struct, which can only be passed/, fn ->
+      Typsty.to_pdf("x", %{plain: %Plain{value: 1}})
+    end
+
+    assert_raise ArgumentError, ~r/^assigns.range is a range of 2000000 numbers/, fn ->
+      Typsty.to_pdf("x", %{range: 1..2_000_000})
+    end
+  end
+
+  test "refuses dates and decimals Typst can't represent, with their path" do
+    assert_raise ArgumentError, ~r/^assigns.d is in the year 10000/, fn ->
+      Typsty.to_pdf("x", %{d: Date.new!(10_000, 1, 1)})
+    end
+
+    for decimal <- ["79228162514264337593543950336", "1E-29", "1E+29"] do
+      assert_raise ArgumentError, ~r/^assigns.x is a decimal that doesn't fit in a Typst decimal/, fn ->
+        Typsty.to_pdf("x", %{x: Decimal.new(decimal)})
+      end
+    end
+
+    assert {:ok, _pdf} = Typsty.to_pdf("#assigns.x", %{x: Decimal.new("79228162514264337593543950335")})
   end
 
   test "raises for integers that don't fit in 64 bits" do
@@ -226,7 +279,7 @@ defmodule Typsty.ValueTest do
     for decimal <- [huge, tiny] do
       {micros, _} =
         :timer.tc(fn ->
-          assert_raise ArgumentError, ~r/^assigns.amount is a decimal with an exponent of/, fn ->
+          assert_raise ArgumentError, ~r/^assigns.amount is a decimal that doesn't fit/, fn ->
             Typsty.to_pdf("x", %{amount: decimal})
           end
         end)

@@ -9,8 +9,16 @@
 //! - request: `{:render, template, assigns, files, options}`, with the assigns as
 //!   `Typsty.Value` builds them for the NIF, the options the NIF takes, and a `:timeout` in
 //!   milliseconds or `nil`
-//! - response: what the NIF sends: `{:ok, output, warnings}`, `{:error, :typst, diagnostics}`
-//!   or `{:error, :crashed, message}`, or `{:error, :invalid, message}` for invalid arguments
+//! - response: what the NIF sends or returns: `{:ok, output, warnings}`,
+//!   `{:error, :typst, diagnostics}`, `{:error, :crashed, message}`, or
+//!   `{:error, :invalid, message}` for invalid arguments
+//!
+//! Each request is acknowledged with `:started` as soon as it's read, before its response.
+//!
+//! A frame that isn't a term ends the worker (exit status 87): the pool and the worker
+//! disagree on where frames start, and nothing that follows can be trusted. The worker also
+//! exits (status 0) after a render panicked, and when Typst's table of file paths is nearly
+//! full, so that the pool replaces it.
 //!
 //! The process ends, with an exit status the pool understands, when a render runs past its
 //! timeout or the process goes over its memory limit (`--memory-limit BYTES`). Stdout only
@@ -29,7 +37,9 @@ use std::time::{Duration, Instant};
 
 use etf::Term;
 use typsty_core::isolate::{self, Interrupted};
-use typsty_core::{Diagnostic, FontSettings, Format, Output, RenderJob, Rendered, Severity};
+use typsty_core::{
+    Diagnostic, FontSettings, Format, Output, PrepareError, RenderJob, Rendered, Severity,
+};
 
 #[global_allocator]
 static ALLOCATOR: memory::Limited = memory::Limited;
@@ -71,9 +81,9 @@ fn main() {
 
     memory::set_limit(arguments.memory_limit);
 
-    // A crash here only ends this process, so documents may read PDF files (see
-    // `typsty_core::checks`)
-    typsty_core::init(typsty_core::Config { pdf_files: true });
+    // A crash here only ends this process, so documents may read files that are unsafe to
+    // decode inside the BEAM, such as PDF files (see `typsty_core::checks`)
+    typsty_core::init(typsty_core::Config { isolated: true });
 
     if arguments.check {
         println!("typsty_worker {PROTOCOL_VERSION}");
@@ -94,21 +104,47 @@ fn main() {
     let mut floor = memory::used();
 
     for request in received {
-        let response = handle(request);
+        // Acknowledges the request before working on it, so that the pool can tell a worker
+        // that died before it got the request (whose render can go to another worker) from
+        // one that died during the render
+        if write_response(&Term::atom("started")).is_err() {
+            exit::now(exit::PROTOCOL);
+        }
 
-        let written = {
-            let mut output = BufWriter::new(io::stdout().lock());
-            etf::write_frame(&response, &mut output).and_then(|()| output.flush())
-        };
+        let Handled {
+            mut response,
+            retire,
+        } = handle(request);
 
-        if written.is_err() {
+        // A frame's length is 4 bytes
+        if etf::frame_length(&response) > u32::MAX as usize {
+            response = error(
+                Term::atom("crashed"),
+                Term::binary("the rendered document is larger than 4 GiB, the most a Typsty.Pool worker can return"),
+            );
+        }
+
+        if write_response(&response).is_err() {
             // The pool is gone
             exit::now(exit::PROTOCOL);
         }
 
         drop(response);
         trim_caches(&mut floor);
+
+        // The pool replaces a worker that exits while it's idle. A worker that panicked may
+        // have been left in a bad state, and one whose table of file paths is nearly full
+        // would refuse new paths for good (see `typsty_core::world`)
+        if retire || typsty_core::world::file_ids_running_out() {
+            exit::now(0);
+        }
     }
+}
+
+fn write_response(response: &Term) -> io::Result<()> {
+    let mut output = BufWriter::new(io::stdout().lock());
+    etf::write_frame(response, &mut output)?;
+    output.flush()
 }
 
 fn read_requests(requests: mpsc::SyncSender<Vec<u8>>) {
@@ -160,8 +196,18 @@ fn read_frame(input: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error),
     }
+    let length = u32::from_be_bytes(length) as usize;
 
-    let mut frame = vec![0; u32::from_be_bytes(length) as usize];
+    // A request that can't fit under the memory limit is read to its end, so that the pool
+    // finishes sending it and sees the exit status, rather than a broken pipe
+    if let Some(limit) = memory::limit() {
+        if length > limit.saturating_sub(memory::used()) {
+            io::copy(&mut input.take(length as u64), &mut io::sink())?;
+            exit::now(exit::MEMORY_LIMIT);
+        }
+    }
+
+    let mut frame = vec![0; length];
     input.read_exact(&mut frame)?;
     Ok(Some(frame))
 }
@@ -180,19 +226,49 @@ fn trim_caches(floor: &mut usize) {
     }
 }
 
-fn handle(request: Vec<u8>) -> Term {
+/// A request's response, and whether the worker should exit after sending it.
+struct Handled {
+    response: Term,
+    retire: bool,
+}
+
+impl From<Term> for Handled {
+    fn from(response: Term) -> Self {
+        Self {
+            response,
+            retire: false,
+        }
+    }
+}
+
+fn handle(request: Vec<u8>) -> Handled {
     let decoded = etf::decode(&request);
     // The request's files were copied out of it
     drop(request);
 
-    let job = decoded
-        .map_err(|error| error.to_string())
-        .and_then(parse_request)
-        .and_then(|(job, timeout)| Ok((job.prepare()?, timeout)));
+    // A frame that isn't a term means the worker and the pool disagree on where frames
+    // start: whatever comes next can't be trusted
+    let Ok(decoded) = decoded else {
+        exit::now(exit::PROTOCOL);
+    };
 
-    let (job, timeout) = match job {
+    let (job, timeout) = match parse_request(decoded) {
+        Ok(request) => request,
+        Err(message) => return error(Term::atom("invalid"), Term::binary(message)).into(),
+    };
+
+    let job = match job.prepare() {
         Ok(job) => job,
-        Err(message) => return error(Term::atom("invalid"), Term::binary(message)),
+        Err(PrepareError::Invalid(message)) => {
+            return error(Term::atom("invalid"), Term::binary(message)).into()
+        }
+        Err(PrepareError::Refused(message)) => {
+            return error(
+                Term::atom("typst"),
+                diagnostics_term(vec![Diagnostic::error(message)]),
+            )
+            .into()
+        }
     };
 
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
@@ -207,27 +283,41 @@ fn handle(request: Vec<u8>) -> Term {
     );
 
     if let Err(message) = started {
-        return error(Term::atom("crashed"), Term::binary(message));
+        return error(Term::atom("crashed"), Term::binary(message)).into();
     }
 
+    let ended = || {
+        Err(Interrupted::Panicked(
+            "the render ended without a result".into(),
+        ))
+    };
     let result = match deadline {
-        Some(deadline) => results
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            // The render is still running: ending the process is the only way to stop it
-            .unwrap_or_else(|_| exit::now(exit::TIMEOUT)),
-        None => results
-            .recv()
-            .unwrap_or_else(|_| Err(Interrupted::Panicked("unknown".into()))),
+        Some(deadline) => {
+            match results.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(result) => result,
+                // The render is still running: ending the process is the only way to stop it
+                Err(mpsc::RecvTimeoutError::Timeout) => exit::now(exit::TIMEOUT),
+                Err(mpsc::RecvTimeoutError::Disconnected) => ended(),
+            }
+        }
+        None => results.recv().unwrap_or_else(|_| ended()),
     };
 
     match result {
-        Ok(Ok(rendered)) => ok(rendered),
-        Ok(Err(errors)) => error(Term::atom("typst"), diagnostics_term(errors)),
+        Ok(Ok(rendered)) => ok(rendered).into(),
+        Ok(Err(errors)) => error(Term::atom("typst"), diagnostics_term(errors)).into(),
         Err(Interrupted::Stopped(message)) => error(
             Term::atom("typst"),
             diagnostics_term(vec![Diagnostic::error(message)]),
-        ),
-        Err(interrupted) => error(Term::atom("crashed"), Term::binary(interrupted.message())),
+        )
+        .into(),
+        Err(interrupted @ Interrupted::Panicked(_)) => Handled {
+            response: error(Term::atom("crashed"), Term::binary(interrupted.message())),
+            retire: true,
+        },
+        Err(interrupted) => {
+            error(Term::atom("crashed"), Term::binary(interrupted.message())).into()
+        }
     }
 }
 

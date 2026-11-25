@@ -28,6 +28,9 @@ time = "0.3"
 rayon = "1"
 imagesize = "0.14"
 flate2 = "1"
+memchr = "2"
+roxmltree = "0.21"
+data-url = "0.3"
 libc = "0.2"
 
 [profile.release]

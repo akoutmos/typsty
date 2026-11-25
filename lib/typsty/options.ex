@@ -36,10 +36,15 @@ defmodule Typsty.Options do
       """
     ],
     font_paths: [
-      type: {:list, :string},
+      type: {:custom, __MODULE__, :paths, []},
       type_doc: "list of `t:Path.t/0`",
+      type_spec: quote(do: [Path.t()]),
       default: [],
-      doc: "Directories to load fonts from, searched recursively."
+      doc: """
+      Directories to load fonts from, searched recursively. Relative paths are relative to
+      the current directory when the document renders, which in a release isn't your app's
+      directory: use `Application.app_dir/2`, in `config/runtime.exs`.
+      """
     ],
     system_fonts: [
       type: :boolean,
@@ -58,8 +63,9 @@ defmodule Typsty.Options do
       """
     ],
     package_paths: [
-      type: {:list, :string},
+      type: {:custom, __MODULE__, :paths, []},
       type_doc: "list of `t:Path.t/0`",
+      type_spec: quote(do: [Path.t()]),
       default: [],
       doc: """
       Directories with Typst packages, laid out as `namespace/name/version`, like Typst's
@@ -104,8 +110,8 @@ defmodule Typsty.Options do
     ],
     pool: [
       type: {:custom, __MODULE__, :pool, []},
-      type_doc: "`t:GenServer.server/0` or `nil`",
-      type_spec: quote(do: GenServer.server() | nil),
+      type_doc: "`t:GenServer.name/0`, `t:pid/0` or `nil`",
+      type_spec: quote(do: GenServer.name() | pid() | nil),
       default: nil,
       doc: "The name or pid of a `Typsty.Pool` to render in, instead of rendering inside the VM."
     ]
@@ -162,7 +168,7 @@ defmodule Typsty.Options do
       """
     ],
     memory_limit: [
-      type: {:custom, __MODULE__, :optional_positive_integer, []},
+      type: {:custom, __MODULE__, :memory_limit, []},
       type_doc: "`t:pos_integer/0` or `nil`",
       type_spec: quote(do: pos_integer() | nil),
       default: nil,
@@ -186,7 +192,16 @@ defmodule Typsty.Options do
 
   @font_options [:font_paths, :system_fonts, :embedded_fonts]
 
-  @schemas %{render: @render, config: @config_only, format: @format, pool: @pool}
+  @schemas %{
+    render: @render,
+    config: @config_only,
+    format: @format,
+    fonts: Keyword.take(@render, @font_options),
+    pool: @pool
+  }
+
+  # The most memory a worker may be given: a 64-bit worker can't count more
+  @max_memory_limit Integer.pow(2, 62)
 
   # Options given to a function are validated without their defaults, and so is the
   # config, so that the defaults, the config and the options can be merged in that order.
@@ -210,8 +225,13 @@ defmodule Typsty.Options do
 
   @doc false
   # The options' typespec
-  @spec typespec(:render | :format | :pool) :: Macro.t()
+  @spec typespec(:render | :format | :fonts | :pool) :: Macro.t()
   def typespec(schema), do: NimbleOptions.option_typespec(Map.fetch!(@schemas, schema))
+
+  @doc false
+  # The defaults of Typsty.format/2's options, which the formatter plugin shares
+  @spec format_defaults() :: keyword()
+  def format_defaults, do: for({key, spec} <- @format, do: {key, spec[:default]})
 
   @doc false
   # The options to render with: the defaults, overridden by the config, overridden by the
@@ -252,11 +272,20 @@ defmodule Typsty.Options do
   @spec pool!(term()) :: keyword()
   def pool!(opts), do: validate!(opts, @pool_schema)
 
-  # The application config, other than the config of modules (such as Rustler's for
-  # Typsty.Native), which is someone else's to check
+  # The application config. Rustler reads Typsty.Native's config (`config :typsty,
+  # Typsty.Native, ...`), which is its to check
   defp config! do
-    config =
-      for {key, value} <- Application.get_all_env(:typsty), not module?(key), do: {key, value}
+    config = :typsty |> Application.get_all_env() |> Keyword.delete(Typsty.Native)
+
+    for {key, _value} <- config, key |> Atom.to_string() |> String.starts_with?("Elixir.") do
+      raise ArgumentError,
+            "config :typsty, #{inspect(key)} isn't read: Typsty's options go directly under :typsty " <>
+              "(config :typsty, ppi: 300), and a Typsty.Pool's options go in its child spec"
+    end
+
+    if Keyword.has_key?(config, :files) do
+      raise ArgumentError, "the :files option can't be set in the config, only given to a render"
+    end
 
     case NimbleOptions.validate(config, @config_given) do
       {:ok, config} -> config
@@ -264,14 +293,14 @@ defmodule Typsty.Options do
     end
   end
 
-  defp module?(key), do: key |> Atom.to_string() |> String.starts_with?("Elixir.")
-
   defp validate!(opts, schema) do
     if not Keyword.keyword?(opts) do
       raise ArgumentError, "the options must be a keyword list, got: #{inspect(opts)}"
     end
 
-    case NimbleOptions.validate(opts, schema) do
+    # Like Keyword.get/2, the first of an option given more than once wins, so that defaults
+    # can be appended to options: opts ++ [ppi: 300]
+    case NimbleOptions.validate(Enum.uniq_by(opts, &elem(&1, 0)), schema) do
       {:ok, opts} -> opts
       {:error, error} -> raise ArgumentError, Exception.message(error)
     end
@@ -283,17 +312,38 @@ defmodule Typsty.Options do
   def files(files) when is_map(files) or is_list(files) do
     files = Enum.to_list(files)
 
-    case Enum.find(files, &(not match?({path, contents} when is_binary(path) and is_binary(contents), &1))) do
-      nil -> {:ok, files}
-      other -> {:error, "expected paths (strings) mapped to binaries, got: #{inspect(other, limit: 5)}"}
+    cond do
+      other = Enum.find(files, &(not match?({path, contents} when is_binary(path) and is_binary(contents), &1))) ->
+        {:error, "expected paths (strings) mapped to binaries, got: #{inspect(other, limit: 5)}"}
+
+      other = Enum.find(files, fn {path, _contents} -> not String.valid?(path) end) ->
+        {:error, "expected paths that are valid UTF-8, got: #{inspect(elem(other, 0))}"}
+
+      true ->
+        {:ok, files}
     end
   end
 
   def files(other), do: {:error, "expected a map or a list of tuples, got: #{inspect(other, limit: 5)}"}
 
   @doc false
-  def optional_path(path) when is_binary(path) or is_nil(path), do: {:ok, path}
+  def optional_path(nil), do: {:ok, nil}
+
+  def optional_path(path) when is_binary(path) do
+    if String.valid?(path), do: {:ok, path}, else: {:error, "expected a path that's valid UTF-8, got: #{inspect(path)}"}
+  end
+
   def optional_path(other), do: {:error, "expected a path (a string) or nil, got: #{inspect(other)}"}
+
+  @doc false
+  def paths(paths) when is_list(paths) do
+    case Enum.find(paths, &(not (is_binary(&1) and String.valid?(&1)))) do
+      nil -> {:ok, paths}
+      other -> {:error, "expected a list of paths (strings that are valid UTF-8), got: #{inspect(other)} in it"}
+    end
+  end
+
+  def paths(other), do: {:error, "expected a list of paths, got: #{inspect(other)}"}
 
   @doc false
   def positive_number(number) when is_number(number) and number > 0, do: {:ok, number}
@@ -302,6 +352,13 @@ defmodule Typsty.Options do
   @doc false
   def optional_positive_integer(value) when (is_integer(value) and value > 0) or is_nil(value), do: {:ok, value}
   def optional_positive_integer(other), do: {:error, "expected a positive integer or nil, got: #{inspect(other)}"}
+
+  @doc false
+  def memory_limit(value) when is_integer(value) and value > @max_memory_limit do
+    {:error, "expected a number of bytes of at most #{@max_memory_limit}, or nil, got: #{value}"}
+  end
+
+  def memory_limit(value), do: optional_positive_integer(value)
 
   @doc false
   def timeout(:infinity), do: {:ok, :infinity}

@@ -2,6 +2,8 @@ defmodule Typsty.Diagnostic do
   @moduledoc """
   An error or warning reported by Typst.
 
+  - `:severity` - `:error` or `:warning`.
+  - `:message` - what the problem is.
   - `:file` - the file the problem is in. For a problem in the template itself, it's the
     template's file (the module's `.ex` file for the `~TYPST` sigil, or its `.typ` file), or
     `nil` for a template rendered from a string. For other files, it's their path in the

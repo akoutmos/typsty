@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use typst::diag::{FileError, FileResult, PackageError};
-use typst::foundations::{Bytes, Datetime, Dict, Duration};
-use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
+use typst::foundations::{Bytes, Datetime, Dict, Duration, Value};
+use typst::syntax::{FileId, Lines, PathError, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
@@ -60,15 +60,31 @@ static GIVEN_PATHS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::n
 static LIBRARY: LazyLock<LazyHash<Library>> = LazyLock::new(|| LazyHash::new(Library::default()));
 
 /// The line added before the template, which binds its assigns. The assigns are passed in
-/// `sys.inputs`, and bound to the `assigns` variable at the top of the main file. Like a
+/// `sys.inputs.assigns` (rather than as `sys.inputs` itself, which packages read their own
+/// settings from), and bound to the `assigns` variable at the top of the main file. Like a
 /// `let` binding in the template itself, it's only visible in the main file: imported files
-/// and packages don't see it (they can read `sys.inputs`).
-const PREAMBLE: &str = "#let assigns = sys.inputs\n";
+/// and packages don't see it (they can read `sys.inputs.assigns`).
+const PREAMBLE: &str = "#let assigns = sys.inputs.at(\"assigns\", default: (:))\n";
+
+/// Files read from the root directory or from package directories may be at most this
+/// large: 512 MiB.
+pub const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
+
+/// Why a render's arguments were refused before it started.
+pub enum PrepareError {
+    /// They're invalid, which is raised as an `ArgumentError`.
+    Invalid(String),
+    /// They're valid, but go over one of Typsty's limits, which is reported like Typst's
+    /// errors.
+    Refused(String),
+}
 
 /// What a document reads, checked before its render starts (see `Prepared::new`).
 pub struct Prepared {
     library: Option<LazyHash<Library>>,
-    main: Source,
+    /// The template, which is only parsed on the render's thread: parsing recurses, and the
+    /// thread preparing the render is one of the BEAM's, with a small stack.
+    template: String,
     files: HashMap<FileId, Bytes>,
     root: Option<FsRoot>,
     packages: Vec<FsPackages>,
@@ -76,19 +92,21 @@ pub struct Prepared {
 
 impl Prepared {
     /// Checks the file paths, which is quick: fonts and files are only read when the
-    /// document renders. The error describes invalid arguments.
+    /// document renders.
     pub fn new(
-        template: &str,
+        template: String,
         assigns: Dict,
         files: Vec<(String, Vec<u8>)>,
         root: Option<String>,
         package_paths: Vec<String>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, PrepareError> {
         let library = if assigns.is_empty() {
             None
         } else {
+            let mut inputs = Dict::new();
+            inputs.insert("assigns".into(), Value::Dict(assigns));
             Some(LazyHash::new(
-                Library::builder().with_inputs(assigns).build(),
+                Library::builder().with_inputs(inputs).build(),
             ))
         };
 
@@ -97,15 +115,15 @@ impl Prepared {
             let id = given_file(&path)?;
 
             if id == *MAIN_ID {
-                return Err(format!(
-                    "the file path {path:?} is reserved for the template itself"
-                ));
+                return Err(PrepareError::Invalid(format!(
+                    "the file path {path:?} in the :files option is reserved for the template itself"
+                )));
             }
 
             if given.insert(id, Bytes::new(bytes)).is_some() {
-                return Err(format!(
+                return Err(PrepareError::Invalid(format!(
                     "the :files option has the path {path:?} more than once (paths are relative to the project root, so \"logo.png\" and \"/logo.png\" are the same file)"
-                ));
+                )));
             }
         }
 
@@ -116,9 +134,14 @@ impl Prepared {
             FsRoot::new(std::fs::canonicalize(&root).unwrap_or(root))
         });
 
+        let template = match template.strip_prefix('\u{feff}') {
+            Some(stripped) => stripped.to_string(),
+            None => template,
+        };
+
         Ok(Self {
             library,
-            main: Source::new(*MAIN_ID, format!("{PREAMBLE}{}", strip_bom(template))),
+            template,
             files: given,
             root,
             packages: package_paths.into_iter().map(FsPackages::new).collect(),
@@ -130,6 +153,8 @@ pub struct TypstyWorld {
     library: Option<LazyHash<Library>>,
     fonts: Arc<FontStore>,
     main: Source,
+    /// The template, without the preamble, for reading the main file as data.
+    template: Bytes,
     /// The files given to the render, which take precedence over the root directory.
     files: HashMap<FileId, Bytes>,
     root: Option<FsRoot>,
@@ -148,10 +173,13 @@ pub struct TypstyWorld {
 
 impl TypstyWorld {
     pub fn new(prepared: Prepared, fonts: Arc<FontStore>, cancellation: Cancellation) -> Self {
+        let main = Source::new(*MAIN_ID, format!("{PREAMBLE}{}", prepared.template));
+
         Self {
             library: prepared.library,
             fonts,
-            main: prepared.main,
+            main,
+            template: Bytes::from_string(prepared.template),
             files: prepared.files,
             root: prepared.root,
             packages: prepared.packages,
@@ -195,10 +223,9 @@ impl TypstyWorld {
         }
 
         if observe(id) > MAX_FILE_ID {
-            isolate::stop(
-                "Typst's table of file paths is full: it keeps every file path it sees for the life of the VM, and it has nearly run out of room for new ones. Use stable file names (like logo.png) rather than a new one for every render, and restart the VM, or render in a Typsty.Pool with the :max_renders option"
-                .into(),
-            );
+            isolate::stop(format!(
+                "the document needs a new file path, but {TABLE_FULL}"
+            ));
         }
 
         let used = {
@@ -209,15 +236,28 @@ impl TypstyWorld {
 
         if used > MAX_RENDER_FILES {
             isolate::stop(format!(
-                "the document reads more than {MAX_RENDER_FILES} different files. Typst keeps every file path it sees for the life of the VM, so a render may only use {MAX_RENDER_FILES} of them"
+                "the document reads more than {MAX_RENDER_FILES} different files. Typst keeps every file path it sees, for as long as the VM (or a Typsty.Pool worker) runs, so a render may only use {MAX_RENDER_FILES} of them"
             ));
         }
+    }
+
+    /// The lines of a file, to turn a position in it into a line and column: a parsed
+    /// source's, or the file's text, which isn't parsed as Typst just for that (it may be a
+    /// large data file).
+    pub fn lines(&self, id: FileId) -> Option<Lines<String>> {
+        if let Some(source) = lock(&self.sources).get(&id) {
+            return Some(source.lines().clone());
+        }
+
+        let bytes = self.raw(id).ok()?;
+        let text = std::str::from_utf8(&bytes).ok()?;
+        Some(Lines::new(text.to_string()))
     }
 
     /// A file's contents, before they're checked.
     fn raw(&self, id: FileId) -> FileResult<Bytes> {
         if id == self.main.id() {
-            return Ok(Bytes::from_string(self.main.clone()));
+            return Ok(self.template.clone());
         }
 
         if let Some(bytes) = self.files.get(&id) {
@@ -285,10 +325,28 @@ fn confine(path: &Path, root: &Path, outside: impl FnOnce() -> String) -> FileRe
     }
 }
 
-/// Reads a file, refusing anything but regular files: reading a device such as /dev/zero
-/// never ends, and reading a FIFO can block forever.
+/// Reads a file, refusing anything but regular files of at most `MAX_FILE_SIZE`: reading a
+/// device such as /dev/zero never ends, and reading a FIFO can block forever. The file is
+/// opened once, and checked through its handle, so that it can't be swapped in between;
+/// opening doesn't block on a FIFO.
 fn read_regular_file(path: &Path) -> FileResult<Vec<u8>> {
-    let metadata = std::fs::metadata(path).map_err(|error| FileError::from_io(error, path))?;
+    use std::io::Read;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+
+    let file = options
+        .open(path)
+        .map_err(|error| FileError::from_io(error, path))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| FileError::from_io(error, path))?;
 
     if metadata.is_dir() {
         return Err(FileError::IsDirectory);
@@ -300,7 +358,22 @@ fn read_regular_file(path: &Path) -> FileResult<Vec<u8>> {
         )));
     }
 
-    std::fs::read(path).map_err(|error| FileError::from_io(error, path))
+    if metadata.len() > MAX_FILE_SIZE {
+        return Err(FileError::Other(Some(
+            format!(
+                "{} is larger than {} MiB, the most a document may read from disk",
+                path.display(),
+                MAX_FILE_SIZE / 1024 / 1024
+            )
+            .into(),
+        )));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_FILE_SIZE)
+        .read_to_end(&mut bytes)
+        .map_err(|error| FileError::from_io(error, path))?;
+    Ok(bytes)
 }
 
 impl World for TypstyWorld {
@@ -384,22 +457,41 @@ fn observe(id: FileId) -> u16 {
     number
 }
 
+/// What's wrong when Typst's table of file paths is full.
+const TABLE_FULL: &str = "Typst's table of file paths is full: it keeps every file path it sees, for as long as the VM (or a Typsty.Pool worker) runs. Use stable file names, like logo.png, rather than a new name for every render. Inside the VM, the table empties when the VM restarts; a Typsty.Pool replaces a worker whose table is nearly full";
+
+/// Whether Typst's table of file paths is close to full: a process that can be replaced
+/// (the worker) should be.
+pub fn file_ids_running_out() -> bool {
+    HIGHEST_FILE_ID.load(Ordering::Relaxed) as usize >= MAX_FILE_ID as usize - MAX_RENDER_FILES
+}
+
 /// The id of a file given in `:files`. New paths are refused when too many were given, or
 /// when Typst's table of paths is nearly full, before Typst creates an id for them.
-fn given_file(path: &str) -> Result<FileId, String> {
-    let vpath = VirtualPath::new(path).map_err(|_| {
-        format!("invalid file path in the :files option: {path:?}. Paths can't contain \"..\" or start with a drive letter")
+fn given_file(path: &str) -> Result<FileId, PrepareError> {
+    let vpath = VirtualPath::new(path).map_err(|error| {
+        let reason = match error {
+            PathError::Escapes => "it leads outside the project root",
+            PathError::Backslash => "paths use forward slashes (/), not backslashes",
+        };
+        PrepareError::Invalid(format!(
+            "invalid file path in the :files option: {path:?}: {reason}"
+        ))
     })?;
 
     {
         let mut paths = lock(&GIVEN_PATHS);
         if !paths.contains(vpath.get_with_slash()) {
-            if paths.len() >= MAX_GIVEN_PATHS
-                || HIGHEST_FILE_ID.load(Ordering::Relaxed) >= MAX_FILE_ID
-            {
-                return Err(format!(
-                    "too many distinct file paths: Typst keeps every file path it sees for the life of the VM, and {path:?} would be more than it has room for. Use stable file names, like logo.png, rather than a new name for every render"
-                ));
+            if paths.len() >= MAX_GIVEN_PATHS {
+                return Err(PrepareError::Refused(format!(
+                    "the :files option has a new file path, {path:?}, but {MAX_GIVEN_PATHS} different paths were already given. {TABLE_FULL}"
+                )));
+            }
+
+            if HIGHEST_FILE_ID.load(Ordering::Relaxed) >= MAX_FILE_ID {
+                return Err(PrepareError::Refused(format!(
+                    "the :files option has a new file path, {path:?}, but {TABLE_FULL}"
+                )));
             }
 
             paths.insert(vpath.get_with_slash().to_string());

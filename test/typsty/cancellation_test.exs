@@ -124,10 +124,29 @@ defmodule Typsty.CancellationTest do
 
     Application.delete_env(:typsty, :font_path)
 
-    # Rustler reads config :typsty, Typsty.Native
+    # Rustler reads config :typsty, Typsty.Native; other modules' config would be a mistake
     Application.put_env(:typsty, Typsty.Native, skip_compilation?: true)
     on_exit(fn -> Application.delete_env(:typsty, Typsty.Native) end)
     assert {:ok, _pdf} = Typsty.to_pdf("x")
+
+    Application.put_env(:typsty, Typsty.Pool, size: 2)
+    on_exit(fn -> Application.delete_env(:typsty, Typsty.Pool) end)
+
+    assert_raise ArgumentError,
+                 ~r/config :typsty, Typsty.Pool isn't read: .* a Typsty.Pool's options go in its child spec/,
+                 fn ->
+                   Typsty.to_pdf("x")
+                 end
+
+    Application.delete_env(:typsty, Typsty.Pool)
+    Application.put_env(:typsty, :files, %{"a.txt" => "a"})
+    on_exit(fn -> Application.delete_env(:typsty, :files) end)
+
+    assert_raise ArgumentError, "the :files option can't be set in the config, only given to a render", fn ->
+      Typsty.to_pdf("x")
+    end
+
+    Application.delete_env(:typsty, :files)
 
     # Options given to a render override the config
     Application.put_env(:typsty, :ppi, 72)

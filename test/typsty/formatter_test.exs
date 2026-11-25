@@ -22,10 +22,10 @@ defmodule Typsty.FormatterTest do
     code = ~S'''
     def render(assigns) do
       ~TYPST"""
-      #let   total=items.map(i=>i.price).sum()
-      = Invoice #number
+      #let   total=assigns.items.map(i=>i.price).sum()
+      = Invoice #assigns.number
 
-      #for item in items {[- #item.name]}
+      #for item in assigns.items {[- #item.name]}
       """
     end
     '''
@@ -34,10 +34,10 @@ defmodule Typsty.FormatterTest do
              String.trim_trailing(~S'''
              def render(assigns) do
                ~TYPST"""
-               #let total = items.map(i => i.price).sum()
-               = Invoice #number
+               #let total = assigns.items.map(i => i.price).sum()
+               = Invoice #assigns.number
 
-               #for item in items { [- #item.name] }
+               #for item in assigns.items { [- #item.name] }
                """
              end
              ''')

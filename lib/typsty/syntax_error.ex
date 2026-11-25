@@ -1,7 +1,8 @@
 defmodule Typsty.SyntaxError do
   @moduledoc """
   A template has invalid Typst syntax. Raised when a module with a `~TYPST` sigil or a `.typ`
-  template is compiled, so that the problem fails the build instead of a render.
+  template is compiled, so that the problem fails the build instead of a render, and when
+  `mix format` formats one with `Typsty.Formatter`.
 
   `:diagnostics` has every syntax error in the template, and `:file`, `:line` and `:column`
   point at the first one.

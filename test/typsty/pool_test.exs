@@ -50,12 +50,19 @@ defmodule Typsty.PoolTest do
     )
   end
 
-  # Waits until the pool has no idle workers. NimblePool keeps them in a queue.
+  # The pool's idle workers, which NimblePool keeps in a queue
+  defp idle_workers(pool) do
+    pool |> :sys.get_state() |> Map.fetch!(:resources) |> :queue.to_list() |> Enum.map(&elem(&1, 0))
+  end
+
+  # Waits until a worker is checked out: NimblePool keeps its checked out workers with the
+  # requests it served
   defp wait_until_busy(pool, tries \\ 500) do
-    idle = :queue.len(:sys.get_state(pool).resources)
+    busy? =
+      pool |> :sys.get_state() |> Map.fetch!(:requests) |> Map.values() |> Enum.any?(&match?({_, _, :state, _}, &1))
 
     cond do
-      idle == 0 -> :ok
+      busy? -> :ok
       tries == 0 -> flunk("the pool's workers never got busy")
       true -> Process.sleep(10) && wait_until_busy(pool, tries - 1)
     end
@@ -214,13 +221,62 @@ defmodule Typsty.PoolTest do
       render =
         spawn(fn -> send(parent, {:result, Typsty.to_pdf(@busy, %{}, pool: pool, timeout: :infinity)}) end)
 
+      monitor = Process.monitor(render)
       wait_until_busy(pool)
       stop_supervised!(pool)
 
       assert_receive {:result, {:error, %RenderError{reason: :crashed, diagnostics: [%{message: message}]}}}, 5_000
       assert message == "the pool stopped during the render"
-      refute Process.alive?(render)
+      assert_receive {:DOWN, ^monitor, :process, ^render, :normal}
       refute_received {:EXIT, _, _}
+    end
+
+    @tag pool_opts: [size: 1]
+    test "renders waiting for a worker get an error when the pool stops", %{pool: pool} do
+      parent = self()
+      busy = spawn(fn -> Typsty.to_pdf(@busy, %{}, pool: pool, timeout: :infinity) end)
+      wait_until_busy(pool)
+
+      waiting =
+        for _ <- 1..3 do
+          spawn(fn -> send(parent, {:result, Typsty.to_pdf("waits", %{}, pool: pool, timeout: :infinity)}) end)
+        end
+
+      Process.sleep(100)
+      stop_supervised!(pool)
+
+      for _ <- waiting do
+        assert_receive {:result, {:error, %RenderError{reason: :crashed, diagnostics: [%{message: message}]}}}, 5_000
+        assert message == "the pool stopped before the render started"
+      end
+
+      Process.exit(busy, :kill)
+    end
+
+    test "a worker killed while it's idle is replaced, without failing a render", %{pool: pool} do
+      assert {:ok, _pdf} = Typsty.to_pdf("warm", %{}, pool: pool)
+
+      # The idle workers' OS processes, killed the way the system's OOM killer would
+      for %{port: port} <- idle_workers(pool), {:os_pid, os_pid} = Port.info(port, :os_pid) do
+        System.cmd("kill", ["-9", Integer.to_string(os_pid)])
+      end
+
+      assert {:ok, _pdf} = Typsty.to_pdf("still works", %{}, pool: pool)
+    end
+
+    test "the longest timeout is accepted", %{pool: pool} do
+      assert {:ok, _pdf} = Typsty.to_pdf("x", %{}, pool: pool, timeout: 4_294_967_295)
+    end
+
+    @tag pool_opts: [memory_limit: 100_000_000]
+    test "a render larger than the memory limit fails without reaching a worker", %{pool: pool} do
+      files = %{"big.bin" => :binary.copy(<<0>>, 120_000_000)}
+
+      assert {:error, %RenderError{reason: :memory_limit, diagnostics: [%{message: message}]}} =
+               Typsty.to_pdf("x", %{}, pool: pool, files: files)
+
+      assert message =~ "more than the pool's memory limit (100000000 bytes)"
+      assert {:ok, _pdf} = Typsty.to_pdf("still works", %{}, pool: pool)
     end
   end
 
