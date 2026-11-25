@@ -176,7 +176,10 @@ defmodule Typsty.PoolTest do
 
       assert {:error, %RenderError{reason: :timeout, diagnostics: [%{message: message}]}} = result
       assert message == "rendering didn't finish within the timeout (100 ms), and its worker was stopped"
-      assert micros < 1_000_000
+
+      # The worker stops itself at the timeout, or is ended a second after it, long before
+      # the render would have finished
+      assert micros < 2_000_000
 
       assert {:ok, _pdf} = Typsty.to_pdf("the pool still works", %{}, pool: pool)
     end
@@ -193,10 +196,15 @@ defmodule Typsty.PoolTest do
       table = "#table(columns: assigns.n)"
       assert {:error, %RenderError{reason: :memory_limit}} = Typsty.to_pdf(table, %{n: 100_000_000_000}, pool: pool)
 
-      # So does a string repeated enough times (one that would take more than 1 GiB is
-      # refused before it's allocated, in the pool and inside the VM)
-      large = ~S|#let s = "a" * 500000000|
-      assert {:error, %RenderError{reason: :memory_limit}} = Typsty.to_pdf(large, %{}, pool: pool)
+      # So do the ways data can make a template ask for unbounded memory, which inside the
+      # VM would end it: a string repeated a number of times from the data (as `qty * price`
+      # does when a user sends a string for qty), and a huge number in Roman numerals
+      for {source, assigns} <- [
+            {~S|#(assigns.qty * assigns.price)|, %{qty: "AAAAA", price: 1_000_000_000_000_000_000}},
+            {~S|#numbering("I", assigns.n)|, %{n: 9_223_372_036_854_775_807}}
+          ] do
+        assert {:error, %RenderError{reason: :memory_limit}} = Typsty.to_pdf(source, assigns, pool: pool)
+      end
 
       assert {:ok, _pdf} = Typsty.to_pdf("the pool still works", %{}, pool: pool)
     end

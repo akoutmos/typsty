@@ -1,0 +1,127 @@
+From 87ef763db907bf5661c09abc6574b68cd46f2c17 Mon Sep 17 00:00:00 2001
+From: Alex Koutmos <akoutmos@gmail.com>
+Date: Wed, 25 Nov 2026 12:28:32 -0600
+Subject: [PATCH] Bound the numbers additive and symbolic systems represent
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Additive systems (Roman, Greek, Armenian and Hebrew numerals, and so on)
+and the symbolic system write a symbol for every multiple of their
+largest value, so representing a number takes time and memory
+proportional to the number itself. `represent` only bounded the fixed
+systems: `u64::MAX` in upper Roman numerals is about 1.8 × 10^13
+symbols, which never finishes and exhausts memory.
+
+In Typst, this is reachable from a document's data, with
+`numbering("I", n)`, `enum(start: n, numbering: "I.")` or a page counter
+updated to a large number. The work happens in a single call, which
+can't be interrupted, so an application that renders documents with
+untrusted data can't stop it.
+
+`represent` now returns `RepresentationError::TooLarge` when one of
+these systems would repeat its largest symbol more than 10,000 times.
+Typst already falls back to Arabic numerals, with a warning, for numbers
+a system can't represent. Upper Roman numerals still go up to
+10,000,999,999 and symbols up to 60,000, so the outputs the existing
+tests hash (up to 50,000) don't change.
+---
+ src/numeral_systems.rs | 60 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/src/numeral_systems.rs b/src/numeral_systems.rs
+index 10e41c5..a177136 100644
+--- a/src/numeral_systems.rs
++++ b/src/numeral_systems.rs
+@@ -1070,15 +1070,34 @@ impl<'a> NumeralSystem<'a> {
+     ) -> Result<impl Display, RepresentationError> {
+         match self {
+             Self::Positional(_) | Self::Chinese(_, _) => {}
+-            Self::Bijective(_) | Self::Symbolic(_) => {
++            Self::Bijective(_) => {
+                 if number == 0 {
+                     return Err(RepresentationError::Zero);
+                 }
+             }
++            Self::Symbolic(symbols) => {
++                if number == 0 {
++                    return Err(RepresentationError::Zero);
++                }
++                if number.div_ceil(symbols.len() as u64) > MAX_REPETITIONS {
++                    return Err(RepresentationError::TooLarge);
++                }
++            }
+             Self::Additive(numerals) => {
+                 if number == 0 && !matches!(numerals.last(), Some((_, 0))) {
+                     return Err(RepresentationError::Zero);
+                 }
++                let mut largest = 0;
++                let mut i = 0;
++                while i < numerals.len() {
++                    if numerals[i].1 > largest {
++                        largest = numerals[i].1;
++                    }
++                    i += 1;
++                }
++                if largest > 0 && number / largest > MAX_REPETITIONS {
++                    return Err(RepresentationError::TooLarge);
++                }
+             }
+             Self::Fixed(symbols) => {
+                 if number as usize >= symbols.len() {
+@@ -1098,6 +1117,16 @@ impl<'a> NumeralSystem<'a> {
+     }
+ }
+ 
++/// The most times an additive or symbolic numeral system may repeat its
++/// largest symbol to represent a number.
++///
++/// These systems write a symbol for every multiple of their largest value, so
++/// without a bound, representing a large number takes time and memory
++/// proportional to the number itself: `u64::MAX` in upper Roman numerals would
++/// be about 1.8 × 10^13 symbols. With it, upper Roman numerals go up to
++/// 10,000,999,999, and symbols (`*`, `†`, ...) up to 60,000.
++const MAX_REPETITIONS: u64 = 10_000;
++
+ /// A number, together with a numeral system in which it is representable.
+ ///
+ /// Notably, this type implements [`Display`] and is thus compatible with
+@@ -1226,7 +1255,34 @@ mod tests {
+ 
+     use siphasher::sip128::{Hasher128, SipHasher13};
+ 
+-    use super::{NamedNumeralSystem, NumeralSystem};
++    use super::{NamedNumeralSystem, NumeralSystem, RepresentationError};
++
++    /// Makes sure systems that repeat symbols refuse numbers that would take
++    /// unbounded time and memory to write.
++    #[test]
++    fn repetitions_are_bounded() {
++        for named in [
++            NamedNumeralSystem::UpperRoman,
++            NamedNumeralSystem::LowerGreek,
++            NamedNumeralSystem::Hebrew,
++            NamedNumeralSystem::Symbols,
++        ] {
++            assert!(matches!(
++                named.system().represent(u64::MAX),
++                Err(RepresentationError::TooLarge)
++            ));
++        }
++
++        let roman = NamedNumeralSystem::UpperRoman.system();
++        assert_eq!(roman.represent(1_000_000).unwrap().to_string(), "M̅");
++        assert!(roman.represent(10_000_999_999).is_ok());
++        assert!(roman.represent(10_001_000_000).is_err());
++
++        let symbols = NamedNumeralSystem::Symbols.system();
++        assert_eq!(symbols.represent(7).unwrap().to_string(), "**");
++        assert!(symbols.represent(60_000).is_ok());
++        assert!(symbols.represent(60_001).is_err());
++    }
+ 
+     /// Makes sure shorthands correspond to the way the number one is
+     /// represented in the corresponding system.
+-- 
+2.54.0 (Apple Git-157)
+

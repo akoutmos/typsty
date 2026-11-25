@@ -31,8 +31,7 @@ defmodule Typsty.WorkerBuild do
       "typsty_worker/Cargo.toml",
       "typsty_worker/src/**/*.rs",
       "typsty_core/Cargo.toml",
-      "typsty_core/src/**/*.rs",
-      "vendor/**/*"
+      "typsty_core/src/**/*.rs"
     ]
     |> Enum.flat_map(&Path.wildcard(Path.join(@native_dir, &1)))
   end

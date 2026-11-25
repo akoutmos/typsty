@@ -127,16 +127,6 @@ defmodule Typsty.RobustnessTest do
       assert {:error, %RenderError{}} = Typsty.to_pdf(~S|#image("renamed.png")|, %{}, files: %{"renamed.png" => pdf})
     end
 
-    test "huge strings and arrays are errors, not failed allocations" do
-      # As an invoice line with a string for its quantity would make: `qty * price`
-      for source <- [~S|#("A" * assigns.n)|, ~S|#((1, 2) * assigns.n)|, ~S|#range(assigns.n).len()|] do
-        assert {:error, %RenderError{reason: :crashed, diagnostics: [%{message: message}]}} =
-                 Typsty.to_pdf(source, %{n: 1_000_000_000_000_000_000})
-
-        assert message =~ "a string or array would take more than 1 GiB of memory"
-      end
-    end
-
     test "PNG export refuses content placed far off the page" do
       result = Typsty.to_png(~S|#place(dx: assigns.x * 1pt)[Hello]|, %{x: 1.0e10})
       assert_render_error(result, "content is placed or scaled more than")

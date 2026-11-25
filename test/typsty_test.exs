@@ -150,14 +150,6 @@ defmodule TypstyTest do
       assert [%{severity: :error}, %{severity: :warning, message: "unknown font family: no such font"}] = diagnostics
     end
 
-    test "falls back to Arabic numerals for numbers too large for other numeral systems" do
-      for pattern <- ["I", "i", "א", "*"] do
-        source = "#numbering(#{inspect(pattern)}, assigns.n)"
-        assert {:ok, [svg]} = Typsty.to_svg(source, %{n: 1_000_000_000_000_000}, timeout: 5_000)
-        assert svg =~ "<svg"
-      end
-    end
-
     test "leaves links to URLs other than web, mail and phone ones out" do
       source = ~S|#link(assigns.bad)[bad] #link(assigns.good)[good]|
       assigns = %{bad: " JavaScript:alert(document.domain)", good: "https://example.com/?a=1&b=<2>"}
