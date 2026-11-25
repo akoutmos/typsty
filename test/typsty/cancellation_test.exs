@@ -36,8 +36,8 @@ defmodule Typsty.CancellationTest do
   test "a render that times out is cancelled, and stops shortly after" do
     {micros, result} = :timer.tc(fn -> Typsty.to_pdf(long_document(), %{}, timeout: 50) end)
 
-    assert {:error, %RenderError{diagnostics: [%{message: message}]}} = result
-    assert message == "rendering didn't finish within the timeout (50 ms), and was cancelled"
+    assert {:error, %RenderError{reason: :timeout, diagnostics: [%{message: message}]}} = result
+    assert message == "rendering didn't finish within the timeout (50 ms), and is being cancelled"
     assert micros < 1_000_000
 
     # The render's work stops too, rather than running to the end in the background
@@ -58,19 +58,101 @@ defmodule Typsty.CancellationTest do
     assert {:error, %RenderError{}} = Typsty.to_pdf(busy, %{}, timeout: 20)
     assert Typsty.running_renders() == 1
 
-    assert {:error, %RenderError{diagnostics: [%{message: message}]}} = Typsty.to_pdf("waits", %{}, timeout: 50)
-    assert message =~ "rendering didn't start within the timeout (50 ms): 1 renders were already running"
+    assert {:error, %RenderError{reason: :busy, diagnostics: [%{message: message}]}} =
+             Typsty.to_pdf("waits", %{}, timeout: 50)
+
+    assert message =~ "rendering didn't start within the timeout (50 ms): 1 render was already running"
 
     # A render that can wait long enough gets the slot once it's free
     assert {:ok, _pdf} = Typsty.to_pdf("waits long enough", %{}, timeout: 30_000)
     assert wait_until_idle() == 0
   end
 
+  test "a render is cancelled when the process waiting for it exits" do
+    caller = spawn(fn -> Typsty.to_pdf(long_document(), %{}, timeout: :infinity) end)
+    assert wait_until(fn -> Typsty.running_renders() == 1 end)
+
+    Process.exit(caller, :kill)
+    assert wait_until_idle(2_000) == 0
+  end
+
+  test "renders don't hold the VM's dirty schedulers while Typst works" do
+    schedulers = :erlang.system_info(:dirty_cpu_schedulers)
+    Application.put_env(:typsty, :max_concurrent_renders, schedulers * 2)
+
+    # More renders than there are dirty CPU schedulers, all running at once
+    renders =
+      for _ <- 1..(schedulers * 2), do: Task.async(fn -> Typsty.to_pdf(long_document(), %{}, timeout: 10_000) end)
+
+    assert wait_until(fn -> Typsty.running_renders() == schedulers * 2 end)
+
+    # Checking syntax runs on a dirty CPU scheduler, which is free
+    {micros, :ok} = :timer.tc(fn -> Typsty.validate("= Hello") end)
+    assert micros < 500_000
+
+    Enum.each(renders, &Task.shutdown(&1, :brutal_kill))
+    assert wait_until_idle() == 0
+  end
+
+  defp wait_until(fun, tries \\ 500) do
+    cond do
+      fun.() -> true
+      tries == 0 -> false
+      true -> Process.sleep(10) && wait_until(fun, tries - 1)
+    end
+  end
+
   test "the limit must be a positive integer" do
     Application.put_env(:typsty, :max_concurrent_renders, 0)
 
-    assert_raise ArgumentError, ~r/:max_concurrent_renders config must be a positive integer/, fn ->
+    message =
+      "invalid value for :max_concurrent_renders option: expected positive integer, got: 0 " <>
+        "(in the :typsty application config)"
+
+    assert_raise ArgumentError, message, fn -> Typsty.to_pdf("x") end
+  end
+
+  # Here rather than with the other option tests, since they change the config, which this
+  # module's tests run on their own for
+  test "the config is checked too, catching typos, but not other modules' config" do
+    Application.put_env(:typsty, :font_path, ["fonts"])
+    on_exit(fn -> Application.delete_env(:typsty, :font_path) end)
+
+    assert_raise ArgumentError, ~r/^unknown options \[:font_path\], .* \(in the :typsty application config\)$/, fn ->
       Typsty.to_pdf("x")
     end
+
+    Application.delete_env(:typsty, :font_path)
+
+    # Rustler reads config :typsty, Typsty.Native; other modules' config would be a mistake
+    Application.put_env(:typsty, Typsty.Native, skip_compilation?: true)
+    on_exit(fn -> Application.delete_env(:typsty, Typsty.Native) end)
+    assert {:ok, _pdf} = Typsty.to_pdf("x")
+
+    Application.put_env(:typsty, Typsty.Pool, size: 2)
+    on_exit(fn -> Application.delete_env(:typsty, Typsty.Pool) end)
+
+    assert_raise ArgumentError,
+                 ~r/config :typsty, Typsty.Pool isn't read: .* a Typsty.Pool's options go in its child spec/,
+                 fn ->
+                   Typsty.to_pdf("x")
+                 end
+
+    Application.delete_env(:typsty, Typsty.Pool)
+    Application.put_env(:typsty, :files, %{"a.txt" => "a"})
+    on_exit(fn -> Application.delete_env(:typsty, :files) end)
+
+    assert_raise ArgumentError, "the :files option can't be set in the config, only given to a render", fn ->
+      Typsty.to_pdf("x")
+    end
+
+    Application.delete_env(:typsty, :files)
+
+    # Options given to a render override the config
+    Application.put_env(:typsty, :ppi, 72)
+    on_exit(fn -> Application.delete_env(:typsty, :ppi) end)
+    assert {:ok, [small]} = Typsty.to_png("#set page(width: 1in, height: 1in)")
+    assert {:ok, [large]} = Typsty.to_png("#set page(width: 1in, height: 1in)", %{}, ppi: 144)
+    assert byte_size(large) > byte_size(small)
   end
 end

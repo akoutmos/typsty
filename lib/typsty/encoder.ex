@@ -2,16 +2,34 @@ defprotocol Typsty.Encoder do
   @moduledoc """
   Converts structs into data that can be passed to a template.
 
-  Structs without an implementation are passed as dictionaries of their fields. `Date`,
-  `Time`, `NaiveDateTime` and `DateTime` become Typst datetimes, and `Decimal` becomes a
-  Typst decimal, without going through this protocol.
+  `Date`, `Time`, `NaiveDateTime`, `DateTime` and `Decimal` become Typst datetimes and
+  decimals, and `MapSet`s and `Range`s become arrays, without this protocol. Other structs
+  must implement it to be passed to a template, so that their internal fields (an Ecto
+  schema's metadata, or a password hash) don't reach templates by accident.
 
-  Implement it to pass a struct differently, such as a money struct as a decimal or as a
-  formatted string:
+  Derive it to pass a struct as a dictionary of its fields, or of some of them:
 
   ```elixir
-  defimpl Typsty.Encoder, for: Money do
-    def encode(money), do: Money.to_string(money)
+  defmodule MyApp.Customer do
+    @derive {Typsty.Encoder, only: [:name, :email]}
+    defstruct [:name, :email, :password_hash]
+  end
+  ```
+
+  `@derive Typsty.Encoder` passes every field, and `except: [...]` leaves some out. For
+  structs from other libraries, derive it with `Protocol.derive/3`:
+
+  ```elixir
+  require Protocol
+  Protocol.derive(Typsty.Encoder, SomeLibrary.Struct, only: [:name])
+  ```
+
+  Or implement it, to pass a struct differently, such as a money struct as a formatted
+  string:
+
+  ```elixir
+  defimpl Typsty.Encoder, for: MyApp.Money do
+    def encode(money), do: MyApp.Money.to_string(money)
   end
   ```
 
@@ -19,13 +37,34 @@ defprotocol Typsty.Encoder do
   booleans, `nil`, dates and decimals, or another struct.
   """
 
-  @fallback_to_any true
-
   @doc "Converts the struct into data for a template."
   @spec encode(t()) :: term()
   def encode(struct)
+
+  @impl Protocol
+  defmacro __deriving__(module, options) do
+    options = Keyword.validate!(options, [:only, :except])
+
+    fields =
+      case options do
+        [] -> quote(do: map)
+        [only: only] when is_list(only) -> quote(do: Map.take(map, unquote(only)))
+        [except: except] when is_list(except) -> quote(do: Map.drop(map, unquote(except)))
+        _other -> raise ArgumentError, "deriving Typsty.Encoder takes either :only or :except, as a list of fields"
+      end
+
+    quote do
+      defimpl Typsty.Encoder, for: unquote(module) do
+        def encode(struct) do
+          map = Map.from_struct(struct)
+          unquote(fields)
+        end
+      end
+    end
+  end
 end
 
-defimpl Typsty.Encoder, for: Any do
-  def encode(%_{} = struct), do: Map.from_struct(struct)
+defimpl Typsty.Encoder, for: MapSet do
+  # In order, so that the same set gives the same array
+  def encode(set), do: set |> MapSet.to_list() |> Enum.sort()
 end

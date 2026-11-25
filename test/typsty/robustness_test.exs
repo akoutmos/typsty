@@ -16,9 +16,9 @@ defmodule Typsty.RobustnessTest do
   describe "deeply nested data" do
     test "is refused before it reaches Typst" do
       error = assert_raise ArgumentError, fn -> Typsty.to_pdf("#v", %{v: nest_list(10_000, 1)}) end
-      assert error.message =~ "v[0][0][0][0][0]…[0][0][0][0] is nested too deeply"
+      assert error.message =~ "assigns.v[0][0][0][0][0]…[0][0][0][0] is nested too deeply"
 
-      assert {:ok, _pdf} = Typsty.to_pdf("#v.len()", %{v: nest_list(200, 1)})
+      assert {:ok, _pdf} = Typsty.to_pdf("#assigns.v.len()", %{v: nest_list(200, 1)})
     end
   end
 
@@ -66,6 +66,15 @@ defmodule Typsty.RobustnessTest do
       assert {:ok, _pdf} = Typsty.to_pdf(gradient)
     end
 
+    test "sizes gradients relative to their parent by the nearest block, not the innermost group" do
+      # The gradient fills the huge block it's in, through the group `scale` adds
+      source =
+        "#place(block(width: 8000000cm, height: 8000000cm)[#scale(100%)[" <>
+          "#rect(width: 1cm, height: 1cm, fill: gradient.linear(red, blue, relative: \"parent\"))]])"
+
+      assert_render_error(Typsty.to_png(source), "a gradient needs")
+    end
+
     test "still renders ordinary pages with many gradients" do
       boxes = for i <- 1..200, into: "", do: "#box(width: 1cm, height: 1cm, fill: gradient.linear(red, blue)) #{i}\n"
       assert {:ok, [_ | _]} = Typsty.to_png(boxes, %{}, ppi: 300)
@@ -97,6 +106,57 @@ defmodule Typsty.RobustnessTest do
     end
   end
 
+  describe "PDF files" do
+    test "are refused inside the VM, where a malformed one could crash it" do
+      pdf = "%PDF-1.7\n1 0 obj << /Type /Catalog >> endobj\n"
+
+      for {name, contents} <- [{"doc.pdf", pdf}, {"renamed.png", "junk\n" <> pdf}, {"no-header.pdf", "junk"}] do
+        result = Typsty.to_pdf("#image(\"#{name}\")", %{}, files: %{name => contents})
+        assert_render_error(result, "PDF files can't be used when rendering inside the VM")
+      end
+    end
+  end
+
+  describe "compressed SVGs and XML entities" do
+    test "are refused when they expand too much" do
+      bomb = :zlib.gzip(:binary.copy(" ", 129 * 1024 * 1024))
+      result = Typsty.to_pdf("#image(\"i.svgz\")", %{}, files: %{"i.svgz" => bomb})
+      assert_render_error(result, "the compressed file expands to more than 128 MiB")
+
+      laughs = ~s(<!DOCTYPE a [<!ENTITY a "aaaaaaaaaa"><!ENTITY b "&a;&a;&a;&a;">]><a>&b;&b;</a>)
+      result = Typsty.to_pdf(~S|#xml("d.xml")|, %{}, files: %{"d.xml" => laughs})
+      assert_render_error(result, "an XML entity that contains markup or refers to other entities")
+
+      # Flat entities, like the ones Adobe Illustrator writes, are fine
+      svg =
+        ~s(<!DOCTYPE svg [<!ENTITY ns "http://www.w3.org/2000/svg">]>) <>
+          ~s(<svg xmlns="&ns;" width="10" height="10"><rect width="10" height="10"/></svg>)
+
+      assert {:ok, _pdf} = Typsty.to_pdf(~S|#image("i.svg", width: 1cm)|, %{}, files: %{"i.svg" => svg})
+    end
+
+    test "data files that only look like images or XML aren't refused" do
+      files = %{
+        # imagesize takes "BM" for a bitmap's header
+        "cars.csv" => "BMW,1\nAudi,2\n",
+        "page.html" => "<html><body>" <> String.duplicate("line<br>", 2000) <> "</body></html>"
+      }
+
+      assert {:ok, _pdf} = Typsty.to_pdf(~S|#csv("cars.csv").len() #read("page.html").len()|, %{}, files: files)
+    end
+  end
+
+  describe "file paths" do
+    test "a render that reads too many different files is stopped" do
+      # Errors in context blocks don't stop Typst, so this would go on to use up Typst's
+      # table of file paths, which lasts for the life of the VM
+      source = "#for i in range(10001) { context read(\"many/\" + str(i)) }"
+      assert_render_error(Typsty.to_pdf(source), "the document reads more than 10000 different files")
+
+      assert {:ok, _pdf} = Typsty.to_pdf("still works")
+    end
+  end
+
   describe "deeply nested SVG and XML" do
     test "are refused before Typst parses them" do
       svg =
@@ -120,11 +180,34 @@ defmodule Typsty.RobustnessTest do
 
     @tag :unix
     test "refuses devices and FIFOs, which would never finish reading", %{tmp_dir: dir} do
-      File.ln_s!("/dev/zero", Path.join(dir, "zero.txt"))
       {_, 0} = System.cmd("mkfifo", [Path.join(dir, "pipe.txt")])
-
-      assert_render_error(Typsty.to_pdf(~S|#read("zero.txt")|, %{}, root: dir), "is not a regular file")
       assert_render_error(Typsty.to_pdf(~S|#read("pipe.txt")|, %{}, root: dir), "is not a regular file")
+    end
+
+    @tag :unix
+    test "refuses symbolic links that lead outside the root", %{tmp_dir: dir} do
+      root = Path.join(dir, "root")
+      File.mkdir_p!(Path.join(root, "assets"))
+      File.write!(Path.join(dir, "secret.txt"), "secret")
+      File.write!(Path.join(root, "assets/inside.txt"), "inside")
+
+      File.ln_s!(Path.join(dir, "secret.txt"), Path.join(root, "secret.txt"))
+      File.ln_s!("/dev/zero", Path.join(root, "zero.txt"))
+      File.ln_s!(Path.join(root, "assets"), Path.join(root, "linked"))
+
+      for name <- ["secret.txt", "zero.txt"] do
+        result = Typsty.to_pdf(~s|#read("#{name}")|, %{}, root: root)
+        assert_render_error(result, "/#{name} is outside the :root directory, through a symbolic link")
+      end
+
+      # Links that stay inside the root are fine
+      assert {:ok, _pdf} = Typsty.to_pdf(~S|#assert.eq(read("linked/inside.txt"), "inside")|, %{}, root: root)
+
+      # Files outside the root can't be named either
+      File.write!(Path.join(dir, "outside.txt"), "outside")
+      result = Typsty.to_pdf(~S|#read("../outside.txt")|, %{}, root: root)
+      assert {:error, %RenderError{diagnostics: [%{hints: hints}]}} = result
+      assert "files outside the project root can only be read by changing the :root option" in hints
     end
   end
 
@@ -134,7 +217,7 @@ defmodule Typsty.RobustnessTest do
       assert_render_error(Typsty.to_pdf(slow, %{}, timeout: 50), "didn't finish within the timeout (50 ms)")
       assert {:ok, _pdf} = Typsty.to_pdf("still works", %{}, timeout: :infinity)
 
-      assert_raise ArgumentError, ~r/:timeout option must be a positive integer or :infinity/, fn ->
+      assert_raise ArgumentError, ~r/invalid value for :timeout option: expected a positive integer/, fn ->
         Typsty.to_pdf("x", %{}, timeout: 0)
       end
     end

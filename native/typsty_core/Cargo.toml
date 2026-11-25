@@ -1,0 +1,31 @@
+[package]
+name = "typsty_core"
+description = "Compiles and exports Typst documents for Typsty's NIF and worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+comemo.workspace = true
+typst.workspace = true
+typst-kit.workspace = true
+typst-layout.workspace = true
+typst-pdf.workspace = true
+typst-render.workspace = true
+typst-svg.workspace = true
+typstyle-core.workspace = true
+time.workspace = true
+# Typst's thread pool, configured with large stacks
+rayon.workspace = true
+# Reads image dimensions from headers, to refuse decompression bombs before decoding
+imagesize.workspace = true
+# Decompresses compressed SVGs with a limit, to refuse ones that expand too much
+flate2.workspace = true
+# Parses XML and SVG files the way Typst does, to measure their depth and find the images
+# an SVG embeds, and scans files for the signs of formats that are unsafe to decode
+roxmltree.workspace = true
+data-url.workspace = true
+memchr.workspace = true
+# Opens files without blocking on FIFOs
+libc.workspace = true

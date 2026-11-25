@@ -36,8 +36,6 @@ defmodule Typsty.Formatter do
 
   @behaviour Mix.Tasks.Format
 
-  @default_line_length 98
-
   @heredoc_delimiters [~s("""), ~s(''')]
 
   @impl Mix.Tasks.Format
@@ -55,10 +53,15 @@ defmodule Typsty.Formatter do
   end
 
   defp do_format(source, opts) do
+    typst_opts = Typsty.Options.formatter!(opts)
+
+    # Typsty.format/2's defaults, except that the line length follows the formatter's own
+    defaults = Typsty.Options.format_defaults()
+
     format_opts = [
-      line_length: opts[:typst_line_length] || opts[:line_length] || @default_line_length,
-      indent: opts[:typst_indent] || 2,
-      wrap_text: Keyword.get(opts, :typst_wrap_text, false)
+      line_length: typst_opts[:typst_line_length] || opts[:line_length] || defaults[:line_length],
+      indent: Keyword.get(typst_opts, :typst_indent, defaults[:indent]),
+      wrap_text: Keyword.get(typst_opts, :typst_wrap_text, defaults[:wrap_text])
     ]
 
     case Typsty.format(source, format_opts) do
@@ -87,7 +90,7 @@ defmodule Typsty.Formatter do
     end
   end
 
-  # A sigil on one line, like ~TYPST"*#name*", stays on one line, and is left as it is when
+  # A sigil on one line, like ~TYPST"*#assigns.name*", stays on one line, and is left as it is when
   # formatting would add its closing delimiter, which would have to be escaped
   defp single_line(formatted, source, opening_delimiter) do
     formatted = String.trim_trailing(formatted, "\n")
@@ -109,11 +112,16 @@ defmodule Typsty.Formatter do
 
   defp count(text, pattern), do: length(:binary.matches(text, pattern))
 
-  # The template's position, to point syntax errors at the file being formatted
+  # The template's position, to point syntax errors at the file being formatted. For a
+  # sigil, the formatter is told its line, but not its column or indentation, so errors in
+  # it point at lines only.
   defp template(source, opts) do
-    line = opts[:line] || 1
-    line = if opts[:opening_delimiter] in @heredoc_delimiters, do: line + 1, else: line
-
-    %Typsty.Template{source: source, file: opts[:file], line: line}
+    if Keyword.has_key?(opts, :sigil) do
+      line = opts[:line] || 1
+      line = if opts[:opening_delimiter] in @heredoc_delimiters, do: line + 1, else: line
+      %Typsty.Template{source: source, file: opts[:file], line: line, column: nil, indentation: nil}
+    else
+      %Typsty.Template{source: source, file: opts[:file]}
+    end
   end
 end
