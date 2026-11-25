@@ -188,13 +188,15 @@ defmodule Typsty.PoolTest do
       assert {:error, %RenderError{reason: :memory_limit, diagnostics: [%{message: message}]}} = result
       assert message == "the render used more than the pool's memory limit (300000000 bytes), and was stopped"
 
-      # Typst's Roman numerals of huge numbers never finish allocating
-      roman = "#counter(\"x\").update(9223372036854775807)#context counter(\"x\").display(\"I\")"
-      assert {:error, %RenderError{reason: :memory_limit}} = Typsty.to_pdf(roman, %{}, pool: pool)
+      # A table with a column for every number, as a template that sizes its work by its data
+      # can make, which would end the VM
+      table = "#table(columns: assigns.n)"
+      assert {:error, %RenderError{reason: :memory_limit}} = Typsty.to_pdf(table, %{n: 100_000_000_000}, pool: pool)
 
-      # So does a string repeated enough times, which would end the VM
-      huge = ~S|#let s = "a" * 4611686018427387904|
-      assert {:error, %RenderError{reason: :memory_limit}} = Typsty.to_pdf(huge, %{}, pool: pool)
+      # So does a string repeated enough times (one that would take more than 1 GiB is
+      # refused before it's allocated, in the pool and inside the VM)
+      large = ~S|#let s = "a" * 500000000|
+      assert {:error, %RenderError{reason: :memory_limit}} = Typsty.to_pdf(large, %{}, pool: pool)
 
       assert {:ok, _pdf} = Typsty.to_pdf("the pool still works", %{}, pool: pool)
     end
@@ -281,9 +283,11 @@ defmodule Typsty.PoolTest do
   end
 
   test "invalid options raise" do
-    assert_raise ArgumentError, "invalid value for :size option: expected positive integer, got: 0", fn ->
-      Pool.start_link(size: 0)
-    end
+    assert_raise ArgumentError,
+                 "invalid value for :size option: expected a positive integer of at most 10000, got: 0",
+                 fn ->
+                   Pool.start_link(size: 0)
+                 end
 
     assert_raise ArgumentError,
                  "invalid value for :memory_limit option: expected a positive integer or nil, got: -1",
@@ -308,5 +312,50 @@ defmodule Typsty.PoolTest do
     assert_raise ArgumentError, ~r/the :memory_limit option \(1000 bytes\) is too low for a worker to start/, fn ->
       Pool.start_link(memory_limit: 1_000)
     end
+
+    # Enough to start, but not to load the fonts renders use
+    assert_raise ArgumentError, ~r/the :memory_limit option \(1500000 bytes\) is too low for a worker to/, fn ->
+      Pool.start_link(memory_limit: 1_500_000)
+    end
+  end
+
+  @tag pool_opts: [memory_limit: 100_000_000]
+  test "a request that fits under the memory limit, but not in what a worker has left, is a memory error",
+       %{pool: pool} do
+    files = %{"big.bin" => :binary.copy(<<0>>, 99_900_000)}
+
+    assert {:error, %RenderError{reason: :memory_limit, diagnostics: [%{message: message}]}} =
+             Typsty.to_pdf("x", %{}, pool: pool, files: files)
+
+    assert message =~ "more than the render's worker had room for under the pool's memory limit (100000000 bytes)"
+    assert {:ok, _pdf} = Typsty.to_pdf("still works", %{}, pool: pool)
+  end
+
+  @tag pool_opts: [size: 1]
+  test "a worker that was given many file names is replaced before it has to refuse new ones", %{pool: pool} do
+    # 108,000 names in all, more than one process can be given
+    for round <- 1..12 do
+      files = for i <- 1..9_000, into: %{}, do: {"r#{round}/#{i}.txt", "x"}
+      assert {:ok, _pdf} = Typsty.to_pdf("x", %{}, pool: pool, files: files)
+    end
+  end
+
+  test "the :pool option must be a Typsty.Pool, not another kind of NimblePool" do
+    other = start_supervised!({NimblePool, worker: {__MODULE__.OtherPool, nil}, pool_size: 1})
+
+    assert_raise ArgumentError, ~r/the :pool option must be a Typsty.Pool/, fn ->
+      Typsty.to_pdf("x", %{}, pool: other)
+    end
+  end
+
+  defmodule OtherPool do
+    @moduledoc false
+    @behaviour NimblePool
+
+    @impl NimblePool
+    def init_worker(pool_state), do: {:ok, :worker, pool_state}
+
+    @impl NimblePool
+    def handle_checkout(_command, _from, worker, pool_state), do: {:ok, worker, worker, pool_state}
   end
 end
