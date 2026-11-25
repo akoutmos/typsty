@@ -6,7 +6,7 @@ defmodule Mix.Tasks.Typsty.Packages.Get do
   templates can import them.
 
   ```shell
-  mix typsty.packages.get @preview/cetz:0.4.2 @preview/tablex:0.0.9
+  mix typsty.packages.get @preview/cetz:0.4.2 @preview/oxifmt:1.0.0
   ```
 
   Packages are saved in `priv/typst/packages`, laid out as `namespace/name/version` like
@@ -36,7 +36,7 @@ defmodule Mix.Tasks.Typsty.Packages.Get do
 
   ```elixir
   # config/config.exs
-  config :typsty, packages: ["@preview/cetz:0.4.2", "@preview/tablex:0.0.9"]
+  config :typsty, packages: ["@preview/cetz:0.4.2", "@preview/oxifmt:1.0.0"]
   ```
 
   ```shell
