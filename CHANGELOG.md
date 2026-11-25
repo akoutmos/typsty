@@ -7,7 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-The first release.
+The first release, with Typst 0.15.1. The NIF and the pool's worker are precompiled for macOS (Apple Silicon and
+Intel), Linux (x86-64 and ARM64, glibc and musl) and Windows (x86-64).
 
 ### Added
 
@@ -16,8 +17,10 @@ The first release.
 - `Typsty.to_pdf/3`, `Typsty.to_png/3` and `Typsty.to_svg/3` for templates and Typst source.
 - The assigns (a map) are passed to the template as a dictionary named `assigns` (`#assigns.name`), as Typst values
   rather than generated code, so they never shadow anything in Typst: strings, numbers, booleans, `nil`, lists,
-  tuples, maps (as dictionaries sorted by key), dates and times, and decimals. Structs are passed as dictionaries, or
-  as `Typsty.Encoder` encodes them. Using an assign that wasn't given comes with a hint that says so.
+  tuples, maps (as dictionaries sorted by key), dates and times, decimals, `MapSet`s and `Range`s. Other structs
+  implement `Typsty.Encoder`, by deriving it (`@derive {Typsty.Encoder, only: [...]}`) or implementing it. Using an
+  assign that wasn't given comes with a hint that says so. Imported files can read the assigns from
+  `sys.inputs.assigns`.
 - A virtual file system: images, data files and `.typ` files are passed as binaries with the `:files` option. Files
   can also be read from a `:root` directory, which documents can't read outside of, even through symbolic links.
 - Fonts from the system, from Typst's embedded fonts and from `:font_paths`, scanned once per font configuration and
@@ -53,10 +56,14 @@ The first release.
     run at once, counting cancelled renders still winding down, and `Typsty.running_renders/0` reports how many are
     running.
   - Assigns are nested at most 256 levels deep.
-  - Files are checked before Typst decodes them: images claiming more than 134 megapixels, SVG and XML files nested
-    more than 1,024 levels deep, compressed SVGs expanding past 128 MiB and XML entities that nest or expand past
-    16 MiB are refused, as are PDF files (which renders in a `Typsty.Pool` can read). Only regular files are read from
-    disk.
+  - Files are checked before Typst decodes them: images claiming more than 134 megapixels (including images inside
+    SVGs), SVG and XML files nested more than 1,024 levels deep, compressed SVGs expanding past 128 MiB, XML entities
+    that nest or expand past 16 MiB, CBOR that declares more items than it holds and deeply nested bibliographies are
+    refused, as are PDF files and SVGs inside SVGs (which renders in a `Typsty.Pool` can read). Only regular files of
+    at most 512 MiB are read from disk.
   - PNG export refuses pages that would need more than 2^28 pixels of textures.
   - Typst keeps every file path for the life of the VM, with room for 65,535: a render may use at most 10,000 paths,
     at most 50,000 may be given in `:files`, and renders needing a new path are stopped before the table runs out.
+    A `Typsty.Pool` replaces a worker whose table is nearly full.
+- `THIRD_PARTY_NOTICES.txt`, with the licenses of what the precompiled binaries are built from, which ships with
+  them.

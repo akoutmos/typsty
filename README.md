@@ -56,8 +56,11 @@ def deps do
 end
 ```
 
-Typsty compiles documents with the Typst compiler through a Rust NIF, which is
-downloaded precompiled for your platform, so you don't need Rust installed.
+Typsty compiles documents with Typst 0.15 through a Rust NIF, which is
+downloaded precompiled for your platform, so you don't need Rust installed. The
+download is about 40 MB (82 MB unpacked, in `priv/native`), since it has both
+the NIF and the program `Typsty.Pool` runs, which each include Typst and its
+fonts.
 
 Documentation can be found at [https://hexdocs.pm/typsty](https://hexdocs.pm/typsty).
 
@@ -190,7 +193,8 @@ format dates:
 | maps                                             | `dictionary`, with string keys, sorted      |
 | `Date`, `Time`, `NaiveDateTime`, `DateTime`      | `datetime` (`DateTime` keeps its wall time) |
 | `Decimal`                                        | `decimal`                                   |
-| other structs                                    | `dictionary`, or see `Typsty.Encoder`       |
+| `MapSet`, `Range`                                | `array`                                     |
+| other structs                                    | see `Typsty.Encoder`                        |
 
 The assigns are a map with atom or string keys. A template reads keys that
 aren't Typst identifiers with `at` (`assigns.at("invoice number")`), and assigns
@@ -205,7 +209,19 @@ dictionaries. Typst's datetimes have no time zone or fractions of a second, so
 a `DateTime` keeps its wall time and times are truncated to the second, and its
 decimals have 28 significant digits.
 
-Implement `Typsty.Encoder` to pass your own structs differently:
+Other structs are passed when they implement `Typsty.Encoder`, so that their
+internal fields (an Ecto schema's metadata, or a password hash) don't reach
+templates by accident. Derive it to pass a struct as a dictionary of its
+fields, or some of them:
+
+```elixir
+defmodule MyApp.Customer do
+  @derive {Typsty.Encoder, only: [:name, :email]}
+  defstruct [:name, :email, :password_hash]
+end
+```
+
+or implement it to pass a struct differently:
 
 ```elixir
 defimpl Typsty.Encoder, for: MyApp.Money do
@@ -241,7 +257,7 @@ where their data comes from:
 #line-items(assigns.items)
 ```
 
-(Imported files and packages can also read the assigns from `sys.inputs`.)
+(Imported files can also read the assigns from `sys.inputs.assigns`.)
 
 `render/1` gets the assigns first, so it can compute values for the template
 with all of Elixir:
@@ -281,18 +297,22 @@ MyApp.Report.to_pdf(assigns,
 
 Without the `:root` option, a document can only read the files it's given. Set
 `:root` to a directory to also read files from it (files in `:files` take
-precedence). Documents can't read outside it, even through symbolic links.
+precedence). Documents can't read outside it, even through symbolic links, and
+may read files of up to 512 MiB from it. `main.typ` is the template itself.
 
 Typst keeps every file path it has seen for the life of the VM, and has room for
-65,535 of them, so use stable names like `logo.png` or `photos/42.jpg` rather
-than a new unique name for every render. Typsty stops a render that reads more
-than 10,000 different files, refuses new paths in `:files` after 50,000 have
-been given, and stops renders that need a new path once the table is nearly
-full, rather than let it overflow. Typst keeps label names for the life of the
-VM too, so make labels from fixed names (`<total>`), not from data such as ids.
+65,535 of them, so use stable names like `logo.png` rather than a new unique
+name for every render; a template that builds paths from data, like
+`image("photos/" + assigns.id)`, uses a new one for every id. Typsty stops a
+render that reads more than 10,000 different files, and stops renders that need
+a new path once the table is nearly full, rather than let it overflow; inside
+the VM, that lasts until the VM restarts, while a `Typsty.Pool` replaces its
+workers. Typst keeps label names and bibliography keys for the life of the VM
+too, so make labels from fixed names (`<total>`), not from data such as ids.
 
-Renders inside the VM can't read PDF files (to use a PDF as an image, say),
-since a malformed PDF can crash the VM. Renders in a `Typsty.Pool` can.
+Renders inside the VM can't read PDF files (to use a PDF as an image, say), or
+SVG images that contain other SVG images, since decoding them can crash the VM.
+Renders in a `Typsty.Pool` can.
 
 ## Fonts
 
@@ -397,7 +417,7 @@ emits [telemetry](https://hexdocs.pm/telemetry) events (see `Typsty.Telemetry`).
 ## Running Typst inside the BEAM
 
 Typsty runs Typst in a NIF, inside your VM, so a crash in it would take the
-whole VM down. It's built so that the data you render with can't crash it:
+whole VM down. It's built to protect the VM from what you render with:
 
 - **Renders don't hold up the VM.** Each render runs on a thread of its own,
   outside the BEAM's schedulers, and the process that asked for it waits for a
@@ -423,20 +443,33 @@ whole VM down. It's built so that the data you render with can't crash it:
   cancelled. New renders wait for a slot within their timeout, so renders that
   keep timing out can't pile up in the background. `Typsty.running_renders/0`
   reports how many are running.
-- **Data is checked before Typst gets it.** Assigns can be nested at most
-  256 levels deep. Images whose header claims more than 134 megapixels are
-  refused before they're decoded (a small file can claim to be enormous), as
-  are SVG and XML files nested more than 1,024 levels deep, compressed SVGs
-  that expand past 128 MiB, XML entities that nest or expand past 16 MiB, and
-  PDF files. Files are only read from `:root` and package directories if they
-  are regular files inside them, so a symbolic link can't lead elsewhere, and
-  a link to `/dev/zero` or a FIFO can't hang a render.
+- **Assigns are safe.** They're converted to Typst values, nested at most 256
+  levels deep, with numbers and dates checked against what Typst can hold. A
+  template can't do anything with them that it couldn't do with values it
+  wrote itself.
+- **Files are checked before Typst decodes them**, for the files known to
+  crash or hang its decoders: images whose header claims more than 134
+  megapixels (a small file can claim to be enormous), including images inside
+  SVGs; SVG and XML files nested more than 1,024 levels deep; compressed SVGs
+  that expand past 128 MiB; XML entities that nest or expand past 16 MiB; CBOR
+  that declares more items than it holds; deeply nested bibliographies; PDF
+  files. Files are only read from `:root` and package directories if they are
+  regular files inside them, so a symbolic link can't lead elsewhere, and a
+  link to `/dev/zero` or a FIFO can't hang a render.
 - **PNG export is checked before rasterizing.** A page, and the images,
   gradients and tilings on it, may use at most 2^28 pixels of textures (1 GiB),
   so an extreme `:ppi` or content far larger than the page returns an error
   instead of an allocation that would fail.
 - **File paths are rationed**, since Typst keeps every path it sees for the
   life of the VM and breaks for good after 65,535 of them (see [Files](#files)).
+
+Typst decodes many formats, with many libraries, and the checks can't promise
+to catch every hostile file. **Render documents that read files from people
+you don't trust, such as uploads, in a `Typsty.Pool` with a `:memory_limit`.**
+Only the files a document reads are checked: data a template turns into bytes
+itself (`image(bytes(assigns.svg))`) isn't, so pass such data as a file. An SVG
+can read other files in the project by linking them, so don't give documents a
+`:root` that holds other people's files.
 
 A template, though, is code. Like any code, it can loop for a long time, and
 it can ask for as much memory as it likes (`range(n)`, `"x" * n`, and so on).
@@ -477,11 +510,14 @@ Renders return what they return without a pool: the same output and the same
 warnings and errors, pointing at the same lines (and they can read PDF files).
 A worker that's stopped is replaced, and workers end when the pool stops, when
 the process rendering with them exits and when the VM exits. A pool that stops
-during a render returns an error to the process waiting for it.
+before or during a render returns an error to the process waiting for it. A
+new worker loads the fonts renders use by default before it takes renders.
 
 The memory limit counts everything a worker allocates, including the fonts it
 has loaded and Typst's caches, and each worker keeps its own, so leave room for
-them; see `Typsty.Pool`.
+them; see `Typsty.Pool`. Without a memory limit, a render that allocates
+without bound can make the system run out of memory, and the system may then
+end the BEAM rather than the worker.
 
 The pool's workers run `typsty_worker`, a program built from the same code as
 the NIF, which comes with it. Rendering in a worker copies the template, the
@@ -558,7 +594,7 @@ later, add Rustler to your dependencies:
 and set `TYPSTY_BUILD=1` when compiling:
 
 ```shell
-TYPSTY_BUILD=1 mix deps.compile typsty --force
+TYPSTY_BUILD=1 mix deps.compile typsty --force --include-children
 ```
 
 or, to always build it from source, configure RustlerPrecompiled:
@@ -568,7 +604,13 @@ config :rustler_precompiled, :force_build, typsty: true
 ```
 
 Development versions of Typsty (such as a Git dependency on `master`) are always
-built from source, so they need Rust and the Rustler dependency too.
+built from source, so they need Rust and the Rustler dependency too, as does a
+Git dependency on a release's tag (with `TYPSTY_BUILD=1`).
+
+If downloading the precompiled NIF fails with a TLS error such as
+`unsupported_certificate`, update Erlang/OTP: some patch releases (such as
+27.2) don't accept the certificates GitHub's downloads use. Building from
+source works too.
 
 ## Attribution
 
@@ -576,9 +618,11 @@ built from source, so they need Rust and the Rustler dependency too.
   wrapper for (Apache License 2.0)
 - [typstyle](https://github.com/typstyle-rs/typstyle), the Typst formatter
   behind `Typsty.Formatter` (Apache License 2.0)
-- The precompiled NIF includes the fonts that come with Typst, through
-  [typst-assets](https://github.com/typst/typst-assets), under their own
-  licenses
+- The precompiled NIF and worker include the fonts that come with Typst,
+  through [typst-assets](https://github.com/typst/typst-assets), and many Rust
+  crates, under their own licenses: see
+  [THIRD_PARTY_NOTICES.txt](https://github.com/akoutmos/typsty/blob/master/THIRD_PARTY_NOTICES.txt), which is also in
+  `priv/native`
 - The Elixir [typst](https://hex.pm/packages/typst) and
   [typster](https://hex.pm/packages/typster) packages, whose virtual file system
   and variables inspired Typsty's
