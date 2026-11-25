@@ -41,8 +41,9 @@ Intel), Linux (x86-64 and ARM64, glibc and musl) and Windows (x86-64).
 - Telemetry events for every render.
 - Options checked with NimbleOptions, in calls and in the application config (where unknown keys are typos), with
   errors that name the option, and option docs and typespecs generated from the same schemas.
-- `Typsty.Pool`, a pool of worker processes to render in, with the `:pool` option (per render, or in the config). A
-  render that runs past its timeout is stopped right away, a render can be given a memory limit (`:memory_limit`),
+- `Typsty.Pool`, a pool of worker processes to render in, with the `:pool` option (per render, or in the config),
+  favored for input from untrusted users that isn't well validated. A render that runs past its timeout is stopped
+  right away, a render can be given a memory limit (`:memory_limit`),
   and a worker that crashes takes nothing else down. Workers get only the environment variables that finding fonts
   needs. Workers are replaced when they're stopped, can be recycled after
   a number of renders (`:max_renders`), and end with the pool, with the process rendering with them, and with the VM.
@@ -59,11 +60,6 @@ Intel), Linux (x86-64 and ARM64, glibc and musl) and Windows (x86-64).
   - Assigns are nested at most 256 levels deep.
   - Links can only go to http, https, mailto and tel URLs (or relative ones): others, such as `javascript:` URLs
     from a template's data, are left out of PDFs and SVGs with a warning. SVGs escape the URLs that Typst doesn't.
-  - Numbering a large number with Roman, Greek, Armenian or Hebrew numerals, or with symbols (`*`), falls back to
-    Arabic numerals with a warning, instead of writing a symbol for every thousand (or million), through a patched
-    copy of Typst's codex crate.
-  - A string or array that would take more than 1 GiB (`"x" * n`, `range(n)`, or `qty * price` when a user sends a
-    string) is an error rather than an allocation that would fail, through a patched copy of the ecow crate.
   - PNG export refuses content placed far off the page, which takes minutes to draw.
   - Renders with large assigns or files (over 32 MiB) drop Typst's caches when they finish, rather than keep them
     for later renders.

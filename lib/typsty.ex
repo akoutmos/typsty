@@ -209,9 +209,7 @@ defmodule Typsty do
 
   - **Assigns** are converted to Typst values, with limits on how deeply they nest and on
     the size of numbers and dates. They're data, never code: a template can't do anything
-    with them that it couldn't do with values it wrote itself. Strings and arrays that
-    would take more than 1 GiB (`"x" * n`, `range(n)`) are errors, rather than allocations
-    that would fail.
+    with them that it couldn't do with values it wrote itself.
   - **Files** (in `:files`, or under `:root`) are checked before Typst decodes them, for the
     files known to crash or hang its decoders: images that claim to be enormous, compressed
     SVGs, XML entities and PNG color profiles that expand without bound, SVGs with content
@@ -227,11 +225,17 @@ defmodule Typsty do
 
   A template, though, is code. A template that loops forever is stopped at its timeout only
   when it next calls into Typst, and what it does with its data decides how much work it
-  does: `table(columns: assigns.columns)` takes as much memory as the number says, and an
-  allocation that fails ends the VM. Check the types and sizes of data from users in Elixir
-  before rendering (as an Ecto changeset that casts it does), and render documents that use
-  data from people you don't trust, or templates you don't control, in a `Typsty.Pool`
-  with a `:memory_limit`, where such a render only ends its worker.
+  does: `"x" * assigns.n`, `range(assigns.n)` and `table(columns: assigns.n)` take as much
+  memory as the number says, and an allocation that fails ends the VM. A value of the wrong
+  type changes what an operation does, too: `#(item.qty * item.price)` repeats a string
+  when a user sends one as the quantity.
+
+  Rendering inside the VM is the right choice for well validated data: data your
+  application built, or that came from users through an Ecto changeset that cast its types
+  and checked its sizes. **Favor a `Typsty.Pool` with a `:memory_limit` for input from
+  untrusted users that isn't well validated**, such as request parameters passed to a
+  template as they are, and for templates you don't control: there, such a render only
+  ends its worker.
 
   ## Warnings
 

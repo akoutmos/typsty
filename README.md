@@ -464,10 +464,6 @@ whole VM down. It's built to protect the VM from what you render with:
   https, mailto and tel URLs (or relative ones): a link to another kind, such
   as a `javascript:` URL from a user, is left out of PDFs and SVGs, with a
   warning.
-- **Huge values are errors.** A string or array that would take more than
-  1 GiB (`"x" * n`, `range(n)`, or `qty * price` when a user sends a string as
-  `qty`) is an error rather than an allocation that would fail, as is
-  numbering a huge number with Roman numerals.
 - **Files are checked before Typst decodes them**, for the files known to
   crash or hang its decoders: images whose header claims more than 134
   megapixels (a small file can claim to be enormous), including images inside
@@ -499,24 +495,42 @@ can read other files in the project by linking them, so don't give documents a
 
 A template, though, is code. Like any code, it can loop for a long time, and
 it can ask for as much memory as it likes. An allocation that fails ends the VM
-at once, whatever memory is free, and some of Typst's libraries end the process
+at once, whatever memory is free (a template that asks for an exabyte doesn't
+wait for the machine to run out), and some of Typst's libraries end the process
 on a panic in the middle of drawing. Typsty can't stop all of that inside the
 VM. What a template does with its data decides how much work it does:
-`table(columns: assigns.columns)`, `heading(level: assigns.level)` and
-`lorem(assigns.words)` take as much time and memory as the number says, and
-syntax highlighting a long text (`raw(assigns.code, lang: "js")`) takes time
-that grows faster than its length, which can't be cancelled. So:
 
-- Check the data that comes from users in Elixir before rendering, its types
-  as well as its sizes (an Ecto changeset that casts it does), or
-- render documents that use data from people you don't trust, or templates you
-  don't write, in a `Typsty.Pool` with a `:memory_limit`, where the worst a
-  render can do is end its worker.
+- `"x" * assigns.n`, `range(assigns.n)`, `table(columns: assigns.n)`,
+  `heading(level: assigns.n)` and `lorem(assigns.n)` take as much memory or
+  time as the number says.
+- Numbering a huge number with Roman numerals or symbols
+  (`numbering("I", assigns.n)`, or a counter or `enum(start: ...)` set from the
+  data) writes a symbol for every thousand.
+- A value of the wrong type changes what an operation does: an invoice line's
+  `#(item.qty * item.price)` repeats a string when a user sends `"AAAAA"` as
+  the quantity, as many times as the price says.
+- Syntax highlighting a long text (`raw(assigns.code, lang: "js")`) takes time
+  that grows faster than its length, which can't be cancelled.
+
+### Which to use
+
+Rendering inside the VM is the right choice for data that's well validated:
+data your application built itself, or that came from users through an Ecto
+changeset that cast its types and checked its sizes (`validate_number/3`,
+`validate_length/3`) before it was saved to your database.
+
+**Favor a `Typsty.Pool` with a `:memory_limit` for input from untrusted users
+that isn't well validated**, such as request parameters passed to a template
+as they are, or uploaded files, and for templates you don't write. In a pool,
+the worst a render can do is end its worker: the render returns an error, and
+the worker is replaced.
 
 ## Rendering in separate processes
 
 `Typsty.Pool` runs renders in a pool of separate OS processes, which it can end
-at any moment. That gives you guarantees the NIF can't:
+at any moment. It's the way to render input from untrusted users that isn't
+well validated (see [Which to use](#which-to-use)), since it gives you
+guarantees the NIF can't:
 
 - A render that runs past its timeout is **stopped right away**, whatever it's
   doing, including pure computation.

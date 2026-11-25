@@ -2,12 +2,13 @@ defmodule Typsty.Pool do
   @moduledoc """
   A pool of worker processes that render documents outside of the BEAM.
 
-  By default, Typsty renders inside your VM. That's the fastest way to render, and it's
-  protected against everything the data can do (see
+  By default, Typsty renders inside your VM. That's the fastest way to render, and the
+  right one for well validated data (see
   [What a template can do](Typsty.html#module-what-a-template-can-do)). A template is code,
-  though, and a template that loops for a long time or allocates without bound can only be
-  stopped by ending the process it runs in. The pool runs renders in separate OS processes,
-  so that it can:
+  though, and a template that loops for a long time or allocates without bound, as data
+  can make it do, can only be stopped by ending the process it runs in. Favor a pool for
+  input from untrusted users that isn't well validated, and for files they upload. The
+  pool runs renders in separate OS processes, so that it can:
 
   - **stop a render at its timeout**, whatever it's doing, by ending its worker
   - **limit the memory** a render can use, ending its worker when it goes over
