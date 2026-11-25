@@ -148,7 +148,7 @@ assigns = %{
   items: [%{name: "Widget", price: Decimal.new("19.99")}, %{name: "Gadget", price: Decimal.new("5.01")}]
 }
 
-files = %{"logo.png" => File.read!("priv/static/images/logo.png")}
+files = %{"logo.png" => File.read!(Application.app_dir(:my_app, "priv/static/images/logo.png"))}
 
 {:ok, pdf} = MyApp.Invoice.to_pdf(assigns, files: files)
 {:ok, [first_page | _]} = MyApp.Invoice.to_png(assigns, files: files, ppi: 300)
@@ -284,7 +284,7 @@ MyApp.Report.to_pdf(assigns,
     "logo.png" => logo,
     "charts/revenue.svg" => chart_svg,
     "data/sales.csv" => csv,
-    "components.typ" => File.read!("priv/typst/components.typ")
+    "components.typ" => File.read!(Application.app_dir(:my_app, "priv/typst/components.typ"))
   }
 )
 ```
@@ -295,6 +295,11 @@ MyApp.Report.to_pdf(assigns,
 #let sales = csv("data/sales.csv")
 ```
 
+Name files yourself, rather than with names that come from users (an upload's
+file name, say): a `.typ` file in `:files` takes the place of the one the
+template imports, which would let a user run their own Typst code. Use names
+like `uploads/#{id}.png`.
+
 Without the `:root` option, a document can only read the files it's given. Set
 `:root` to a directory to also read files from it (files in `:files` take
 precedence). Documents can't read outside it, even through symbolic links, and
@@ -304,8 +309,10 @@ Typst keeps every file path it has seen for the life of the VM, and has room for
 65,535 of them, so use stable names like `logo.png` rather than a new unique
 name for every render; a template that builds paths from data, like
 `image("photos/" + assigns.id)`, uses a new one for every id. Typsty stops a
-render that reads more than 10,000 different files, and stops renders that need
-a new path once the table is nearly full, rather than let it overflow; inside
+render that reads more than 10,000 different files, refuses new names in
+`:files` once 50,000 different ones have been given over the life of the VM,
+and stops renders that need a new path once the table is nearly full, rather
+than let it overflow; inside
 the VM, that lasts until the VM restarts, while a `Typsty.Pool` replaces its
 workers. Typst keeps label names and bibliography keys for the life of the VM
 too, so make labels from fixed names (`<total>`), not from data such as ids.
@@ -323,7 +330,8 @@ documents that render the same on every machine, ship your fonts with your
 application and turn system fonts off:
 
 ```elixir
-config :typsty, font_paths: ["priv/fonts"], system_fonts: false
+# config/runtime.exs
+config :typsty, font_paths: [Application.app_dir(:my_app, "priv/fonts")], system_fonts: false
 ```
 
 Fonts are scanned once for each combination of font options and cached for the
@@ -345,7 +353,7 @@ mix typsty.packages.get @preview/cetz:0.4.2
 * Fetched @preview/cetz:0.4.2
 * Fetched @preview/oxifmt:1.0.0 (imported by @preview/cetz:0.4.2)
 
-Downloaded 2 of 2 packages into priv/typst/packages. Templates can import them when the :package_paths option includes that directory:
+Downloaded 2 of 2 packages into priv/typst/packages. Templates can import them when the :package_paths option includes that directory, in config/runtime.exs:
 
     config :typsty, package_paths: [Application.app_dir(:my_app, "priv/typst/packages")]
 ```
@@ -414,6 +422,10 @@ option or a value that can't be passed to Typst, raise an `ArgumentError`.
 Typst's warnings, such as an unknown font family, are logged. Every render also
 emits [telemetry](https://hexdocs.pm/telemetry) events (see `Typsty.Telemetry`).
 
+Errors are written for developers: their messages can quote the assigns, and
+name paths on the server (the `:root` directory's, say). Log them, and show
+users a message of your own.
+
 ## Running Typst inside the BEAM
 
 Typsty runs Typst in a NIF, inside your VM, so a crash in it would take the
@@ -430,7 +442,9 @@ whole VM down. It's built to protect the VM from what you render with:
   the same file names and assigns names but different values (as a Phoenix
   controller does for each request), each produce exactly what they would on
   their own. Typst's cache only reuses work after checking that every file and
-  value it depended on is the same in the new render.
+  value it depended on is the same in the new render. (So it mostly helps
+  renders with the same assigns: with new ones, the template and the files it
+  imports are evaluated again, though fonts and images are loaded once.)
 - **Renders time out** after 60 seconds by default (`:timeout`). A render that
   times out returns an error and is cancelled: it unwinds the next time Typst
   lays out content, loads a file or font, or exports a PNG or SVG page, which
@@ -443,23 +457,34 @@ whole VM down. It's built to protect the VM from what you render with:
   cancelled. New renders wait for a slot within their timeout, so renders that
   keep timing out can't pile up in the background. `Typsty.running_renders/0`
   reports how many are running.
-- **Assigns are safe.** They're converted to Typst values, nested at most 256
-  levels deep, with numbers and dates checked against what Typst can hold. A
-  template can't do anything with them that it couldn't do with values it
-  wrote itself.
+- **Assigns are data, never code.** They're converted to Typst values, nested
+  at most 256 levels deep, with numbers and dates checked against what Typst
+  can hold, and are shown as they are: a template can't do anything with them
+  that it couldn't do with values it wrote itself. Links can only go to http,
+  https, mailto and tel URLs (or relative ones): a link to another kind, such
+  as a `javascript:` URL from a user, is left out of PDFs and SVGs, with a
+  warning.
+- **Huge values are errors.** A string or array that would take more than
+  1 GiB (`"x" * n`, `range(n)`, or `qty * price` when a user sends a string as
+  `qty`) is an error rather than an allocation that would fail, as is
+  numbering a huge number with Roman numerals.
 - **Files are checked before Typst decodes them**, for the files known to
   crash or hang its decoders: images whose header claims more than 134
   megapixels (a small file can claim to be enormous), including images inside
   SVGs; SVG and XML files nested more than 1,024 levels deep; compressed SVGs
-  that expand past 128 MiB; XML entities that nest or expand past 16 MiB; CBOR
-  that declares more items than it holds; deeply nested bibliographies; PDF
-  files. Files are only read from `:root` and package directories if they are
+  that expand past 128 MiB; SVGs with content far outside their canvas; XML
+  entities that nest or expand past 16 MiB; PNG color profiles that expand past
+  16 MiB; images without pixels; CBOR that declares more items than it holds;
+  deeply nested bibliographies, and BibTeX references that cycle or expand
+  exponentially; PDF files. Files are only read from `:root` and package
+  directories if they are
   regular files inside them, so a symbolic link can't lead elsewhere, and a
   link to `/dev/zero` or a FIFO can't hang a render.
 - **PNG export is checked before rasterizing.** A page, and the images,
   gradients and tilings on it, may use at most 2^28 pixels of textures (1 GiB),
   so an extreme `:ppi` or content far larger than the page returns an error
-  instead of an allocation that would fail.
+  instead of an allocation that would fail, and content placed far off the
+  page (which takes minutes to draw) is an error too.
 - **File paths are rationed**, since Typst keeps every path it sees for the
   life of the VM and breaks for good after 65,535 of them (see [Files](#files)).
 
@@ -467,16 +492,26 @@ Typst decodes many formats, with many libraries, and the checks can't promise
 to catch every hostile file. **Render documents that read files from people
 you don't trust, such as uploads, in a `Typsty.Pool` with a `:memory_limit`.**
 Only the files a document reads are checked: data a template turns into bytes
-itself (`image(bytes(assigns.svg))`) isn't, so pass such data as a file. An SVG
+itself (`image(bytes(assigns.svg))`, or bytes from a list of integers) isn't,
+so pass such data as a file. An SVG
 can read other files in the project by linking them, so don't give documents a
 `:root` that holds other people's files.
 
 A template, though, is code. Like any code, it can loop for a long time, and
-it can ask for as much memory as it likes (`range(n)`, `"x" * n`, and so on).
-An allocation that fails ends the VM at once, whatever memory is free: a
-template that asks for an exabyte doesn't wait for the machine to run out.
-Typsty can't stop that inside the VM. Render templates you don't write, or
-ones that use data to decide how much work to do, in separate processes.
+it can ask for as much memory as it likes. An allocation that fails ends the VM
+at once, whatever memory is free, and some of Typst's libraries end the process
+on a panic in the middle of drawing. Typsty can't stop all of that inside the
+VM. What a template does with its data decides how much work it does:
+`table(columns: assigns.columns)`, `heading(level: assigns.level)` and
+`lorem(assigns.words)` take as much time and memory as the number says, and
+syntax highlighting a long text (`raw(assigns.code, lang: "js")`) takes time
+that grows faster than its length, which can't be cancelled. So:
+
+- Check the data that comes from users in Elixir before rendering, its types
+  as well as its sizes (an Ecto changeset that casts it does), or
+- render documents that use data from people you don't trust, or templates you
+  don't write, in a `Typsty.Pool` with a `:memory_limit`, where the worst a
+  render can do is end its worker.
 
 ## Rendering in separate processes
 
@@ -512,6 +547,10 @@ A worker that's stopped is replaced, and workers end when the pool stops, when
 the process rendering with them exits and when the VM exits. A pool that stops
 before or during a render returns an error to the process waiting for it. A
 new worker loads the fonts renders use by default before it takes renders.
+
+The pool isolates crashes and memory use, not privileges: its workers run as
+the same user as the VM. They get only the environment variables that finding
+fonts needs, not the VM's (such as secrets in `DATABASE_URL`).
 
 The memory limit counts everything a worker allocates, including the fonts it
 has loaded and Typst's caches, and each worker keeps its own, so leave room for
@@ -557,8 +596,8 @@ config :typsty,
   pdf_standards: [],
   timeout: 60_000,
   pool: nil,
-  # Renders inside the VM at once (by default, the number of dirty CPU schedulers)
-  max_concurrent_renders: :erlang.system_info(:dirty_cpu_schedulers),
+  # Renders inside the VM at once; defaults to the number of dirty CPU schedulers
+  max_concurrent_renders: 8,
   log_warnings: true,
   # Packages for mix typsty.packages.get to fetch (see Packages)
   packages: []
@@ -580,10 +619,15 @@ config :typsty, font_paths: [Application.app_dir(:my_app, "priv/fonts")]
 and `"ua-1"` for PDF/UA-1. PDF/A needs the document's creation date, which is
 the time of the render unless the template sets `#set document(date: ...)`.
 
+`datetime.today()` is the date in UTC. For a date in the user's time zone, pass
+it as an assign.
+
 ## Building the NIF from source
 
 The NIF is downloaded precompiled for macOS (Apple Silicon and Intel), Linux
-(x86-64 and ARM64, glibc and musl) and Windows (x86-64). To build it from
+(x86-64 and ARM64, glibc and musl) and Windows (x86-64); `Typsty.Pool` is less
+tested on Windows than on macOS and Linux. On Alpine Linux, the NIF needs
+`libgcc` (`apk add libgcc`, which `libstdc++` brings along). To build it from
 source instead, install [Rust](https://www.rust-lang.org/tools/install) 1.92 or
 later, add Rustler to your dependencies:
 
@@ -622,7 +666,7 @@ source works too.
   through [typst-assets](https://github.com/typst/typst-assets), and many Rust
   crates, under their own licenses: see
   [THIRD_PARTY_NOTICES.txt](https://github.com/akoutmos/typsty/blob/master/THIRD_PARTY_NOTICES.txt), which is also in
-  `priv/native`
+  `priv/native`, as `typsty-THIRD_PARTY_NOTICES.txt`
 - The Elixir [typst](https://hex.pm/packages/typst) and
   [typster](https://hex.pm/packages/typster) packages, whose virtual file system
   and variables inspired Typsty's
