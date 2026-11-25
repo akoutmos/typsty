@@ -106,7 +106,7 @@ defmodule Typsty.CancellationTest do
     Application.put_env(:typsty, :max_concurrent_renders, 0)
 
     message =
-      "invalid value for :max_concurrent_renders option: expected positive integer, got: 0 " <>
+      "invalid value for :max_concurrent_renders option: expected a positive integer of at most 10000, got: 0 " <>
         "(in the :typsty application config)"
 
     assert_raise ArgumentError, message, fn -> Typsty.to_pdf("x") end

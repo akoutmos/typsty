@@ -24,6 +24,13 @@ defmodule Typsty.ValueTest do
     defstruct [:value]
   end
 
+  # Like an Ecto schema, whose metadata is a struct of its own
+  defmodule Schema do
+    @moduledoc false
+    @derive Typsty.Encoder
+    defstruct __meta__: %Plain{}, name: nil
+  end
+
   defmodule Money do
     @moduledoc false
     defstruct [:amount, :currency]
@@ -201,9 +208,11 @@ defmodule Typsty.ValueTest do
   end
 
   test "refuses structs that don't implement Typsty.Encoder, rather than pass their fields" do
-    assert_raise ArgumentError, ~r/^assigns.plain is a Typsty.ValueTest.Plain struct, which can only be passed/, fn ->
-      Typsty.to_pdf("x", %{plain: %Plain{value: 1}})
-    end
+    assert_raise ArgumentError,
+                 ~r/^assigns.plain is a %Typsty.ValueTest.Plain{} struct, which can only be passed/,
+                 fn ->
+                   Typsty.to_pdf("x", %{plain: %Plain{value: 1}})
+                 end
 
     assert_raise ArgumentError, ~r/^assigns.range is a range of 2000000 numbers/, fn ->
       Typsty.to_pdf("x", %{range: 1..2_000_000})
@@ -222,6 +231,43 @@ defmodule Typsty.ValueTest do
     end
 
     assert {:ok, _pdf} = Typsty.to_pdf("#assigns.x", %{x: Decimal.new("79228162514264337593543950335")})
+  end
+
+  test "drops trailing zeros that don't fit in a Typst decimal, and only those" do
+    one = Decimal.mult(Decimal.new("1.00000000000000000"), Decimal.new("1.0000000000000"))
+    assert one.exp == -30
+
+    assert_typst(
+      ~S"""
+      #assert.eq(assigns.one, decimal("1"))
+      #assert.eq(str(assigns.price), "19.50")
+      """,
+      %{one: one, price: Decimal.new("19.50")}
+    )
+  end
+
+  test "refuses huge decimals without working through their digits" do
+    {time, _} =
+      :timer.tc(fn ->
+        assert_raise ArgumentError, ~r/doesn't fit in a Typst decimal/, fn ->
+          Typsty.to_pdf("x", %{x: %Decimal{sign: 1, coef: Integer.pow(10, 200_000) + 1, exp: -5}})
+        end
+      end)
+
+    assert time < 1_000_000
+  end
+
+  test "deriving Typsty.Encoder leaves an Ecto schema's metadata out, and checks the fields it names" do
+    assert_typst(~S|#assert.eq(assigns.schema, (name: "Ada"))|, %{schema: %Schema{name: "Ada"}})
+
+    assert_raise ArgumentError, ~r/:only has fields the struct doesn't have: \[:nmae\]/, fn ->
+      Code.compile_string("""
+      defmodule Typsty.ValueTest.Typo do
+        @derive {Typsty.Encoder, only: [:nmae]}
+        defstruct [:name]
+      end
+      """)
+    end
   end
 
   test "raises for integers that don't fit in 64 bits" do
@@ -255,11 +301,11 @@ defmodule Typsty.ValueTest do
       Typsty.to_pdf("x", %{:name => 1, "name" => 2})
     end
 
-    assert_raise ArgumentError, ~r/Loop struct that Typsty.Encoder encodes as itself/, fn ->
+    assert_raise ArgumentError, ~r/%Typsty.ValueTest.Loop{} struct that Typsty.Encoder encodes as itself/, fn ->
       Typsty.to_pdf("x", %{loop: %Loop{}})
     end
 
-    assert_raise ArgumentError, ~r/PingPong.Ping struct, after 32 structs in a row/, fn ->
+    assert_raise ArgumentError, ~r/PingPong.Ping{} struct, after 32 structs in a row/, fn ->
       Typsty.to_pdf("x", %{ping: %Ping{}})
     end
 

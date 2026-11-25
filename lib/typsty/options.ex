@@ -14,6 +14,11 @@ defmodule Typsty.Options do
   # The longest a receive can wait
   @max_timeout 4_294_967_295
 
+  # Bounds for numbers that are only sensible well below them, so that the native code can
+  # take them (it can't take integers past 64 bits)
+  @max_count 10_000
+  @max_ppi 10_000
+
   @render [
     files: [
       type: {:custom, __MODULE__, :files, []},
@@ -75,8 +80,8 @@ defmodule Typsty.Options do
       """
     ],
     ppi: [
-      type: {:custom, __MODULE__, :positive_number, []},
-      type_doc: "positive number",
+      type: {:custom, __MODULE__, :positive_number, [@max_ppi]},
+      type_doc: "positive number (at most #{@max_ppi})",
       type_spec: quote(do: number()),
       default: 144,
       doc: "For PNG, the resolution in pixels per inch."
@@ -119,7 +124,9 @@ defmodule Typsty.Options do
 
   @config_only [
     max_concurrent_renders: [
-      type: :pos_integer,
+      type: {:custom, __MODULE__, :positive_integer, [@max_count]},
+      type_doc: "`t:pos_integer/0`",
+      type_spec: quote(do: pos_integer()),
       doc: """
       How many renders may run inside the VM at once, counting renders that timed out and are
       still being cancelled. A render waits for a free slot, within its timeout. This keeps
@@ -141,14 +148,26 @@ defmodule Typsty.Options do
   ]
 
   @format [
-    line_length: [type: :pos_integer, default: 98, doc: "The maximum line length."],
-    indent: [type: :pos_integer, default: 2, doc: "The number of spaces to indent by."],
+    line_length: [
+      type: {:custom, __MODULE__, :positive_integer, [@max_count]},
+      type_doc: "`t:pos_integer/0`",
+      type_spec: quote(do: pos_integer()),
+      default: 98,
+      doc: "The maximum line length."
+    ],
+    indent: [
+      type: {:custom, __MODULE__, :positive_integer, [@max_count]},
+      type_doc: "`t:pos_integer/0`",
+      type_spec: quote(do: pos_integer()),
+      default: 2,
+      doc: "The number of spaces to indent by."
+    ],
     wrap_text: [type: :boolean, default: false, doc: "Whether to wrap long lines of text in markup."]
   ]
 
   @formatter [
-    typst_line_length: [type: :pos_integer],
-    typst_indent: [type: :pos_integer],
+    typst_line_length: [type: {:custom, __MODULE__, :positive_integer, [@max_count]}],
+    typst_indent: [type: {:custom, __MODULE__, :positive_integer, [@max_count]}],
     typst_wrap_text: [type: :boolean]
   ]
 
@@ -160,7 +179,9 @@ defmodule Typsty.Options do
       doc: "The name to register the pool under, to pass as the `:pool` option."
     ],
     size: [
-      type: :pos_integer,
+      type: {:custom, __MODULE__, :positive_integer, [@max_count]},
+      type_doc: "`t:pos_integer/0`",
+      type_spec: quote(do: pos_integer()),
       doc: """
       The number of workers, which is how many renders can run at once. Defaults to the
       number of CPU cores (`System.schedulers_online/0`). A render waits for a free worker,
@@ -312,19 +333,19 @@ defmodule Typsty.Options do
   def files(files) when is_map(files) or is_list(files) do
     files = Enum.to_list(files)
 
-    cond do
-      other = Enum.find(files, &(not match?({path, contents} when is_binary(path) and is_binary(contents), &1))) ->
-        {:error, "expected paths (strings) mapped to binaries, got: #{inspect(other, limit: 5)}"}
-
-      other = Enum.find(files, fn {path, _contents} -> not String.valid?(path) end) ->
-        {:error, "expected paths that are valid UTF-8, got: #{inspect(elem(other, 0))}"}
-
-      true ->
-        {:ok, files}
+    case Enum.find_value(files, &file_problem/1) do
+      nil -> {:ok, files}
+      problem -> {:error, problem}
     end
   end
 
   def files(other), do: {:error, "expected a map or a list of tuples, got: #{inspect(other, limit: 5)}"}
+
+  defp file_problem({path, contents}) when is_binary(path) and is_binary(contents) do
+    if not String.valid?(path), do: "expected paths that are valid UTF-8, got: #{inspect(path)}"
+  end
+
+  defp file_problem(other), do: "expected paths (strings) mapped to binaries, got: #{inspect(other, limit: 5)}"
 
   @doc false
   def optional_path(nil), do: {:ok, nil}
@@ -337,17 +358,26 @@ defmodule Typsty.Options do
 
   @doc false
   def paths(paths) when is_list(paths) do
-    case Enum.find(paths, &(not (is_binary(&1) and String.valid?(&1)))) do
-      nil -> {:ok, paths}
-      other -> {:error, "expected a list of paths (strings that are valid UTF-8), got: #{inspect(other)} in it"}
+    case Enum.reject(paths, &(is_binary(&1) and String.valid?(&1))) do
+      [] ->
+        {:ok, paths}
+
+      [other | _] ->
+        {:error, "expected a list of paths (strings that are valid UTF-8), and #{inspect(other)} isn't one"}
     end
   end
 
   def paths(other), do: {:error, "expected a list of paths, got: #{inspect(other)}"}
 
   @doc false
-  def positive_number(number) when is_number(number) and number > 0, do: {:ok, number}
-  def positive_number(other), do: {:error, "expected a positive number, got: #{inspect(other)}"}
+  def positive_number(number, max) when is_number(number) and number > 0 and number <= max, do: {:ok, number}
+  def positive_number(other, max), do: {:error, "expected a positive number of at most #{max}, got: #{inspect(other)}"}
+
+  @doc false
+  def positive_integer(value, max) when is_integer(value) and value > 0 and value <= max, do: {:ok, value}
+
+  def positive_integer(other, max),
+    do: {:error, "expected a positive integer of at most #{max}, got: #{inspect(other)}"}
 
   @doc false
   def optional_positive_integer(value) when (is_integer(value) and value > 0) or is_nil(value), do: {:ok, value}

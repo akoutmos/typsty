@@ -33,7 +33,9 @@ defmodule Typsty do
   Render it with the generated functions:
 
   ```elixir
-  {:ok, pdf} = MyApp.Invoice.to_pdf(%{number: 1042, items: [%{name: "Widget", price: 25}]})
+  assigns = %{number: 1042, items: [%{name: "Widget", price: 25}]}
+
+  {:ok, pdf} = MyApp.Invoice.to_pdf(assigns)
   {:ok, [page_1 | _]} = MyApp.Invoice.to_png(assigns, ppi: 300)
   {:ok, pages} = MyApp.Invoice.to_svg(assigns)
   ```
@@ -65,6 +67,7 @@ defmodule Typsty do
   | maps                                      | `dictionary`, with string keys         |
   | `Date`, `Time`, `NaiveDateTime`, `DateTime` | `datetime` (`DateTime` keeps its wall time) |
   | `Decimal`                                 | `decimal`                              |
+  | `MapSet`, `Range`                         | `array`                                |
   | other structs                             | see `Typsty.Encoder`                   |
 
   The assigns are a map with atom or string keys, and the keys of maps inside the data can be
@@ -85,6 +88,11 @@ defmodule Typsty do
     the second, and a `DateTime` keeps its wall time (convert it to the time zone the
     document should show first).
   - Typst's decimals have 28 significant digits, at most 28 of them after the decimal point.
+  - Links can only go to http, https, mailto and tel URLs, or relative ones: a link to
+    another kind of URL, such as a `javascript:` URL that came from a user, is left out of
+    PDFs and SVGs, with a warning.
+  - `datetime.today()` is the date in UTC: pass the date in the user's time zone as an
+    assign instead.
 
   A template that uses a few assigns a lot can give them short names, by destructuring
   them at its top. The names are then the template's own, so pick ones that don't hide
@@ -200,13 +208,17 @@ defmodule Typsty do
   the data a document is rendered with:
 
   - **Assigns** are converted to Typst values, with limits on how deeply they nest and on
-    the size of numbers and dates. A template can't do anything with them that it couldn't
-    do with values it wrote itself.
+    the size of numbers and dates. They're data, never code: a template can't do anything
+    with them that it couldn't do with values it wrote itself. Strings and arrays that
+    would take more than 1 GiB (`"x" * n`, `range(n)`) are errors, rather than allocations
+    that would fail.
   - **Files** (in `:files`, or under `:root`) are checked before Typst decodes them, for the
     files known to crash or hang its decoders: images that claim to be enormous, compressed
-    SVGs and XML entities that expand without bound, deeply nested XML, CBOR that declares
-    billions of items, deeply nested bibliographies, PDFs. Typst decodes many formats with
-    many libraries, though, and the checks can't promise that every hostile file is caught.
+    SVGs, XML entities and PNG color profiles that expand without bound, SVGs with content
+    far outside their canvas, deeply nested XML, CBOR that declares billions of items,
+    bibliographies whose references cycle or nest deeply, PDFs. Typst decodes many formats
+    with many libraries, though, and the checks can't promise that every hostile file is
+    caught.
     **Render documents that read files from people you don't trust, such as uploads, in a
     `Typsty.Pool` with a `:memory_limit`.** Only the files a document reads are checked:
     data a template turns into bytes itself (`image(bytes(assigns.svg))`) isn't, so pass
@@ -214,10 +226,12 @@ defmodule Typsty do
     so don't give documents a `:root` that holds other people's files.
 
   A template, though, is code. A template that loops forever is stopped at its timeout only
-  when it next calls into Typst, and one that asks for an enormous amount of memory
-  (`"a" * 1000000000000`) makes the allocation fail, which ends the VM. Render templates you
-  don't control, such as ones your users write, in a `Typsty.Pool` with a `:memory_limit`,
-  where such a render only ends its worker.
+  when it next calls into Typst, and what it does with its data decides how much work it
+  does: `table(columns: assigns.columns)` takes as much memory as the number says, and an
+  allocation that fails ends the VM. Check the types and sizes of data from users in Elixir
+  before rendering (as an Ecto changeset that casts it does), and render documents that use
+  data from people you don't trust, or templates you don't control, in a `Typsty.Pool`
+  with a `:memory_limit`, where such a render only ends its worker.
 
   ## Warnings
 
@@ -463,7 +477,12 @@ defmodule Typsty do
     error in [UndefinedFunctionError, ErlangError] ->
       if match?(%UndefinedFunctionError{module: Native}, error) or
            match?(%ErlangError{original: :nif_not_loaded}, error) do
-        IO.warn("Typsty can't check templates' syntax, since its NIF couldn't be loaded (cross-compiling?)", [])
+        # Once per compilation, rather than for every template
+        if not :persistent_term.get({__MODULE__, :warned_unavailable}, false) do
+          :persistent_term.put({__MODULE__, :warned_unavailable}, true)
+          IO.warn("Typsty can't check templates' syntax, since its NIF couldn't be loaded (cross-compiling?)", [])
+        end
+
         :unavailable
       else
         reraise error, __STACKTRACE__
@@ -524,6 +543,8 @@ defmodule Typsty do
     end
   end
 
+  def validate(other), do: raise(ArgumentError, "expected Typst source (a string), got: #{inspect(other)}")
+
   @doc """
   Formats Typst source with [typstyle](https://github.com/typstyle-rs/typstyle). Returns
   `{:error, diagnostics}` if the source has syntax errors, since it can't be formatted then.
@@ -533,7 +554,9 @@ defmodule Typsty do
   #{Options.docs(:format)}
   """
   @spec format(String.t(), [format_option()]) :: {:ok, String.t()} | {:error, [Diagnostic.t()]}
-  def format(source, opts \\ []) when is_binary(source) do
+  def format(source, opts \\ [])
+
+  def format(source, opts) when is_binary(source) do
     opts = Options.format!(opts)
 
     Native.format(utf8!(source, "the Typst source"), %{
@@ -542,6 +565,8 @@ defmodule Typsty do
       wrap_text: opts[:wrap_text]
     })
   end
+
+  def format(other, _opts), do: raise(ArgumentError, "expected Typst source (a string), got: #{inspect(other)}")
 
   @doc """
   Returns the names of the font families available to documents with the given font options
@@ -665,14 +690,14 @@ defmodule Typsty do
   defp pool_process!(pid, pool) do
     case Process.info(pid, :dictionary) do
       {:dictionary, dictionary} ->
-        if dictionary[:"$initial_call"] != {NimblePool, :init, 1} do
+        if not Typsty.Pool.__pool__?(dictionary) do
           raise ArgumentError, "the :pool option must be a Typsty.Pool, got: #{inspect(pool)}"
         end
 
         pid
 
       nil ->
-        raise ArgumentError, "the :pool option (or the :pool config) names no running Typsty.Pool: #{inspect(pool)}"
+        {:not_running, pool}
     end
   end
 
@@ -686,7 +711,7 @@ defmodule Typsty do
       package_paths: Enum.map(opts[:package_paths], &Path.expand/1),
       fonts: font_options(opts),
       ppi: opts[:ppi] * 1.0,
-      pdf_standards: opts[:pdf_standards],
+      pdf_standards: Enum.uniq(opts[:pdf_standards]),
       timeout: if(opts[:timeout] == :infinity, do: nil, else: opts[:timeout]),
       max_running: opts[:max_concurrent_renders]
     }
@@ -700,8 +725,9 @@ defmodule Typsty do
     [%Diagnostic{severity: :error, message: message}]
   end
 
-  # A package from Typst Universe that isn't in the :package_paths directories
-  @missing_package ~r/package not found \(searched for (@preview\/[^\s)]+)\)/
+  # A package that isn't in the :package_paths directories. The whole message must match, since
+  # messages can quote a template's data
+  @missing_package ~r/\Apackage not found \(searched for (@([\p{L}_][\p{L}\p{N}_-]*)\/([\p{L}_][\p{L}\p{N}_-]*):(\d+\.\d+\.\d+))\)\z/u
 
   # Typst's hints are written for its command-line tool, which takes a --root argument
   @root_hint ~r/--root/
@@ -715,20 +741,22 @@ defmodule Typsty do
       end)
 
     case Regex.run(@missing_package, message) do
-      [_, spec] -> %{diagnostic | hints: hints ++ [package_hint(spec, native_opts.package_paths)]}
+      [_ | spec] -> %{diagnostic | hints: hints ++ [package_hint(spec, native_opts.package_paths)]}
       nil -> %{diagnostic | hints: hints}
     end
   end
 
-  defp package_hint(spec, package_paths) do
+  defp package_hint([spec, namespace, name, version], package_paths) do
     # A directory that has the package one level down names the namespace's directory,
     # rather than the one that holds it
-    [_, namespace, name, version] = Regex.run(~r/^@([^\/]+)\/([^:]+):(.+)$/, spec)
-
     case Enum.find(package_paths, &File.dir?(Path.join([&1, name, version]))) do
-      nil ->
+      nil when namespace == "preview" ->
         "download it with `mix typsty.packages.get #{spec}`, and add the directory it's saved in " <>
           "to the :package_paths option. #{searched(package_paths)}"
+
+      nil ->
+        "add the directory that holds #{namespace}/#{name}/#{version} to the :package_paths option. " <>
+          searched(package_paths)
 
       path ->
         "#{path} has the package, but :package_paths must name the directory that holds " <>
@@ -748,6 +776,11 @@ defmodule Typsty do
       {:ok, job} -> await(reference, job, native_opts.timeout, native_opts.max_running)
       {:error, _reason, _message} = error -> error
     end
+  end
+
+  defp render_with({:not_running, pool}, _source, _assigns, _files, _native_opts) do
+    {:error, :crashed,
+     "the pool #{inspect(pool)} isn't running (a Typsty.Pool in a supervision tree may be restarting)"}
   end
 
   defp render_with(pool, source, assigns, files, native_opts) do
@@ -794,9 +827,19 @@ defmodule Typsty do
   defp log_warnings(warnings, true), do: Enum.each(warnings, &log_warning/1)
   defp log_warnings(_warnings, false), do: :ok
 
-  defp log_warning(warning), do: Logger.warning(fn -> "[Typsty] " <> Diagnostic.format(warning) end)
+  # Messages can quote a template's data, whose line breaks would start what looks like
+  # another log entry
+  defp log_warning(warning) do
+    Logger.warning(fn ->
+      warning = %{warning | message: one_line(warning.message), hints: Enum.map(warning.hints, &one_line/1)}
+      "[Typsty] " <> Diagnostic.format(warning)
+    end)
+  end
 
-  # The pool's pid. Options.render!/1 checked that it's a name or a pid
+  defp one_line(text), do: text |> String.replace("\r", "\\r") |> String.replace("\n", "\\n")
+
+  # The pool's pid. Options.render!/1 checked that it's a name or a pid. A pool that isn't
+  # running (one that's restarting, say) is an error like a pool that stops during a render
   defp pool!(nil), do: nil
 
   defp pool!(pool) do
@@ -805,7 +848,7 @@ defmodule Typsty do
         pool_process!(pid, pool)
 
       nil ->
-        raise ArgumentError, "the :pool option (or the :pool config) names no running Typsty.Pool: #{inspect(pool)}"
+        {:not_running, pool}
 
       _remote ->
         raise ArgumentError,

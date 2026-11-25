@@ -16,8 +16,10 @@ defprotocol Typsty.Encoder do
   end
   ```
 
-  `@derive Typsty.Encoder` passes every field, and `except: [...]` leaves some out. For
-  structs from other libraries, derive it with `Protocol.derive/3`:
+  `@derive Typsty.Encoder` passes every field, and `except: [...]` leaves some out. An Ecto
+  schema's `__meta__` field is always left out, and associations must be preloaded or left
+  out. Fields in `:only` and `:except` that the struct doesn't have raise when it compiles.
+  For structs from other libraries, derive it with `Protocol.derive/3`:
 
   ```elixir
   require Protocol
@@ -44,12 +46,20 @@ defprotocol Typsty.Encoder do
   @impl Protocol
   defmacro __deriving__(module, options) do
     options = Keyword.validate!(options, [:only, :except])
+    struct_fields = for %{field: field} <- Macro.struct_info!(module, __CALLER__), do: field
 
+    for {option, fields} <- options, is_list(fields), (unknown = fields -- struct_fields) != [] do
+      raise ArgumentError,
+            "deriving Typsty.Encoder for #{inspect(module)}: #{inspect(option)} has fields " <>
+              "the struct doesn't have: #{inspect(unknown)}"
+    end
+
+    # An Ecto schema's metadata, which templates have no use for
     fields =
       case options do
-        [] -> quote(do: map)
+        [] -> quote(do: Map.delete(map, :__meta__))
         [only: only] when is_list(only) -> quote(do: Map.take(map, unquote(only)))
-        [except: except] when is_list(except) -> quote(do: Map.drop(map, unquote(except)))
+        [except: except] when is_list(except) -> quote(do: Map.drop(map, [:__meta__ | unquote(except)]))
         _other -> raise ArgumentError, "deriving Typsty.Encoder takes either :only or :except, as a list of fields"
       end
 
