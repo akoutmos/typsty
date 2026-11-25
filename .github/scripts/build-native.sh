@@ -28,9 +28,10 @@ if [ "$use_cross" = "true" ]; then
 fi
 
 cd "$root/native"
-"$build" build --release --target "$target" --package typsty_nif \
+# --locked: the binaries are built from the versions in Cargo.lock, or not at all
+"$build" build --locked --release --target "$target" --package typsty_nif \
   --no-default-features --features "nif_version_${nif_version//./_}"
-"$build" build --release --target "$target" --package typsty_worker
+"$build" build --locked --release --target "$target" --package typsty_worker
 
 case "$target" in
   *-pc-windows-*) lib="typsty_nif.dll" prefix="" extension="dll" worker="typsty_worker.exe" ;;
@@ -49,8 +50,14 @@ cp "$built/$lib" "$staging/$name"
 cp "$built/$worker" "$staging/$worker"
 chmod 755 "$staging/$worker"
 
-# COPYFILE_DISABLE keeps macOS's tar from adding ._ metadata files
+# The binaries' licenses travel with them (see .github/scripts/third_party_notices.exs)
+notices="typsty-LICENSE.txt typsty-THIRD_PARTY_NOTICES.txt"
+cp "$root/LICENSE" "$staging/typsty-LICENSE.txt"
+cp "$root/THIRD_PARTY_NOTICES.txt" "$staging/typsty-THIRD_PARTY_NOTICES.txt"
+
+# The plain ustar format leaves out extended attributes and macOS metadata, which
+# COPYFILE_DISABLE alone doesn't
 tarball="dist/$name.tar.gz"
-(cd "$staging" && COPYFILE_DISABLE=1 tar -czf "$root/$tarball" "$name" "$worker")
+(cd "$staging" && COPYFILE_DISABLE=1 tar --format=ustar -czf "$root/$tarball" "$name" "$worker" $notices)
 
 echo "$tarball"

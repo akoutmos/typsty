@@ -38,3 +38,6 @@ typsty-*.tar
 
 # Precompiled NIF tarballs built by .github/scripts/build-native.sh
 /dist/
+
+# The checksums of a release's precompiled builds, which only go in the Hex package (see RELEASING.md)
+/checksum-*.exs

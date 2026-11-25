@@ -11,7 +11,7 @@ defmodule Typsty.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       name: "Typsty",
       source_url: @source_url,
-      homepage_url: "https://hex.pm/packages/typsty",
+      homepage_url: @source_url,
       description:
         "Render Typst documents to PDF, PNG and SVG with Elixir data, from templates checked at compile time",
       start_permanent: Mix.env() == :prod,
@@ -65,6 +65,7 @@ defmodule Typsty.MixProject do
       maintainers: ["Alex Koutmos"],
       links: %{
         "GitHub" => @source_url,
+        "Changelog" => "#{@source_url}/blob/master/CHANGELOG.md",
         "Sponsor" => "https://github.com/sponsors/akoutmos"
       }
     ]
@@ -98,7 +99,7 @@ defmodule Typsty.MixProject do
   defp deps do
     [
       # Production deps
-      {:rustler_precompiled, "~> 0.8"},
+      {:rustler_precompiled, "~> 0.10"},
       {:rustler, "~> 0.38", optional: true},
       {:telemetry, "~> 1.0"},
       {:nimble_pool, "~> 1.1"},
@@ -115,7 +116,8 @@ defmodule Typsty.MixProject do
   end
 
   defp project_version do
-    "VERSION"
+    __DIR__
+    |> Path.join("VERSION")
     |> File.read!()
     |> String.trim()
   end

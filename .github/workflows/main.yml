@@ -16,10 +16,11 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same branch or pull request supersedes the running checks
+# A newer push to a pull request supersedes its running checks. Every master commit gets a
+# complete run
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   rust_checks:
@@ -90,6 +91,8 @@ jobs:
         run: mix format --check-formatted
       - name: Check for unused dependencies in mix.lock
         run: mix deps.unlock --check-unused
+      - name: Check that THIRD_PARTY_NOTICES.txt is up to date
+        run: elixir .github/scripts/third_party_notices.exs --check
       - name: Check for compiler warnings
         run: mix compile --warnings-as-errors
       - name: Credo strict checks
@@ -104,6 +107,7 @@ jobs:
   unit_test:
     name: Tests (Elixir ${{ matrix.version.elixir }}, OTP ${{ matrix.version.otp }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
 
     strategy:
       fail-fast: false
@@ -120,6 +124,12 @@ jobs:
         # The pool's worker is a separate program, whose process handling differs by OS
         include:
           - os: macos-latest
+            version:
+              otp: "28"
+              elixir: "1.19"
+          # Windows hasn't been tested as much: its failures are reported, but don't fail CI
+          - os: windows-latest
+            experimental: true
             version:
               otp: "28"
               elixir: "1.19"
