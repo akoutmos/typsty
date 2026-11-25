@@ -5,6 +5,8 @@
 # - typsty_worker: the program `Typsty.Pool` runs renders in, as separate OS processes
 [workspace]
 members = ["typsty_core", "typsty_nif", "typsty_worker"]
+# Patched dependencies (see [patch.crates-io])
+exclude = ["vendor"]
 resolver = "2"
 
 [workspace.package]
@@ -32,6 +34,18 @@ memchr = "2"
 roxmltree = "0.21"
 data-url = "0.3"
 libc = "0.2"
+# The libraries Typst parses bibliographies and SVGs with, which checks.rs parses them with too
+biblatex = "0.12"
+usvg = { version = "0.47", default-features = false }
+
+# Patched dependencies, each with a TYPSTY_PATCH.md that says why:
+# - codex writes numbers in other numeral systems for Typst's numbering, and is patched to
+#   refuse numbers it would take unbounded memory to write
+# - ecow holds Typst's strings and arrays, and is patched to refuse allocations far larger
+#   than any document needs, which would otherwise abort the process when they fail
+[patch.crates-io]
+codex = { path = "vendor/codex" }
+ecow = { path = "vendor/ecow" }
 
 [profile.release]
 # Panics must unwind, so that they become errors instead of aborting the VM

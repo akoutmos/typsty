@@ -53,7 +53,7 @@ defmodule Typsty.MixProject do
       # when TYPSTY_BUILD is set. The README's images are only needed by the docs, which get
       # them through :assets.
       files:
-        ~w(lib native/Cargo.toml native/Cargo.lock native/.cargo) ++
+        ~w(lib native/Cargo.toml native/Cargo.lock native/.cargo native/vendor) ++
           for(
             crate <- ~w(typsty_core typsty_nif typsty_worker),
             path <- ~w(Cargo.toml src),

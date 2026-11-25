@@ -129,10 +129,17 @@ impl Prepared {
 
         // Files are confined to the root even through symbolic links, which is checked
         // against the root's real path
-        let root = root.map(|root| {
-            let root = PathBuf::from(root);
-            FsRoot::new(std::fs::canonicalize(&root).unwrap_or(root))
-        });
+        let root = match root {
+            Some(root) => match std::fs::canonicalize(&root) {
+                Ok(real) if real.is_dir() => Some(FsRoot::new(real)),
+                _ => {
+                    return Err(PrepareError::Invalid(format!(
+                        "the :root directory {root:?} doesn't exist, or isn't a directory (in a release, find directories in priv with Application.app_dir/2)"
+                    )))
+                }
+            },
+            None => None,
+        };
 
         let template = match template.strip_prefix('\u{feff}') {
             Some(stripped) => stripped.to_string(),
@@ -464,6 +471,12 @@ const TABLE_FULL: &str = "Typst's table of file paths is full: it keeps every fi
 /// (the worker) should be.
 pub fn file_ids_running_out() -> bool {
     HIGHEST_FILE_ID.load(Ordering::Relaxed) as usize >= MAX_FILE_ID as usize - MAX_RENDER_FILES
+}
+
+/// Whether close to `MAX_GIVEN_PATHS` paths were given in `:files`: a process that can be
+/// replaced (the worker) should be, before it has to refuse new ones.
+pub fn given_paths_running_out() -> bool {
+    lock(&GIVEN_PATHS).len() >= MAX_GIVEN_PATHS - MAX_RENDER_FILES
 }
 
 /// The id of a file given in `:files`. New paths are refused when too many were given, or

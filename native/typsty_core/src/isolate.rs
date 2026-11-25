@@ -363,11 +363,23 @@ fn launch_waiting(deliver_failures: bool) {
                 (job.run)(Some(error));
             }
             Launched::Failed(job, _error) => {
-                *lock(&job.shared.phase) = Phase::Queued;
+                // Unless it was abandoned meanwhile, which only leaves it to be dropped
+                let requeue = {
+                    let mut phase = lock(&job.shared.phase);
+                    let running = *phase == Phase::Running;
+                    if running {
+                        *phase = Phase::Queued;
+                    }
+                    running
+                };
+
                 let mut queue = lock(&QUEUE);
                 queue.running -= 1;
-                queue.waiting.push_front(job);
-                return;
+
+                if requeue {
+                    queue.waiting.push_front(job);
+                    return;
+                }
             }
         }
     }

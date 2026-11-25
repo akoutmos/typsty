@@ -240,8 +240,6 @@ dependencies = [
 [[package]]
 name = "codex"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0732ab1a27b4ea05e6f9f60a5122c9924dd5123defde0d8e907f58cf643d40e6"
 dependencies = [
  "chinese-number",
 ]
@@ -402,8 +400,6 @@ dependencies = [
 [[package]]
 name = "ecow"
 version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78e4f79b296fbaab6ce2e22d52cb4c7f010fe0ebe7a32e34fa25885fd797bd02"
 dependencies = [
  "serde",
 ]
@@ -2682,6 +2678,7 @@ dependencies = [
 name = "typsty_core"
 version = "0.1.0"
 dependencies = [
+ "biblatex",
  "comemo",
  "data-url",
  "flate2",
@@ -2698,6 +2695,7 @@ dependencies = [
  "typst-render",
  "typst-svg",
  "typstyle-core",
+ "usvg",
 ]
 
 [[package]]

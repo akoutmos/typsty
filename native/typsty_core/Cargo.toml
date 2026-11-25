@@ -29,3 +29,7 @@ data-url.workspace = true
 memchr.workspace = true
 # Opens files without blocking on FIFOs
 libc.workspace = true
+# Parse bibliographies and SVGs the way Typst does, to refuse reference cycles and geometry
+# that its libraries can't handle
+biblatex.workspace = true
+usvg.workspace = true

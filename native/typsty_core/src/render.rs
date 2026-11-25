@@ -1,6 +1,6 @@
 //! Rendering, checking and formatting templates.
 
-use typst::foundations::Dict;
+use typst::foundations::{Dict, Value};
 use typst::syntax::Source;
 use typst_layout::PagedDocument;
 use typst_pdf::PdfStandards;
@@ -15,6 +15,11 @@ use crate::world::{self, PrepareError, Prepared, TypstyWorld};
 /// evaluation, layout, decoded images and rendered textures across compilations, which
 /// speeds up rendering the same template again; evicting old results keeps memory bounded.
 const CACHE_MAX_AGE: usize = 10;
+
+/// Renders whose assigns and files take more than about this much memory evict everything
+/// Typst memoized as soon as they're done, rather than let the cache keep them alive for
+/// `CACHE_MAX_AGE` more renders: 32 MiB.
+const LARGE_INPUT: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -64,6 +69,9 @@ impl RenderJob {
             )));
         }
 
+        let files_size: usize = self.files.iter().map(|(_path, bytes)| bytes.len()).sum();
+        let large = files_size.saturating_add(approximate_size(&self.assigns)) > LARGE_INPUT;
+
         let world = Prepared::new(
             self.template,
             self.assigns,
@@ -78,6 +86,7 @@ impl RenderJob {
             format: self.format,
             ppi: self.ppi,
             pdf_standards,
+            large,
         })
     }
 }
@@ -89,6 +98,8 @@ pub struct PreparedJob {
     format: Format,
     ppi: f64,
     pdf_standards: PdfStandards,
+    /// Whether the assigns and files are large (see `LARGE_INPUT`).
+    large: bool,
 }
 
 impl PreparedJob {
@@ -99,20 +110,23 @@ impl PreparedJob {
 
         // Evicted after exporting (rendering PNGs memoizes textures), and also when a
         // cancelled render unwinds
-        let _evict = EvictOnDrop;
+        let _evict = EvictOnDrop(if self.large { 0 } else { CACHE_MAX_AGE });
 
         let world = TypstyWorld::new(self.world, fonts, cancellation);
         let compiled = typst::compile::<PagedDocument>(&world);
-        let warnings = diagnostics::from_sources(&compiled.warnings, &world);
+        let mut warnings = diagnostics::from_sources(&compiled.warnings, &world);
 
-        let document = compiled
-            .output
-            .map_err(|errors| diagnostics::from_sources(&errors, &world))?;
+        // The warnings often explain the errors (an unknown font, say), so they come along
+        let document = compiled.output.map_err(|errors| {
+            let mut diagnostics = diagnostics::from_sources(&errors, &world);
+            diagnostics.append(&mut warnings);
+            diagnostics
+        })?;
 
         let output = match self.format {
-            Format::Pdf => export::pdf(&document, self.pdf_standards, &world)?,
+            Format::Pdf => export::pdf(&document, self.pdf_standards, &world, &mut warnings)?,
             Format::Png => export::png(&document, self.ppi, &world)?,
-            Format::Svg => export::svg(&document, &world),
+            Format::Svg => export::svg(&document, &world, &mut warnings),
         };
 
         Ok((output, warnings))
@@ -124,12 +138,40 @@ pub fn clear_caches() {
     comemo::evict(0);
 }
 
-struct EvictOnDrop;
+/// Evicts what Typst memoized that's older than the given number of renders.
+struct EvictOnDrop(usize);
 
 impl Drop for EvictOnDrop {
     fn drop(&mut self) {
-        comemo::evict(CACHE_MAX_AGE);
+        comemo::evict(self.0);
     }
+}
+
+/// Roughly how much memory the assigns take in Typst, counting up to `LARGE_INPUT`.
+fn approximate_size(assigns: &Dict) -> usize {
+    let mut size = 0;
+    let mut pending: Vec<&Value> = assigns.iter().map(|(_key, value)| value).collect();
+
+    while let Some(value) = pending.pop() {
+        if size > LARGE_INPUT {
+            break;
+        }
+
+        size += std::mem::size_of::<Value>();
+        match value {
+            Value::Str(text) => size += text.len(),
+            Value::Array(array) => pending.extend(array.iter()),
+            Value::Dict(dict) => {
+                for (key, value) in dict.iter() {
+                    size += key.len();
+                    pending.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    size
 }
 
 /// Checks a template's syntax. Returns the syntax errors, which is empty for a valid template.
