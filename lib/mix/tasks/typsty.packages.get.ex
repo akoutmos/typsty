@@ -87,14 +87,20 @@ defmodule Mix.Tasks.Typsty.Packages.Get do
     Mix.shell().info("""
 
     Downloaded #{fetched} of #{total} #{if total == 1, do: "package", else: "packages"} into #{path}. \
-    Templates can import them when the :package_paths option includes that directory:
+    Templates can import them when the :package_paths option includes that directory, in \
+    config/runtime.exs:
 
         config :typsty, package_paths: [#{config_path(path)}]
     """)
   end
 
-  # In a release, a directory in priv is found through the app's directory
-  defp config_path("priv/" <> _ = path), do: ~s|Application.app_dir(:my_app, "#{path}")|
+  # In a release, a directory in priv is found through the app's directory, which is only
+  # known at runtime
+  defp config_path("priv/" <> _ = path) do
+    app = Mix.Project.config()[:app] || :my_app
+    ~s|Application.app_dir(#{inspect(app)}, "#{path}")|
+  end
+
   defp config_path(path), do: inspect(path)
 
   defp pinned!(package) do

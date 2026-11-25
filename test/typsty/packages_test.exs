@@ -45,6 +45,28 @@ defmodule Typsty.PackagesTest do
       # Imports itself in an example, which shouldn't be fetched again
       "examples/demo.typ" => ~s|#import "@preview/shout:0.2.0": shout|
     },
+    # Imports after a "/*" in a string, and Typst's own syntax for everything else
+    {"stringy", "1.0.0"} => %{
+      "lib.typ" => """
+      #let glob = "src/*"
+      #import "@preview/shout:0.2.0": shout
+      /* a comment */
+      ```typ
+      #import "@preview/in-raw:1.0.0"
+      ```
+      """
+    },
+    {"newer", "0.9.0"} => %{"lib.typ" => "#let x = 1"},
+    {"newer", "1.0.0"} => %{
+      "typst.toml" => """
+      [package]
+      name = "newer"
+      version = "1.0.0"
+      entrypoint = "lib.typ"
+      compiler = "0.16"
+      """,
+      "lib.typ" => "#let x = 1"
+    },
     {"future", "2.0.0"} => %{
       "typst.toml" => """
       [package]
@@ -74,7 +96,9 @@ defmodule Typsty.PackagesTest do
     %{"name" => "greet", "version" => "1.0.0", "compiler" => "0.12.0"},
     %{"name" => "greet", "version" => "1.1.0", "compiler" => "99.0.0"},
     %{"name" => "shout", "version" => "0.2.0"},
-    %{"name" => "future", "version" => "2.0.0", "compiler" => "99.0.0"}
+    %{"name" => "future", "version" => "2.0.0", "compiler" => "99.0.0"},
+    %{"name" => "newer", "version" => "0.9.0"},
+    %{"name" => "newer", "version" => "1.0.0", "compiler" => "0.16"}
   ]
 
   setup %{tmp_dir: tmp_dir} do
@@ -152,6 +176,46 @@ defmodule Typsty.PackagesTest do
              Packages.get(["@preview/greet"], dir, Keyword.put(opts, :typst_version, "99.0.0"))
   end
 
+  test "reads compiler bounds without a minor or patch version", %{dir: dir, opts: opts} do
+    assert [{{"preview", "newer", "0.9.0"}, :fetched, nil}] = Packages.get(["@preview/newer"], dir, opts)
+
+    Packages.get(["@preview/newer:1.0.0"], dir, opts)
+    assert_received {:warn, "warning: @preview/newer:1.0.0 requires Typst 0.16 or later, but Typsty uses Typst 0.15.1"}
+  end
+
+  test "finds imports with Typst's parser, so strings and raw text don't hide or fake them", %{dir: dir, opts: opts} do
+    assert [_stringy, {{"preview", "shout", "0.2.0"}, :fetched, _}] =
+             Packages.get(["@preview/stringy:1.0.0"], dir, opts)
+
+    refute_received {:get, "https://packages.typst.org/preview/in-raw-" <> _}
+  end
+
+  test "removes temporary directories that interrupted runs left behind", %{dir: dir, opts: opts} do
+    stale = Path.join(dir, "preview/greet/.1.0.0.tmp-leftover")
+    File.mkdir_p!(stale)
+    File.touch!(stale, System.os_time(:second) - 3600)
+
+    Packages.get(["@preview/greet:1.1.0"], dir, Keyword.put(opts, :typst_version, "99.0.0"))
+    refute File.exists?(stale)
+  end
+
+  test "skips the proxy for hosts in NO_PROXY, the way curl does" do
+    on_exit(fn -> System.delete_env("NO_PROXY") end)
+
+    for {no_proxy, expected} <- [
+          {"packages.typst.org", true},
+          {"typst.org", true},
+          {".typst.org", true},
+          {"*", true},
+          {"example.com, TYPST.ORG:443", true},
+          {"ypst.org", false},
+          {"", false}
+        ] do
+      System.put_env("NO_PROXY", no_proxy)
+      assert Packages.no_proxy?("packages.typst.org") == expected, "NO_PROXY=#{inspect(no_proxy)}"
+    end
+  end
+
   test "raises when no version works with Typsty's Typst", %{dir: dir, opts: opts} do
     assert_raise Mix.Error, "no version of @preview/future works with Typst 0.15.1, which Typsty uses", fn ->
       Packages.get(["@preview/future"], dir, opts)
@@ -178,7 +242,7 @@ defmodule Typsty.PackagesTest do
   test "raises for download errors", %{dir: dir, opts: opts} do
     opts = Keyword.put(opts, :http_get, fn _url -> {:error, :timeout} end)
 
-    assert_raise Mix.Error, ~r/failed to download @preview\/shout:0.2.0 from .*shout-0.2.0.tar.gz: :timeout/, fn ->
+    assert_raise Mix.Error, ~r/failed to download @preview\/shout:0.2.0 from .*shout-0.2.0.tar.gz: it timed out/, fn ->
       Packages.get(["@preview/shout:0.2.0"], dir, opts)
     end
   end
@@ -202,9 +266,9 @@ defmodule Typsty.PackagesTest do
     refute_received {:get, "https://packages.typst.org/preview/nope-" <> _}
   end
 
-  test "raises for archives without files, or with files that aren't in the package", %{dir: dir, opts: opts} do
-    for package <- ["@preview/dot:1.0.0"] do
-      assert_raise Mix.Error, ~r/has a file outside the package/, fn -> Packages.get([package], dir, opts) end
+  test "raises for archives with files outside the package, and saves empty ones", %{dir: dir, opts: opts} do
+    assert_raise Mix.Error, ~r/has a file outside the package/, fn ->
+      Packages.get(["@preview/dot:1.0.0"], dir, opts)
     end
 
     # An empty package is saved as an empty directory
@@ -267,6 +331,17 @@ defmodule Typsty.PackagesTest do
              Typsty.to_pdf(~S|#import "@preview/greet:1.0.0": greet|, %{}, package_paths: ["/no/such/dir"])
 
     assert List.last(diagnostic.hints) =~ "Searched /no/such/dir (which doesn't exist)"
+  end
+
+  test "rendering says when :package_paths names the namespace's directory", %{dir: dir, opts: opts} do
+    Packages.get(["@preview/shout:0.2.0"], dir, opts)
+    source = ~S|#import "@preview/shout:0.2.0": shout|
+
+    assert {:error, %Typsty.RenderError{diagnostics: [diagnostic]}} =
+             Typsty.to_pdf(source, %{}, package_paths: [Path.join(dir, "preview")])
+
+    assert List.last(diagnostic.hints) =~
+             "has the package, but :package_paths must name the directory that holds preview/: #{dir}"
   end
 
   describe "mix typsty.packages.get" do

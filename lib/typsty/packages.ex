@@ -13,11 +13,12 @@ defmodule Typsty.Packages do
 
   @spec_format ~r/\A@([a-z0-9][a-z0-9_-]*)\/([A-Za-z0-9][A-Za-z0-9_-]*)(?::(\d+\.\d+\.\d+))?\z/
 
-  # Packages that a package's Typst files import, such as `#import "@preview/oxifmt:1.0.0"`
-  @imported_spec ~r/"@(preview)\/([A-Za-z0-9][A-Za-z0-9_-]*):(\d+\.\d+\.\d+)/
+  # The HTTP client's profile, so that the task's proxy settings don't change the VM's
+  # default profile
+  @profile :typsty_packages
 
-  # Comments, which can mention imports that aren't made
-  @comment ~r/\/\/[^\n]*|\/\*.*?\*\//s
+  # Temporary directories older than this are left over from runs that were interrupted
+  @stale_after_seconds 600
 
   # The most a package's archive may take, downloaded and decompressed
   @max_download_size 64 * 1024 * 1024
@@ -198,34 +199,65 @@ defmodule Typsty.Packages do
 
   # The archive is extracted into a new directory next to the package's, and then moved into
   # place, so that an interrupted download doesn't leave a package that looks complete, and
-  # so that runs at the same time don't write into each other's files
+  # so that runs at the same time don't write into each other's files. With :force, the old
+  # package is moved aside first, and only deleted once the new one is in place.
   defp extract!(archive, package, dir, context) do
     files = files!(archive, package)
 
-    tmp = Path.join(Path.dirname(dir), ".#{Path.basename(dir)}.tmp-#{random_suffix()}")
-    mkdir!(Path.dirname(dir), package)
+    parent = Path.dirname(dir)
+    mkdir!(parent, package)
+    remove_stale(parent)
+
+    tmp = Path.join(parent, ".#{Path.basename(dir)}.tmp-#{random_suffix()}")
+    old = Path.join(parent, ".#{Path.basename(dir)}.old-#{random_suffix()}")
     mkdir!(tmp, package)
 
     try do
       for {name, contents} <- files do
-        path = Path.join(tmp, relative_path!(name, tmp, package))
-        mkdir!(Path.dirname(path), package)
-        write!(path, contents, package)
+        relative = relative_path!(name, tmp, package)
+        path = Path.join(tmp, relative)
+
+        with :ok <- File.mkdir_p(Path.dirname(path)),
+             :ok <- File.write(path, contents) do
+          :ok
+        else
+          {:error, reason} ->
+            Mix.raise("the archive of #{format(package)} is invalid: #{relative}: #{:file.format_error(reason)}")
+        end
       end
 
-      if context.force?, do: File.rm_rf(dir)
+      if context.force?, do: File.rename(dir, old)
       move_into_place!(tmp, dir, package)
     after
       File.rm_rf(tmp)
+      File.rm_rf(old)
+    end
+  end
+
+  # Removes the temporary directories that runs which were interrupted left behind
+  defp remove_stale(parent) do
+    now = System.os_time(:second)
+
+    for name <- File.ls!(parent),
+        String.starts_with?(name, "."),
+        String.contains?(name, [".tmp-", ".old-"]),
+        path = Path.join(parent, name),
+        {:ok, %File.Stat{mtime: mtime}} <- [File.stat(path, time: :posix)],
+        now - mtime > @stale_after_seconds do
+      File.rm_rf(path)
     end
   end
 
   defp files!(archive, package) do
     with {:ok, tar} <- gunzip(archive, package),
-         {:ok, files} <- :erl_tar.extract({:binary, tar}, [:memory]) do
+         {:tar, {:ok, files}} <- {:tar, :erl_tar.extract({:binary, tar}, [:memory])} do
       files
     else
-      {:error, reason} -> Mix.raise("the archive of #{format(package)} is invalid: #{describe(reason)}")
+      {:error, reason} ->
+        Mix.raise("the archive of #{format(package)} is invalid: #{describe(reason)}")
+
+      {:tar, {:error, reason}} ->
+        Mix.raise("the archive of #{format(package)} is invalid: #{:erl_tar.format_error(reason)}")
     end
   end
 
@@ -237,7 +269,7 @@ defmodule Typsty.Packages do
       :zlib.inflateInit(z, 31)
       inflate(z, :zlib.safeInflate(z, archive), [], 0, package)
     rescue
-      error in ErlangError -> {:error, "it isn't a gzip file (#{inspect(error.original)})"}
+      ErlangError -> {:error, "it isn't a valid gzip file"}
     after
       :zlib.close(z)
     end
@@ -290,26 +322,25 @@ defmodule Typsty.Packages do
     end
   end
 
-  defp write!(path, contents, package) do
-    case File.write(path, contents) do
-      :ok -> :ok
-      {:error, reason} -> Mix.raise("failed to save #{format(package)}: #{path}: #{:file.format_error(reason)}")
-    end
-  end
-
   defp random_suffix, do: 8 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
 
-  # The packages imported by the package's Typst files, leaving out comments. This may
-  # include packages that are only imported by its examples.
+  # The packages the package's Typst files import or include, found by parsing them with
+  # Typst's parser, so that imports in comments and strings don't count. This may include
+  # packages that are only imported by its examples.
   defp imports(dir) do
     dir
     |> Path.join("**/*.typ")
     |> Path.wildcard()
     |> Enum.flat_map(fn file ->
-      text = file |> File.read!() |> String.replace(@comment, "")
-      Regex.scan(@imported_spec, text, capture: :all_but_first)
+      text = File.read!(file)
+      if String.valid?(text), do: Typsty.Native.package_imports(text), else: []
     end)
-    |> Enum.map(fn [namespace, name, version] -> {namespace, name, version} end)
+    |> Enum.flat_map(fn spec ->
+      case Regex.run(@spec_format, spec) do
+        [_, "preview", name, version] -> [{"preview", name, version}]
+        _other -> []
+      end
+    end)
     |> Enum.uniq()
     |> Enum.sort()
   end
@@ -324,23 +355,52 @@ defmodule Typsty.Packages do
     end
   end
 
+  # A package's compiler bound may leave out the minor and patch versions ("0.16"), which
+  # then count as 0
   defp compatible?(compiler, typst_version) do
-    case Version.parse(compiler) do
+    padded =
+      case String.split(compiler, ".") do
+        [major] -> "#{major}.0.0"
+        [major, minor] -> "#{major}.#{minor}.0"
+        _parts -> compiler
+      end
+
+    case Version.parse(padded) do
       {:ok, compiler} -> Version.compare(compiler, typst_version) != :gt
       :error -> true
     end
   end
 
   defp describe(reason) when is_binary(reason), do: reason
+  defp describe(:timeout), do: "it timed out"
+
+  defp describe({:failed_connect, [{:to_address, {host, port}} | _]}) do
+    "couldn't connect to #{host}:#{port}"
+  end
+
+  defp describe({:could_not_establish_ssl_tunnel, {_version, 407, _reason}}) do
+    "the proxy needs a user and password (it answered 407 Proxy Authentication Required)"
+  end
+
+  defp describe({:could_not_establish_ssl_tunnel, {_version, status, reason}}) do
+    "the proxy refused to connect (#{status} #{reason})"
+  end
+
   defp describe(reason), do: inspect(reason)
 
   # Gets a URL with :httpc, verifying the server's certificate. Honors the HTTPS_PROXY,
-  # HTTP_PROXY and NO_PROXY environment variables.
+  # HTTP_PROXY and NO_PROXY environment variables. The body is read as it arrives, and the
+  # download is stopped once it's larger than @max_download_size.
   defp http_get(url) do
     {:ok, _apps} = Application.ensure_all_started(:inets)
     {:ok, _apps} = Application.ensure_all_started(:ssl)
-    proxy_auth = configure_proxy(url)
 
+    case :inets.start(:httpc, profile: @profile) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
+    proxy_auth = configure_proxy(URI.parse(url))
     headers = [{~c"user-agent", ~c"typsty/#{@version}"}]
 
     http_options =
@@ -349,57 +409,127 @@ defmodule Typsty.Packages do
         connect_timeout: 15_000,
         ssl: [
           verify: :verify_peer,
-          cacerts: :public_key.cacerts_get(),
+          cacerts: cacerts!(),
           depth: 3,
           customize_hostname_check: [match_fun: :public_key.pkix_verify_hostname_match_fun(:https)]
         ]
       ] ++ proxy_auth
 
-    case :httpc.request(:get, {String.to_charlist(url), headers}, http_options, body_format: :binary) do
-      {:ok, {{_version, 200, _reason}, _headers, body}} when byte_size(body) > @max_download_size ->
-        {:error, "it's larger than #{div(@max_download_size, 1024 * 1024)} MiB"}
+    options = [sync: false, stream: :self, body_format: :binary]
 
-      {:ok, {{_version, 200, _reason}, _headers, body}} ->
-        {:ok, body}
-
-      {:ok, {{_version, 404, _reason}, _headers, _body}} ->
-        {:error, :not_found}
-
-      {:ok, {{_version, status, _reason}, _headers, _body}} ->
-        {:error, "HTTP #{status}"}
-
-      {:error, reason} ->
-        {:error, reason}
+    case :httpc.request(:get, {String.to_charlist(url), headers}, http_options, options, @profile) do
+      {:ok, request} -> receive_body(request, [], 0)
+      {:error, reason} -> {:error, reason}
     end
   end
 
-  # Returns the options for an authenticated proxy, if the proxy has a user and password
-  defp configure_proxy(url) do
-    no_proxy =
-      ~w(NO_PROXY no_proxy)
-      |> Enum.find_value("", &System.get_env/1)
-      |> String.split(",", trim: true)
-      |> Enum.map(&(&1 |> String.trim() |> String.to_charlist()))
+  defp cacerts! do
+    :public_key.cacerts_get()
+  rescue
+    error ->
+      Mix.raise(
+        "couldn't load the system's CA certificates, to verify Typst Universe's: #{Exception.message(error)}. " <>
+          "Install them (the ca-certificates package, on most Linux distributions)"
+      )
+  end
 
-    scheme = if String.starts_with?(url, "https:"), do: :https_proxy, else: :proxy
+  # Successful responses are streamed; others come whole
+  defp receive_body(request, body, size) do
+    receive do
+      {:http, {^request, :stream_start, _headers}} ->
+        receive_body(request, body, size)
+
+      {:http, {^request, :stream, chunk}} ->
+        size = size + byte_size(chunk)
+
+        if size > @max_download_size do
+          :httpc.cancel_request(request, @profile)
+          {:error, "it's larger than #{div(@max_download_size, 1024 * 1024)} MiB"}
+        else
+          receive_body(request, [body, chunk], size)
+        end
+
+      {:http, {^request, :stream_end, _headers}} ->
+        {:ok, IO.iodata_to_binary(body)}
+
+      {:http, {^request, {{_version, 200, _reason}, _headers, whole}}} ->
+        {:ok, whole}
+
+      {:http, {^request, {{_version, 404, _reason}, _headers, _body}}} ->
+        {:error, :not_found}
+
+      {:http, {^request, {{_version, status, _reason}, _headers, _body}}} ->
+        {:error, "HTTP #{status}"}
+
+      {:http, {^request, {:error, reason}}} ->
+        {:error, reason}
+    after
+      130_000 ->
+        :httpc.cancel_request(request, @profile)
+        {:error, :timeout}
+    end
+  end
+
+  # Sets the proxy for the URL, returning the options for a proxy with a user and password
+  defp configure_proxy(%URI{scheme: scheme, host: host}) do
+    option = if scheme == "https", do: :https_proxy, else: :proxy
 
     variables =
-      if scheme == :https_proxy, do: ~w(HTTPS_PROXY https_proxy HTTP_PROXY http_proxy), else: ~w(HTTP_PROXY http_proxy)
+      if scheme == "https", do: ~w(HTTPS_PROXY https_proxy HTTP_PROXY http_proxy), else: ~w(HTTP_PROXY http_proxy)
 
-    with value when is_binary(value) <- Enum.find_value(variables, &System.get_env/1),
-         value = if(String.contains?(value, "://"), do: value, else: "http://" <> value),
-         %URI{host: host, port: port, userinfo: userinfo} when is_binary(host) <- URI.parse(value) do
-      :httpc.set_options([{scheme, {{String.to_charlist(host), port}, no_proxy}}])
-
-      case userinfo && String.split(userinfo, ":", parts: 2) do
-        [user, password] ->
-          [proxy_auth: {String.to_charlist(URI.decode(user)), String.to_charlist(URI.decode(password))}]
-
-        _ ->
-          []
+    proxy =
+      with value when is_binary(value) <- Enum.find_value(variables, &env/1),
+           false <- no_proxy?(host),
+           value = if(String.contains?(value, "://"), do: value, else: "http://" <> value),
+           %URI{host: proxy_host} = proxy when proxy_host not in [nil, ""] <- URI.parse(value) do
+        proxy
+      else
+        _ -> nil
       end
-    else
-      _ -> []
+
+    # The profile is the task's own, and has no proxy until one is set
+    case proxy do
+      nil ->
+        []
+
+      %URI{host: proxy_host, port: port, userinfo: userinfo} ->
+        :httpc.set_options([{option, {{String.to_charlist(proxy_host), port}, []}}], @profile)
+
+        case userinfo && String.split(userinfo, ":", parts: 2) do
+          [user, password] ->
+            [proxy_auth: {String.to_charlist(URI.decode(user)), String.to_charlist(URI.decode(password))}]
+
+          _ ->
+            []
+        end
     end
+  end
+
+  # An environment variable's value, with an empty value counting as unset
+  defp env(name) do
+    case System.get_env(name) do
+      nil -> nil
+      value -> if String.trim(value) == "", do: nil, else: String.trim(value)
+    end
+  end
+
+  # Whether NO_PROXY exempts the host, matching the way curl does: `*` for every host, and
+  # otherwise a domain and its subdomains, with or without a leading dot or a port
+  @doc false
+  @spec no_proxy?(String.t() | nil) :: boolean()
+  def no_proxy?(host) do
+    host = String.downcase(host || "")
+
+    (env("NO_PROXY") || env("no_proxy") || "")
+    |> String.split(",", trim: true)
+    |> Enum.map(&(&1 |> String.trim() |> String.downcase()))
+    |> Enum.any?(fn
+      "*" ->
+        true
+
+      entry ->
+        domain = entry |> String.trim_leading(".") |> String.split(":") |> hd()
+        domain != "" and (host == domain or String.ends_with?(host, "." <> domain))
+    end)
   end
 end
