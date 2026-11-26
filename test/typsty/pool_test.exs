@@ -68,6 +68,17 @@ defmodule Typsty.PoolTest do
     end
   end
 
+  # Waits until a render has started in its worker. A worker is checked out a moment before
+  # the process rendering with it takes its port and sends the request, and the process
+  # waits for the result in await/5 once the worker has acknowledged it
+  defp wait_until_rendering(render, tries \\ 500) do
+    cond do
+      Process.info(render, :current_function) == {:current_function, {Pool, :await, 5}} -> :ok
+      tries == 0 -> flunk("the render never started")
+      true -> Process.sleep(10) && wait_until_rendering(render, tries - 1)
+    end
+  end
+
   describe "rendering" do
     test "returns exactly what the NIF returns", %{pool: pool} do
       # A 1x1 transparent PNG
@@ -245,7 +256,7 @@ defmodule Typsty.PoolTest do
         spawn(fn -> send(parent, {:result, Typsty.to_pdf(@busy, %{}, pool: pool, timeout: :infinity)}) end)
 
       monitor = Process.monitor(render)
-      wait_until_busy(pool)
+      wait_until_rendering(render)
       stop_supervised!(pool)
 
       assert_receive {:result, {:error, %RenderError{reason: :crashed, diagnostics: [%{message: message}]}}}, 5_000
