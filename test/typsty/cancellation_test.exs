@@ -44,6 +44,21 @@ defmodule Typsty.CancellationTest do
     assert wait_until_idle(2_000) == 0
   end
 
+  # Here, with no other renders running, so that it can't wait for a slot past its timeout
+  test "a render doing pure computation returns an error at its timeout, and finishes in the background" do
+    # Typst can't cancel pure computation until it ends, which takes a second or more
+    slow = "#let n = 0\n#for i in range(20000000) { n += 1 }\n#n // #{System.unique_integer()}"
+
+    assert {:error, %RenderError{reason: :timeout, diagnostics: [%{message: message}]}} =
+             Typsty.to_pdf(slow, %{}, timeout: 50)
+
+    assert message == "rendering didn't finish within the timeout (50 ms), and is being cancelled"
+    assert Typsty.running_renders() == 1
+
+    assert {:ok, _pdf} = Typsty.to_pdf("still works", %{}, timeout: :infinity)
+    assert wait_until_idle() == 0
+  end
+
   test "PNG exports are cancelled between pages" do
     assert {:error, %RenderError{}} = Typsty.to_png(long_document(), %{}, timeout: 50)
     assert wait_until_idle(2_000) == 0

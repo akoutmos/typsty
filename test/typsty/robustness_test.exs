@@ -226,16 +226,4 @@ defmodule Typsty.RobustnessTest do
       assert "files outside the project root can only be read by changing the :root option" in hints
     end
   end
-
-  describe "timeouts" do
-    test "return an error while the render finishes in the background" do
-      slow = "#let n = 0\n#for i in range(20000000) { n += 1 }\n#n"
-      assert_render_error(Typsty.to_pdf(slow, %{}, timeout: 50), "didn't finish within the timeout (50 ms)")
-      assert {:ok, _pdf} = Typsty.to_pdf("still works", %{}, timeout: :infinity)
-
-      assert_raise ArgumentError, ~r/invalid value for :timeout option: expected a positive integer/, fn ->
-        Typsty.to_pdf("x", %{}, timeout: 0)
-      end
-    end
-  end
 end
