@@ -3,7 +3,8 @@
 Typsty's NIF, and the `typsty_worker` program `Typsty.Pool` runs, are precompiled for each
 target by the `Build precompiled NIFs` workflow (`.github/workflows/release.yml`), and
 RustlerPrecompiled downloads them from the GitHub release of the version. Each target's
-tarball holds both, with Typsty's license and `THIRD_PARTY_NOTICES.txt`: RustlerPrecompiled
+tarball holds both, with Typsty's license and `THIRD_PARTY_NOTICES.txt` (as `typsty-LICENSE.txt`
+and `typsty-THIRD_PARTY_NOTICES.txt`): RustlerPrecompiled
 checks the tarball against its checksum and extracts all of it into `priv/native`, which
 puts the worker next to the NIF. The tarballs are built by `.github/scripts/build-native.sh`,
 which also works locally for the machine's own target:
@@ -25,6 +26,9 @@ elixir .github/scripts/third_party_notices.exs
 ```
 
 ## Before the first release, and after changing the release workflow
+
+CI uploads test coverage to Coveralls, which fails until the repository is enabled on
+coveralls.io: enable it before the first merge to `master`.
 
 Run the `Build precompiled NIFs` workflow by hand (Actions, then "Run workflow") on
 `master`. Without a tag, it builds every target and uploads the tarballs as artifacts of the
@@ -74,8 +78,14 @@ order:
    ```
 
    In a scratch project that depends on it with `path: "/tmp/typsty-0.1.0"`, compile
-   without Rust (the NIF and the worker are downloaded and checked against the checksum
-   file) and render a document, inside the VM and in a `Typsty.Pool`.
+   without Rust and with an empty download cache, so that the NIF and the worker really
+   are downloaded from the release (and checked against the checksum file):
+
+   ```shell
+   RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH=$(mktemp -d) mix compile
+   ```
+
+   Then render a document, inside the VM and in a `Typsty.Pool`.
 5. Publish to Hex with `mix hex.publish`, which publishes the docs too. The checksum file
    is part of the package (and ignored by git: a git dependency on a release's tag builds
    the NIF from source, with `TYPSTY_BUILD=1`). Until it exists, `mix hex.build` and

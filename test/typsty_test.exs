@@ -130,6 +130,38 @@ defmodule TypstyTest do
       assert byte_size(large) > byte_size(small)
     end
 
+    test "raises for options with values the native code can't take" do
+      assert_raise ArgumentError, ~r/invalid value for :ppi option: expected a positive number of at most 10000/, fn ->
+        Typsty.to_png("x", %{}, ppi: Integer.pow(10, 400))
+      end
+
+      assert_raise ArgumentError, ~r/:font_paths option: expected a list of paths .* and nil isn't one/, fn ->
+        Typsty.to_pdf("x", %{}, font_paths: [nil])
+      end
+
+      assert_raise ArgumentError, ~r/:files option: expected paths \(strings\) mapped to binaries, got: nil/, fn ->
+        Typsty.to_pdf("x", %{}, files: [nil])
+      end
+    end
+
+    test "returns the warnings that came before an error" do
+      source = ~s|#set text(font: "No Such Font")\nHi\n#assigns.missing|
+      assert {:error, %RenderError{diagnostics: diagnostics}} = Typsty.to_pdf(source)
+      assert [%{severity: :error}, %{severity: :warning, message: "unknown font family: no such font"}] = diagnostics
+    end
+
+    test "leaves links to URLs other than web, mail and phone ones out" do
+      source = ~S|#link(assigns.bad)[bad] #link(assigns.good)[good]|
+      assigns = %{bad: " JavaScript:alert(document.domain)", good: "https://example.com/?a=1&b=<2>"}
+
+      assert {:ok, [svg]} = Typsty.to_svg(source, assigns)
+      refute svg =~ ~r/javascript/i
+      assert svg =~ ~s|href="https://example.com/?a=1&amp;b=&lt;2&gt;"|
+      assert {_document, []} = svg |> String.to_charlist() |> :xmerl_scan.string(quiet: true)
+
+      assert {:ok, _pdf} = Typsty.to_pdf(source, assigns)
+    end
+
     test "raises for templates that aren't Typst source" do
       assert_raise ArgumentError, ~r/the template's source isn't valid UTF-8/, fn ->
         Typsty.to_pdf(%Template{source: <<0xFF>>})
@@ -172,9 +204,11 @@ defmodule TypstyTest do
         Typsty.to_pdf("x", %{}, max_concurrent_renders: 2)
       end
 
-      assert_raise ArgumentError, "invalid value for :ppi option: expected a positive number, got: 0", fn ->
-        Typsty.to_png("x", %{}, ppi: 0)
-      end
+      assert_raise ArgumentError,
+                   "invalid value for :ppi option: expected a positive number of at most 10000, got: 0",
+                   fn ->
+                     Typsty.to_png("x", %{}, ppi: 0)
+                   end
 
       assert_raise ArgumentError,
                    ~s|invalid value for :font_paths option: expected a list of paths, got: "fonts"|,
@@ -200,11 +234,15 @@ defmodule TypstyTest do
                      Typsty.to_pdf("x", %{}, timeout: 5_000_000_000)
                    end
 
-      assert_raise ArgumentError,
-                   ~r/:pool option \(or the :pool config\) names no running Typsty.Pool: :no_such_pool/,
-                   fn ->
-                     Typsty.to_pdf("x", %{}, pool: :no_such_pool)
-                   end
+      # A pool that isn't running may be restarting, which is an error like a pool that stops
+      assert {:error, %RenderError{reason: :crashed, diagnostics: [%{message: message}]}} =
+               Typsty.to_pdf("x", %{}, pool: :no_such_pool)
+
+      assert message == "the pool :no_such_pool isn't running (a Typsty.Pool in a supervision tree may be restarting)"
+
+      assert_raise ArgumentError, ~r/^the :pool option must be a Typsty.Pool, got: #PID/, fn ->
+        Typsty.to_pdf("x", %{}, pool: self())
+      end
 
       assert_raise ArgumentError,
                    ~r/^invalid value for :pool option: expected the name or pid of a Typsty.Pool, or nil/,
@@ -214,9 +252,11 @@ defmodule TypstyTest do
 
       assert_raise ArgumentError, ~r/^unknown options \[:indnet\]/, fn -> Typsty.format("x", indnet: 2) end
 
-      assert_raise ArgumentError, ~r/^invalid value for :line_length option: expected positive integer/, fn ->
-        Typsty.format("x", line_length: 0)
-      end
+      assert_raise ArgumentError,
+                   ~r/^invalid value for :line_length option: expected a positive integer of at most 10000, got: 0/,
+                   fn ->
+                     Typsty.format("x", line_length: 0)
+                   end
 
       assert_raise ArgumentError, ~r/^unknown options \[:ppi\], valid options are: \[:font_paths/, fn ->
         Typsty.font_families(ppi: 1)
@@ -295,6 +335,12 @@ defmodule TypstyTest do
       assert {:ok, _pdf} = Typsty.to_pdf(source, %{}, root: root, files: %{"b.txt" => "from files"})
     end
 
+    test "raises for a :root directory that doesn't exist" do
+      assert_raise ArgumentError, ~r/the :root directory ".*no_such_dir" doesn't exist, or isn't a directory/, fn ->
+        Typsty.to_pdf("x", %{}, root: "no_such_dir")
+      end
+    end
+
     test "returns an error for a file that wasn't given, without reading from disk" do
       assert {:error, %RenderError{diagnostics: [diagnostic]}} = Typsty.to_pdf(~S|#read("mix.exs")|)
       assert diagnostic.message =~ "/mix.exs is not in the :files option"
@@ -363,6 +409,16 @@ defmodule TypstyTest do
     test "returns the syntax errors" do
       assert {:error, [%Diagnostic{message: "unclosed delimiter", line: 2, column: 10}]} =
                Typsty.validate("Fine\n#let x = (1, 2")
+    end
+
+    test "raises for anything but a string, as format/2 does" do
+      # Through apply/3, which keeps Elixir's type checker from flagging the calls
+      for {function, args} <- [validate: [nil], format: [nil], format: [123, []]] do
+        assert_raise ArgumentError, ~r/expected Typst source \(a string\), got: (nil|123)/, fn ->
+          # credo:disable-for-next-line Credo.Check.Refactor.Apply
+          apply(Typsty, function, args)
+        end
+      end
     end
   end
 

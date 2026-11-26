@@ -12,7 +12,8 @@ defmodule Typsty.RenderError do
       renders were already running, or every worker in its `Typsty.Pool` was busy.
     - `:memory_limit` - the render went over its `Typsty.Pool`'s `:memory_limit`.
     - `:crashed` - the render ended without a result: Typst crashed (a bug in Typst or
-      Typsty), the pool's worker crashed, or the pool stopped.
+      Typsty, which extreme values can reach, such as a date past the year 9999), the
+      pool's worker crashed, or the pool stopped.
   - `:diagnostics` - the errors, as `Typsty.Diagnostic` structs. For reasons other than
     `:typst`, it's a single error that says what happened.
 

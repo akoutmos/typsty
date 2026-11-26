@@ -2,12 +2,13 @@ defmodule Typsty.Pool do
   @moduledoc """
   A pool of worker processes that render documents outside of the BEAM.
 
-  By default, Typsty renders inside your VM. That's the fastest way to render, and it's
-  protected against everything the data can do (see
+  By default, Typsty renders inside your VM. That's the fastest way to render, and the
+  right one for well validated data (see
   [What a template can do](Typsty.html#module-what-a-template-can-do)). A template is code,
-  though, and a template that loops for a long time or allocates without bound can only be
-  stopped by ending the process it runs in. The pool runs renders in separate OS processes,
-  so that it can:
+  though, and a template that loops for a long time or allocates without bound, as data
+  can make it do, can only be stopped by ending the process it runs in. Favor a pool for
+  input from untrusted users that isn't well validated, and for files they upload. The
+  pool runs renders in separate OS processes, so that it can:
 
   - **stop a render at its timeout**, whatever it's doing, by ending its worker
   - **limit the memory** a render can use, ending its worker when it goes over
@@ -113,8 +114,19 @@ defmodule Typsty.Pool do
   # How many workers a render tries when the ones it gets turn out to have exited
   @checkout_attempts 3
 
-  # How a worker acknowledges a request: :started
-  @started :erlang.term_to_binary(:started)
+  # How a worker acknowledges a request: :started, which it always encodes as a UTF-8 atom
+  # (older OTP versions encode atoms differently by default, so this isn't term_to_binary's)
+  @started <<131, 119, 7, "started">>
+
+  # The environment variables a worker gets, which finding fonts and temporary files can
+  # need. The VM's other variables can hold secrets (DATABASE_URL, say), which a worker
+  # compromised by a malicious file shouldn't be able to read
+  @worker_env ~w(HOME USERPROFILE LOCALAPPDATA APPDATA WINDIR SYSTEMROOT SYSTEMDRIVE TEMP TMP TMPDIR
+                 PATH LD_LIBRARY_PATH LANG LC_ALL LC_CTYPE TZ XDG_DATA_HOME XDG_DATA_DIRS
+                 XDG_CONFIG_HOME XDG_CONFIG_DIRS XDG_CACHE_HOME FONTCONFIG_FILE FONTCONFIG_PATH
+                 FONTCONFIG_SYSROOT)
+
+  @pool_key :"$typsty_pool"
 
   # How long a worker that failed to start waits before the pool starts another
   @restart_delay 1_000
@@ -138,7 +150,8 @@ defmodule Typsty.Pool do
   Starts a pool. See [Options](#module-options) for the options.
 
   Raises `ArgumentError` for invalid options, and raises if the worker program can't run,
-  before starting any workers.
+  before starting any workers. With a `:memory_limit`, it also starts a worker to check
+  that the limit leaves room for the fonts renders use by default.
   """
   @spec start_link([option()]) :: GenServer.on_start()
   def start_link(opts) do
@@ -151,6 +164,7 @@ defmodule Typsty.Pool do
     executable = executable!()
     args = if(memory_limit, do: ["--memory-limit", Integer.to_string(memory_limit)], else: [])
     check_worker!(executable, args, memory_limit)
+    if memory_limit, do: check_memory_limit!(executable, args, memory_limit)
 
     pool_state = %{
       executable: executable,
@@ -206,6 +220,25 @@ defmodule Typsty.Pool do
     end
   end
 
+  # A worker loads the fonts renders use by default before it takes renders, which `--check`
+  # doesn't, so a memory limit too low for that would otherwise leave the pool without workers
+  defp check_memory_limit!(executable, args, memory_limit) do
+    port = open_worker(executable, args)
+
+    case warm_up(port) do
+      :ok ->
+        close(port)
+
+      {:error, @exit_memory_limit, _why} ->
+        raise ArgumentError,
+              "the :memory_limit option (#{memory_limit} bytes) is too low for a worker to load the " <>
+                "fonts renders use by default: raise it, or turn :system_fonts off"
+
+      {:error, _status, why} ->
+        raise "Typsty.Pool's worker program at #{executable} failed to start (#{why})"
+    end
+  end
+
   @doc false
   # Renders in a worker. Takes the arguments of Typsty.Native.start_render/5 (the pool
   # aside), and returns what the NIF returns or sends, or {:error, reason, message}.
@@ -257,7 +290,7 @@ defmodule Typsty.Pool do
         pool_monitor = Process.monitor(pool_pid)
 
         try do
-          send_request(port, request, remaining(deadline), {monitor, pool_pid, pool_monitor}, worker)
+          send_request(port, request, deadline, {monitor, pool_pid, pool_monitor}, worker)
         after
           Process.demonitor(monitor, [:flush])
           Process.demonitor(pool_monitor, [:flush])
@@ -270,10 +303,20 @@ defmodule Typsty.Pool do
     end
   end
 
-  defp send_request(port, {template, assigns, files, options}, remaining, monitors, worker)
-       when remaining == :infinity or remaining > 0 do
-    timeout = if remaining == :infinity, do: nil, else: remaining
-    request = :erlang.term_to_iovec({:render, template, assigns, files, %{options | timeout: timeout}})
+  defp send_request(port, {template, assigns, files, options}, deadline, monitors, worker) do
+    case remaining(deadline) do
+      remaining when remaining == :infinity or remaining > 0 ->
+        timeout = if remaining == :infinity, do: nil, else: remaining
+        request = :erlang.term_to_iovec({:render, template, assigns, files, %{options | timeout: timeout}})
+        send_request(port, request, deadline, monitors, worker, options.timeout)
+
+      # The deadline passed while waiting for a worker
+      _expired ->
+        {:unused, busy(options.timeout)}
+    end
+  end
+
+  defp send_request(port, request, deadline, monitors, worker, timeout) do
     size = :erlang.iolist_size(request)
 
     cond do
@@ -297,25 +340,25 @@ defmodule Typsty.Pool do
           # The port closed since it was taken: the worker had exited
           ArgumentError -> :retry
         else
-          true -> await_start(port, monitors, worker, remaining, options.timeout)
+          true -> await_start(port, monitors, worker, deadline, timeout, size)
         end
     end
-  end
-
-  # The deadline passed while waiting for a worker
-  defp send_request(_port, {_template, _assigns, _files, options}, _expired, _monitors, _worker) do
-    {:unused, busy(options.timeout)}
   end
 
   # The worker acknowledges a request as soon as it reads it. A worker that exits before
   # that had died before it got the request (killed while it was idle, say), so the render
   # goes to another worker
-  defp await_start(port, {monitor, pool_pid, pool_monitor} = monitors, worker, remaining, timeout) do
-    wait = if remaining == :infinity, do: :infinity, else: min(remaining + @grace_period, @max_wait)
-
+  defp await_start(port, {monitor, pool_pid, pool_monitor} = monitors, worker, deadline, timeout, size) do
     receive do
       {^port, {:data, @started}} ->
-        await(port, monitors, worker, remaining, timeout)
+        await(port, monitors, worker, deadline, timeout)
+
+      # The request didn't fit in the memory the worker had left
+      {^port, {:exit_status, @exit_memory_limit}} ->
+        {:exited,
+         {:error, :memory_limit,
+          "the template, assigns and files are #{size} bytes together, more than the render's worker " <>
+            "had room for under the pool's memory limit (#{worker.memory_limit} bytes)"}}
 
       {^port, {:exit_status, _status}} ->
         :retry
@@ -329,11 +372,16 @@ defmodule Typsty.Pool do
           do: :retry,
           else: {:exited, {:error, :crashed, "the pool stopped before the render started"}}
     after
-      wait ->
+      wait(deadline) ->
         close(port)
         {:exited, timed_out(timeout)}
     end
   end
+
+  # How long to wait for a worker's answer: until the grace period after the deadline, which
+  # gives the worker the time to stop the render itself
+  defp wait(nil), do: :infinity
+  defp wait(deadline), do: (deadline + @grace_period - System.monotonic_time(:millisecond)) |> max(0) |> min(@max_wait)
 
   # The worker's port is taken over for the render, so that its messages come here. It's
   # monitored rather than linked: a pool that stops while the port is here ends the port,
@@ -360,9 +408,7 @@ defmodule Typsty.Pool do
     end
   end
 
-  defp await(port, {monitor, pool_pid, pool_monitor}, worker, remaining, timeout) do
-    wait = if remaining == :infinity, do: :infinity, else: min(remaining + @grace_period, @max_wait)
-
+  defp await(port, {monitor, pool_pid, pool_monitor}, worker, deadline, timeout) do
     receive do
       {^port, {:data, data}} ->
         reply(port, data)
@@ -382,7 +428,7 @@ defmodule Typsty.Pool do
           {:exited, {:error, :crashed, "the pool stopped during the render"}}
         end
     after
-      wait ->
+      wait(deadline) ->
         # Closing the port ends the worker
         close(port)
         {:exited, timed_out(timeout)}
@@ -457,6 +503,7 @@ defmodule Typsty.Pool do
   end
 
   defp describe_exit(@exit_protocol), do: "it lost track of its requests"
+  defp describe_exit(@exit_memory_limit), do: "it went over the pool's :memory_limit"
 
   defp describe_exit(status) when status > 128 do
     case {:os.type(), status - 128} do
@@ -483,8 +530,16 @@ defmodule Typsty.Pool do
     # Responses are decoded with binary_to_term(data, [:safe]), which only accepts atoms
     # that exist, such as Typsty.Diagnostic's fields
     Code.ensure_loaded!(Diagnostic)
+
+    # Marks the process as a Typsty.Pool, rather than another kind of NimblePool
+    Process.put(@pool_key, true)
     {:ok, pool_state}
   end
+
+  @doc false
+  # Whether a process with this process dictionary is a Typsty.Pool
+  @spec __pool__?(keyword()) :: boolean()
+  def __pool__?(dictionary), do: List.keyfind(dictionary, @pool_key, 0) == {@pool_key, true}
 
   @impl NimblePool
   # A worker starts in the background, and joins the pool once it has scanned the fonts
@@ -497,20 +552,42 @@ defmodule Typsty.Pool do
   defp start_worker(%{executable: executable, args: args, memory_limit: memory_limit}, pool_pid) do
     port =
       try do
-        Port.open({:spawn_executable, executable}, [:binary, :exit_status, :use_stdio, :hide, packet: 4, args: args])
+        open_worker(executable, args)
       rescue
         error in ErlangError -> failed_to_start(Exception.message(error))
       end
 
-    warm_up(port)
+    with {:error, _status, why} <- warm_up(port), do: failed_to_start(why)
 
     # The port goes to the pool, so that it outlives this process
-    Port.connect(port, pool_pid)
+    try do
+      Port.connect(port, pool_pid)
+    rescue
+      # The pool stopped meanwhile
+      ArgumentError ->
+        close(port)
+        exit({:shutdown, :pool_stopped})
+    end
+
     Process.unlink(port)
     %{port: port, memory_limit: memory_limit, renders: 0}
   end
 
-  # Renders an empty document with the default options, which loads their fonts
+  defp open_worker(executable, args) do
+    # Variables are unset by name (the names of variables on Windows such as "=C:" can't be)
+    env =
+      for {name, _value} <- System.get_env(),
+          String.upcase(name) not in @worker_env and name != "" and not String.contains?(name, "="),
+          do: {String.to_charlist(name), false}
+
+    Port.open(
+      {:spawn_executable, executable},
+      [:binary, :exit_status, :use_stdio, :hide, packet: 4, args: args, env: env]
+    )
+  end
+
+  # Renders an empty document with the default options, which loads their fonts. Returns
+  # {:error, exit_status | nil, why} if the worker failed
   defp warm_up(port) do
     options =
       try do
@@ -523,35 +600,31 @@ defmodule Typsty.Pool do
     if options do
       options = options |> Typsty.__native_options__(:svg) |> Map.put(:timeout, nil)
       Port.command(port, :erlang.term_to_iovec({:render, "", %{}, [], options}))
-
-      receive do
-        {^port, {:data, @started}} -> warm_up_response(port)
-        {^port, {:exit_status, status}} -> failed_to_start(describe_exit(status))
-      after
-        @warm_up_timeout ->
-          close(port)
-          failed_to_start("it didn't answer within #{div(@warm_up_timeout, 1000)} seconds")
-      end
+      with :ok <- warm_up_answer(port, @started), do: warm_up_answer(port, :any)
+    else
+      :ok
     end
   end
 
-  defp warm_up_response(port) do
+  defp warm_up_answer(port, expected) do
     receive do
-      {^port, {:data, _response}} -> :ok
-      {^port, {:exit_status, status}} -> failed_to_start(describe_exit(status))
+      {^port, {:data, data}} when expected == :any or data == expected -> :ok
+      {^port, {:data, _data}} -> {:error, nil, "it answered out of step"}
+      {^port, {:exit_status, status}} -> {:error, status, describe_exit(status)}
     after
       @warm_up_timeout ->
         close(port)
-        failed_to_start("it didn't answer within #{div(@warm_up_timeout, 1000)} seconds")
+        {:error, nil, "it didn't answer within #{div(@warm_up_timeout, 1000)} seconds"}
     end
   end
 
   # NimblePool starts another worker right away: waiting keeps a worker that can't start
-  # from being restarted in a tight loop
+  # from being restarted in a tight loop. A shutdown exit, unlike others, isn't reported as
+  # a crash on top of the warning
   defp failed_to_start(why) do
     Logger.warning("a Typsty.Pool worker failed to start (#{why})")
     Process.sleep(@restart_delay)
-    exit(:worker_failed_to_start)
+    exit({:shutdown, :worker_failed_to_start})
   end
 
   @impl NimblePool

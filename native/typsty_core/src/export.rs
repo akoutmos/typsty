@@ -9,6 +9,7 @@ use typst_layout::{Page, PagedDocument};
 use typst_pdf::{PdfOptions, PdfStandard, PdfStandards, Timestamp};
 
 use crate::diagnostics::{self, Diagnostic};
+use crate::links;
 use crate::world::TypstyWorld;
 
 /// The most pixels rasterizing a page may take, for the page itself and for the images,
@@ -17,6 +18,11 @@ use crate::world::TypstyWorld;
 /// ask for more memory than exists, and a failed allocation aborts the VM. (Resizing images
 /// and encoding the page take memory on top of this, a few times as much at worst.)
 pub const MAX_PNG_PIXELS: f64 = (1u64 << 28) as f64;
+
+/// How far from the page, in pixels, content may be placed or scaled for PNG export:
+/// drawing content far outside the page takes typst-render minutes, which can't be
+/// cancelled.
+const MAX_PNG_REACH: f64 = 1e8;
 
 pub enum Output {
     Pdf(Vec<u8>),
@@ -27,7 +33,11 @@ pub fn pdf(
     document: &PagedDocument,
     standards: PdfStandards,
     world: &TypstyWorld,
+    warnings: &mut Vec<Diagnostic>,
 ) -> Result<Output, Vec<Diagnostic>> {
+    let changed = links::for_pdf(document, warnings);
+    let document = changed.as_ref().unwrap_or(document);
+
     let options = PdfOptions {
         standards,
         // Without an identifier, Typst derives one from the document's title and author
@@ -81,7 +91,11 @@ pub fn png(
     Ok(Output::Pages(pages))
 }
 
-pub fn svg(document: &PagedDocument, world: &TypstyWorld) -> Output {
+pub fn svg(
+    document: &PagedDocument,
+    world: &TypstyWorld,
+    warnings: &mut Vec<Diagnostic>,
+) -> Output {
     let options = typst_svg::SvgOptions::default();
 
     Output::Pages(
@@ -90,7 +104,8 @@ pub fn svg(document: &PagedDocument, world: &TypstyWorld) -> Output {
             .iter()
             .map(|page| {
                 world.check_cancelled();
-                typst_svg::svg(page, &options).into_bytes()
+                let page = links::for_svg(page, warnings);
+                typst_svg::svg(&page, &options).into_bytes()
             })
             .collect(),
     )
@@ -188,7 +203,26 @@ fn walk(
     pixel_per_pt: f64,
     budget: &mut Budget,
 ) -> Result<(), String> {
-    for (_position, item) in frame.items() {
+    for (position, item) in frame.items() {
+        let ts = ts.pre_concat(Transform::translate(position.x, position.y));
+
+        let reach = [
+            ts.sx.get(),
+            ts.ky.get(),
+            ts.kx.get(),
+            ts.sy.get(),
+            ts.tx.to_pt(),
+            ts.ty.to_pt(),
+        ];
+        if reach
+            .iter()
+            .any(|value| !value.is_finite() || value.abs() > MAX_PNG_REACH)
+        {
+            return Err(format!(
+                "content is placed or scaled more than {MAX_PNG_REACH:e} pixels away from the page, which can't be drawn"
+            ));
+        }
+
         match item {
             FrameItem::Group(group) => {
                 let container = match group.frame.kind() {

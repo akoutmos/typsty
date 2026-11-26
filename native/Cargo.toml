@@ -32,6 +32,9 @@ memchr = "2"
 roxmltree = "0.21"
 data-url = "0.3"
 libc = "0.2"
+# The libraries Typst parses bibliographies and SVGs with, which checks.rs parses them with too
+biblatex = "0.12"
+usvg = { version = "0.47", default-features = false }
 
 [profile.release]
 # Panics must unwind, so that they become errors instead of aborting the VM

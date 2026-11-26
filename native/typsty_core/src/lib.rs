@@ -8,6 +8,7 @@ pub mod diagnostics;
 pub mod export;
 pub mod fonts;
 pub mod isolate;
+pub mod links;
 pub mod render;
 pub mod values;
 pub mod world;

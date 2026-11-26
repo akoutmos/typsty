@@ -33,17 +33,19 @@ Intel), Linux (x86-64 and ARM64, glibc and musl) and Windows (x86-64).
   `.typ` file. `Typsty.validate/1` checks Typst source at runtime.
 - `Typsty.RenderError`, with a `:reason` that tells Typst's errors (`:typst`) from timeouts (`:timeout`), renders that
   couldn't start in time (`:busy`), the pool's memory limit (`:memory_limit`) and crashes (`:crashed`), and Typst's
-  diagnostics (message, hints, location and trace), mapped to the lines of the module or `.typ` file. Typst's warnings
-  are logged.
+  diagnostics (message, hints, location and trace), mapped to the lines of the module or `.typ` file, with the
+  warnings that came before the errors. Typst's warnings are logged.
 - `Typsty.Formatter`, a `mix format` plugin for `~TYPST` sigils and `.typ` files, using typstyle. `Typsty.format/2`
   formats Typst source.
 - PDF standards (such as PDF/A-2b and PDF/UA-1) with the `:pdf_standards` option, and the PNG resolution with `:ppi`.
 - Telemetry events for every render.
 - Options checked with NimbleOptions, in calls and in the application config (where unknown keys are typos), with
   errors that name the option, and option docs and typespecs generated from the same schemas.
-- `Typsty.Pool`, a pool of worker processes to render in, with the `:pool` option (per render, or in the config). A
-  render that runs past its timeout is stopped right away, a render can be given a memory limit (`:memory_limit`),
-  and a worker that crashes takes nothing else down. Workers are replaced when they're stopped, can be recycled after
+- `Typsty.Pool`, a pool of worker processes to render in, with the `:pool` option (per render, or in the config),
+  favored for input from untrusted users that isn't well validated. A render that runs past its timeout is stopped
+  right away, a render can be given a memory limit (`:memory_limit`),
+  and a worker that crashes takes nothing else down. Workers get only the environment variables that finding fonts
+  needs. Workers are replaced when they're stopped, can be recycled after
   a number of renders (`:max_renders`), and end with the pool, with the process rendering with them, and with the VM.
   Renders return what they return in the NIF, and can also read PDF files. The worker program is built from the same
   code as the NIF, and precompiled downloads include it.
@@ -56,14 +58,21 @@ Intel), Linux (x86-64 and ARM64, glibc and musl) and Windows (x86-64).
     run at once, counting cancelled renders still winding down, and `Typsty.running_renders/0` reports how many are
     running.
   - Assigns are nested at most 256 levels deep.
+  - Links can only go to http, https, mailto and tel URLs (or relative ones): others, such as `javascript:` URLs
+    from a template's data, are left out of PDFs and SVGs with a warning. SVGs escape the URLs that Typst doesn't.
+  - PNG export refuses content placed far off the page, which takes minutes to draw.
+  - Renders with large assigns or files (over 32 MiB) drop Typst's caches when they finish, rather than keep them
+    for later renders.
   - Files are checked before Typst decodes them: images claiming more than 134 megapixels (including images inside
     SVGs), SVG and XML files nested more than 1,024 levels deep, compressed SVGs expanding past 128 MiB, XML entities
-    that nest or expand past 16 MiB, CBOR that declares more items than it holds and deeply nested bibliographies are
-    refused, as are PDF files and SVGs inside SVGs (which renders in a `Typsty.Pool` can read). Only regular files of
-    at most 512 MiB are read from disk.
+    that nest or expand past 16 MiB, SVGs with content far outside their canvas, PNG color profiles that expand past
+    16 MiB, images without pixels, CBOR that declares more items than it holds, deeply nested bibliographies and
+    BibTeX references that cycle or expand exponentially are refused, as are PDF files and SVGs inside SVGs (which
+    renders in a `Typsty.Pool` can read). Only regular files of at most 512 MiB are read from disk.
   - PNG export refuses pages that would need more than 2^28 pixels of textures.
   - Typst keeps every file path for the life of the VM, with room for 65,535: a render may use at most 10,000 paths,
-    at most 50,000 may be given in `:files`, and renders needing a new path are stopped before the table runs out.
+    at most 50,000 different paths may be given in `:files` over the life of the VM (or of a pool's worker), and
+    renders needing a new path are stopped before the table runs out.
     A `Typsty.Pool` replaces a worker whose table is nearly full.
 - `THIRD_PARTY_NOTICES.txt`, with the licenses of what the precompiled binaries are built from, which ships with
   them.

@@ -51,6 +51,14 @@ impl Diagnostic {
         }
     }
 
+    /// A warning without a location, for problems that aren't in a Typst file.
+    pub fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Warning,
+            ..Self::error(message)
+        }
+    }
+
     pub fn from_source(diagnostic: &SourceDiagnostic, world: &TypstyWorld) -> Self {
         let severity = match diagnostic.severity {
             typst::diag::Severity::Error => Severity::Error,

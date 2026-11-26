@@ -12,6 +12,7 @@ defmodule Typsty.Packages do
   @external_resource Path.expand("../../VERSION", __DIR__)
 
   @spec_format ~r/\A@([a-z0-9][a-z0-9_-]*)\/([A-Za-z0-9][A-Za-z0-9_-]*)(?::(\d+\.\d+\.\d+))?\z/
+  @version_format ~r/\A\d+\.\d+\.\d+\z/
 
   # The HTTP client's profile, so that the task's proxy settings don't change the VM's
   # default profile
@@ -97,7 +98,13 @@ defmodule Typsty.Packages do
   defp resolve_version({_namespace, _name, version} = package, _index, _context) when is_binary(version), do: package
 
   defp resolve_version({namespace, name, nil}, index, context) do
-    versions = for %{"name" => ^name, "version" => version} = entry <- index, do: {version, entry["compiler"]}
+    # The version becomes part of a path, so an index that isn't what it should be (from a
+    # proxy that intercepts TLS, say) can't make it lead elsewhere
+    versions =
+      for %{"name" => ^name, "version" => version} = entry <- index,
+          is_binary(version) and version =~ @version_format,
+          is_binary(entry["compiler"]) or entry["compiler"] == nil,
+          do: {version, entry["compiler"]}
 
     compatible =
       for {version, compiler} <- versions, compiler == nil or compatible?(compiler, context.typst_version), do: version
@@ -226,11 +233,27 @@ defmodule Typsty.Packages do
         end
       end
 
-      if context.force?, do: File.rename(dir, old)
-      move_into_place!(tmp, dir, package)
+      replace!(tmp, dir, old, package, context.force?)
     after
       File.rm_rf(tmp)
+    end
+  end
+
+  # With :force, the old package is put back if the new one can't be moved into place
+  defp replace!(tmp, dir, old, package, force?) do
+    if force? and File.rename(dir, old) == :ok do
+      try do
+        move_into_place!(tmp, dir, package)
+      rescue
+        error ->
+          File.rename(old, dir)
+          reraise error, __STACKTRACE__
+      end
+
       File.rm_rf(old)
+      :ok
+    else
+      move_into_place!(tmp, dir, package)
     end
   end
 

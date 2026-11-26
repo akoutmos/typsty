@@ -24,6 +24,8 @@ defmodule Typsty.Value do
   @max_decimal_exponent 40
   @max_decimal_integer Integer.pow(2, 96)
   @max_decimal_places 28
+  @max_trimmed_zeros 1000
+  @max_trimmable_coefficient Integer.pow(10, 1000)
 
   # Typst's dates go from year -9999 to 9999
   @max_year 9999
@@ -67,9 +69,7 @@ defmodule Typsty.Value do
     if not proper?(value), do: invalid!(path, "is an improper list")
     depth!(path)
 
-    value
-    |> Enum.with_index()
-    |> Enum.map(fn {item, index} -> encode(item, [index | path], 0) end)
+    encode_list(value, path, 0)
   end
 
   defp encode(value, path, encodings) when is_tuple(value), do: value |> Tuple.to_list() |> encode(path, encodings)
@@ -95,22 +95,24 @@ defmodule Typsty.Value do
   defp encode(%DateTime{} = datetime, path, encodings),
     do: datetime |> DateTime.to_naive() |> encode(path, encodings)
 
+  defp encode(%{__struct__: Decimal, coef: coef}, path, _encodings) when not is_integer(coef) do
+    invalid!(path, "is a decimal that isn't a number (#{coef}), which Typst decimals can't represent")
+  end
+
   defp encode(%{__struct__: Decimal, coef: coef, exp: exp, sign: sign}, path, _encodings) do
-    cond do
-      not is_integer(coef) ->
-        invalid!(path, "is a decimal that isn't a number (#{coef}), which Typst decimals can't represent")
+    {coef, exp} = trim_zeros(coef, exp)
 
-      exp > @max_decimal_exponent or exp < -(@max_decimal_exponent + length(Integer.digits(coef))) or
-        coef * Integer.pow(10, max(exp, 0)) >= @max_decimal_integer or -exp > @max_decimal_places ->
-        invalid!(
-          path,
-          "is a decimal that doesn't fit in a Typst decimal (about 28 significant digits, " <>
-            "at most 28 of them after the decimal point)"
-        )
-
-      true ->
-        {:decimal, decimal_string(sign, coef, exp)}
+    # The coefficient is compared first, so that a huge one is refused without arithmetic
+    if exp > @max_decimal_exponent or -exp > @max_decimal_places or coef >= @max_decimal_integer or
+         coef * Integer.pow(10, max(exp, 0)) >= @max_decimal_integer do
+      invalid!(
+        path,
+        "is a decimal that doesn't fit in a Typst decimal (about 28 significant digits, " <>
+          "at most 28 of them after the decimal point)"
+      )
     end
+
+    {:decimal, decimal_string(sign, coef, exp)}
   end
 
   defp encode(%Range{} = range, path, _encodings) do
@@ -130,21 +132,34 @@ defmodule Typsty.Value do
   end
 
   defp encode(%module{}, path, encodings) when encodings >= @max_encodings do
-    invalid!(path, "is a #{inspect(module)} struct, after #{encodings} structs in a row were encoded as other structs")
+    invalid!(
+      path,
+      "is a %#{inspect(module)}{} struct, after #{encodings} structs in a row were encoded as other structs"
+    )
+  end
+
+  # An Ecto association that wasn't preloaded
+  defp encode(%{__struct__: Ecto.Association.NotLoaded}, path, _encodings) do
+    invalid!(
+      path,
+      "is an association that wasn't loaded: preload it, or leave it out " <>
+        "(@derive {Typsty.Encoder, except: [...]})"
+    )
   end
 
   defp encode(%module{} = struct, path, encodings) do
     if Typsty.Encoder.impl_for(struct) == nil do
       invalid!(
         path,
-        "is a #{inspect(module)} struct, which can only be passed to a template when it implements " <>
+        "is a %#{inspect(module)}{} struct, which can only be passed to a template when it implements " <>
           "Typsty.Encoder: add @derive Typsty.Encoder (or @derive {Typsty.Encoder, only: [...]}) to " <>
-          "its module, or pass a map of the fields the template needs"
+          "its module, call Protocol.derive(Typsty.Encoder, #{inspect(module)}, only: [...]) for a struct " <>
+          "from another library, or pass a map of the fields the template needs"
       )
     end
 
     case Typsty.Encoder.encode(struct) do
-      %^module{} -> invalid!(path, "is a #{inspect(module)} struct that Typsty.Encoder encodes as itself")
+      %^module{} -> invalid!(path, "is a %#{inspect(module)}{} struct that Typsty.Encoder encodes as itself")
       encoded -> encode(encoded, path, encodings + 1)
     end
   end
@@ -202,6 +217,22 @@ defmodule Typsty.Value do
   defp proper?(_tail), do: false
 
   # Decimal.to_string(decimal, :normal), without depending on Decimal
+  # Without Enum.with_index/1, which would copy a large list once more
+  defp encode_list([], _path, _index), do: []
+
+  defp encode_list([item | rest], path, index),
+    do: [encode(item, [index | path], 0) | encode_list(rest, path, index + 1)]
+
+  # Trailing zeros after the decimal point that a Typst decimal has no room for are dropped,
+  # so that 1.000…0 with 30 zeros (as multiplying decimals can give) is 1. Decimals far out of
+  # range are left to be refused, rather than divided digit by digit
+  defp trim_zeros(coef, exp)
+       when exp < 0 and exp >= -@max_trimmed_zeros and coef < @max_trimmable_coefficient and rem(coef, 10) == 0 and
+              (-exp > @max_decimal_places or coef >= @max_decimal_integer),
+       do: trim_zeros(div(coef, 10), exp + 1)
+
+  defp trim_zeros(coef, exp), do: {coef, exp}
+
   defp decimal_string(sign, coef, exp) do
     digits = Integer.to_string(coef)
 

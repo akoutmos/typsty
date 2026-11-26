@@ -16,6 +16,17 @@ defmodule Typsty.LoggingTest do
     assert log =~ "warning: unknown font family: no such font"
   end
 
+  test "warnings that quote the assigns stay on one line" do
+    source = "#set text(font: assigns.font)\nHi"
+    log = capture_log(fn -> assert {:ok, _pdf} = Typsty.to_pdf(source, %{font: "x\n[error] forged"}) end)
+    assert log =~ ~S|unknown font family: x\n[error] forged|
+  end
+
+  test "links to URLs other than web, mail and phone ones are left out with a warning" do
+    log = capture_log(fn -> assert {:ok, _pdf} = Typsty.to_pdf(~S|#link("javascript:alert(1)")[x]|) end)
+    assert log =~ "a link to a javascript: URL was left out of the document"
+  end
+
   @tag :tmp_dir
   test "fonts from the font paths are used", %{tmp_dir: fonts} do
     assert Typsty.font_families(system_fonts: false, embedded_fonts: false) == []

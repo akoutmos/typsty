@@ -45,7 +45,11 @@ defmodule Typsty.RobustnessTest do
 
   describe "PNG export" do
     test "refuses pages that would need too much memory" do
-      assert_render_error(Typsty.to_png("x", %{}, ppi: 1_000_000), "page 1 can't be rendered as a PNG")
+      assert_render_error(
+        Typsty.to_png("#set page(width: 10in, height: 1000in)\nx", %{}, ppi: 10_000),
+        "page 1 can't be rendered as a PNG"
+      )
+
       assert_render_error(Typsty.to_png("#set page(width: 100000cm, height: 100000cm)\nx"), "the page needs")
     end
 
@@ -110,10 +114,22 @@ defmodule Typsty.RobustnessTest do
     test "are refused inside the VM, where a malformed one could crash it" do
       pdf = "%PDF-1.7\n1 0 obj << /Type /Catalog >> endobj\n"
 
-      for {name, contents} <- [{"doc.pdf", pdf}, {"renamed.png", "junk\n" <> pdf}, {"no-header.pdf", "junk"}] do
-        result = Typsty.to_pdf("#image(\"#{name}\")", %{}, files: %{name => contents})
+      # By extension, by the header Typst detects, and by their objects (Typst decodes
+      # them without a header when asked to with format: "pdf")
+      for {name, contents} <- [{"doc.pdf", pdf}, {"renamed.bin", "junk\n" <> pdf}, {"no-header", "1 0 obj endobj"}] do
+        result = Typsty.to_pdf(~s|#image("#{name}", format: "pdf")|, %{}, files: %{name => contents})
         assert_render_error(result, "PDF files can't be used when rendering inside the VM")
       end
+
+      # Data files that mention PDF objects are fine, and images are decoded as their
+      # extension says
+      assert {:ok, _pdf} = Typsty.to_pdf(~S|#csv("data.csv")|, %{}, files: %{"data.csv" => "endobj,1\n"})
+      assert {:error, %RenderError{}} = Typsty.to_pdf(~S|#image("renamed.png")|, %{}, files: %{"renamed.png" => pdf})
+    end
+
+    test "PNG export refuses content placed far off the page" do
+      result = Typsty.to_png(~S|#place(dx: assigns.x * 1pt)[Hello]|, %{x: 1.0e10})
+      assert_render_error(result, "content is placed or scaled more than")
     end
   end
 

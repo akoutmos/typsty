@@ -135,7 +135,10 @@ fn main() {
         // The pool replaces a worker that exits while it's idle. A worker that panicked may
         // have been left in a bad state, and one whose table of file paths is nearly full
         // would refuse new paths for good (see `typsty_core::world`)
-        if retire || typsty_core::world::file_ids_running_out() {
+        if retire
+            || typsty_core::world::file_ids_running_out()
+            || typsty_core::world::given_paths_running_out()
+        {
             exit::now(0);
         }
     }
@@ -190,11 +193,18 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Arguments, Strin
 }
 
 fn read_frame(input: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+    // The end of the input between frames means the pool closed the port; inside one, that
+    // the worker and the pool disagree on where frames start
     let mut length = [0; 4];
-    match input.read_exact(&mut length) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
+    let mut read = 0;
+    while read < length.len() {
+        match input.read(&mut length[read..]) {
+            Ok(0) if read == 0 => return Ok(None),
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(count) => read += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
     }
     let length = u32::from_be_bytes(length) as usize;
 
@@ -248,8 +258,12 @@ fn handle(request: Vec<u8>) -> Handled {
 
     // A frame that isn't a term means the worker and the pool disagree on where frames
     // start: whatever comes next can't be trusted
-    let Ok(decoded) = decoded else {
-        exit::now(exit::PROTOCOL);
+    let decoded = match decoded {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            eprintln!("typsty_worker: {error}");
+            exit::now(exit::PROTOCOL);
+        }
     };
 
     let (job, timeout) = match parse_request(decoded) {

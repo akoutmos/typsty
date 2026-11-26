@@ -98,7 +98,10 @@ defmodule Typsty.PackagesTest do
     %{"name" => "shout", "version" => "0.2.0"},
     %{"name" => "future", "version" => "2.0.0", "compiler" => "99.0.0"},
     %{"name" => "newer", "version" => "0.9.0"},
-    %{"name" => "newer", "version" => "1.0.0", "compiler" => "0.16"}
+    %{"name" => "newer", "version" => "1.0.0", "compiler" => "0.16"},
+    # Versions become paths
+    %{"name" => "escape", "version" => "../../../../escaped"},
+    %{"name" => "escape", "version" => ["1.0.0"]}
   ]
 
   setup %{tmp_dir: tmp_dir} do
@@ -301,6 +304,14 @@ defmodule Typsty.PackagesTest do
     assert Path.wildcard(Path.join(dir, "**/.*.tmp-*"), match_dot: true) == []
   end
 
+  test "ignores versions in the index that aren't versions", %{dir: dir, opts: opts} do
+    assert_raise Mix.Error, ~r/@preview\/escape doesn't exist on Typst Universe/, fn ->
+      Packages.get(["@preview/escape"], dir, opts)
+    end
+
+    assert Path.wildcard(Path.join([dir, "..", "**", "escaped"])) == []
+  end
+
   test "raises for an index that isn't a list of packages", %{dir: dir, opts: opts} do
     opts = Keyword.put(opts, :http_get, fn _url -> {:ok, "<html>"} end)
 
@@ -331,6 +342,21 @@ defmodule Typsty.PackagesTest do
              Typsty.to_pdf(~S|#import "@preview/greet:1.0.0": greet|, %{}, package_paths: ["/no/such/dir"])
 
     assert List.last(diagnostic.hints) =~ "Searched /no/such/dir (which doesn't exist)"
+  end
+
+  test "rendering only hints at packages for Typst's own message" do
+    # A message that quotes a template's data
+    source = ~S|#panic("package not found (searched for @preview/greet:1.0.0)")|
+    assert {:error, %Typsty.RenderError{diagnostics: [diagnostic]}} = Typsty.to_pdf(source)
+    assert diagnostic.hints == []
+  end
+
+  test "rendering suggests the :package_paths option for packages in other namespaces" do
+    assert {:error, %Typsty.RenderError{diagnostics: [diagnostic]}} =
+             Typsty.to_pdf(~S|#import "@local/mine:1.0.0": mine|)
+
+    assert List.last(diagnostic.hints) =~
+             "add the directory that holds local/mine/1.0.0 to the :package_paths option"
   end
 
   test "rendering says when :package_paths names the namespace's directory", %{dir: dir, opts: opts} do
