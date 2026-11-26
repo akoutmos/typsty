@@ -9,7 +9,8 @@ defmodule Typsty.RenderError do
       modules are checked when they compile).
     - `:timeout` - the render didn't finish within its `:timeout`.
     - `:busy` - the render didn't start within its `:timeout`: `:max_concurrent_renders`
-      renders were already running, or every worker in its `Typsty.Pool` was busy.
+      renders were already running, or every worker in its `Typsty.Pool` was busy, or being
+      replaced (after a timeout, say).
     - `:memory_limit` - the render went over its `Typsty.Pool`'s `:memory_limit`.
     - `:crashed` - the render ended without a result: Typst crashed (a bug in Typst or
       Typsty, which extreme values can reach, such as a date past the year 9999), the

@@ -13,7 +13,6 @@ defmodule Typsty.PoolTest do
     pool = Module.concat(__MODULE__, "Pool#{System.unique_integer([:positive])}")
     opts = Keyword.merge([name: pool, size: 2], context[:pool_opts] || [])
     start_supervised!({Pool, opts})
-    wait_until_ready(pool, opts[:size])
     %{pool: pool}
   end
 
@@ -54,16 +53,6 @@ defmodule Typsty.PoolTest do
   # The pool's idle workers, which NimblePool keeps in a queue
   defp idle_workers(pool) do
     pool |> :sys.get_state() |> Map.fetch!(:resources) |> :queue.to_list() |> Enum.map(&elem(&1, 0))
-  end
-
-  # Waits until every worker has started. They start in the background, after the pool
-  # does, and a render with a short timeout sent before then could time out waiting for one
-  defp wait_until_ready(pool, size, tries \\ 500) do
-    cond do
-      length(idle_workers(pool)) == size -> :ok
-      tries == 0 -> flunk("the pool's workers never started")
-      true -> Process.sleep(10) && wait_until_ready(pool, size, tries - 1)
-    end
   end
 
   # Waits until a worker is checked out: NimblePool keeps its checked out workers with the
@@ -181,6 +170,16 @@ defmodule Typsty.PoolTest do
     end
   end
 
+  describe "starting" do
+    @tag pool_opts: [size: 3]
+    test "a pool is started with its workers ready, so its first renders don't wait for one", %{pool: pool} do
+      assert length(idle_workers(pool)) == 3
+
+      # A render that waited for a worker would be :busy
+      assert {:error, %RenderError{reason: :timeout}} = Typsty.to_pdf(@busy, %{}, pool: pool, timeout: 100)
+    end
+  end
+
   describe "stopping renders" do
     test "a render that times out is stopped right away", %{pool: pool} do
       {micros, result} = :timer.tc(fn -> Typsty.to_pdf(@busy, %{}, pool: pool, timeout: 100) end)
@@ -228,7 +227,8 @@ defmodule Typsty.PoolTest do
       assert {:error, %RenderError{reason: :busy, diagnostics: [%{message: message}]}} =
                Typsty.to_pdf("waits", %{}, pool: pool, timeout: 100)
 
-      assert message == "rendering didn't start within the timeout (100 ms): every worker in the pool was busy"
+      assert message ==
+               "rendering didn't start within the timeout (100 ms): every worker in the pool was busy, or being replaced"
 
       Task.await(busy)
       assert {:ok, _pdf} = Typsty.to_pdf("gets a worker", %{}, pool: pool)
