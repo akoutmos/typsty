@@ -270,6 +270,38 @@ defmodule Typsty.ValueTest do
     end
   end
 
+  test "deriving Typsty.Encoder takes :only or :except, as a list of fields" do
+    derive = fn options ->
+      Code.compile_string("""
+      defmodule Typsty.ValueTest.BadDerive do
+        @derive {Typsty.Encoder, #{options}}
+        defstruct [:name, :token]
+      end
+      """)
+    end
+
+    for options <- ["only: :name", "except: :token", "only: [:name], except: [:token]"] do
+      assert_raise ArgumentError, "deriving Typsty.Encoder takes either :only or :except, as a list of fields", fn ->
+        derive.(options)
+      end
+    end
+
+    assert_raise ArgumentError, ~r/unknown keys \[:fields\]/, fn -> derive.("fields: [:name]") end
+  end
+
+  test "refuses keys that aren't valid UTF-8, and associations that weren't loaded, with their path" do
+    assert_raise ArgumentError, ~r/^assigns.customer has a key that isn't valid UTF-8: <<255>>/, fn ->
+      Typsty.to_pdf("x", %{customer: %{<<255>> => 1}})
+    end
+
+    # What Ecto puts in a schema's association until it's preloaded
+    not_loaded = %{__struct__: Ecto.Association.NotLoaded, __field__: :orders, __cardinality__: :many}
+
+    assert_raise ArgumentError, ~r/^assigns.customer.orders is an association that wasn't loaded: preload it/, fn ->
+      Typsty.to_pdf("x", %{customer: %{orders: not_loaded}})
+    end
+  end
+
   test "raises for integers that don't fit in 64 bits" do
     assert_raise ArgumentError, ~r/big is an integer that doesn't fit in 64 bits/, fn ->
       Typsty.to_pdf("x", %{big: 9_223_372_036_854_775_808})

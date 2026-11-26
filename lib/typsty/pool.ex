@@ -162,13 +162,16 @@ defmodule Typsty.Pool do
   """
   @spec start_link([option()]) :: GenServer.on_start()
   def start_link(opts) do
+    # Typsty's tests run pools with stand-in worker programs, which fail in ways the real one
+    # doesn't, to test how the pool handles them
+    {executable, opts} = if Keyword.keyword?(opts), do: Keyword.pop(opts, :__executable__), else: {nil, opts}
     opts = Typsty.Options.pool!(opts)
 
     size = Keyword.get_lazy(opts, :size, &System.schedulers_online/0)
     memory_limit = opts[:memory_limit]
     max_renders = opts[:max_renders]
 
-    executable = executable!()
+    executable = executable || executable!()
     args = if(memory_limit, do: ["--memory-limit", Integer.to_string(memory_limit)], else: [])
     check_worker!(executable, args, memory_limit)
     if memory_limit, do: check_memory_limit!(executable, args, memory_limit)
@@ -471,10 +474,19 @@ defmodule Typsty.Pool do
     {error, :remove}
   end
 
-  # The port goes back to the pool with the worker
+  # The port goes back to the pool with the worker. What the worker sent after its answer,
+  # before then, came to this process (the caller's), rather than to the pool: it's removed
+  # from the caller's mailbox, and the worker, which is out of step, is replaced
   defp give_back_port(port, pool_pid, checkin) do
     Port.connect(port, pool_pid)
-    checkin
+
+    receive do
+      {^port, _message} ->
+        flush(port)
+        :remove
+    after
+      0 -> checkin
+    end
   rescue
     # The port or the pool is gone
     ArgumentError ->

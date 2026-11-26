@@ -43,6 +43,7 @@ defmodule Typsty.Packages do
   # - :http_get - a function that gets a URL, returning {:ok, body}, {:error, :not_found} or
   #   {:error, reason}
   # - :typst_version - the Typst version packages must work with
+  # - :registry - the URL packages are downloaded from (Typst Universe's), for tests
   @spec get([String.t()], Path.t(), keyword()) :: [result()]
   def get(specs, dir, opts \\ []) do
     context = %{
@@ -51,7 +52,8 @@ defmodule Typsty.Packages do
       report: Keyword.get(opts, :report, fn _message -> :ok end),
       warn: Keyword.get(opts, :warn, fn _message -> :ok end),
       http_get: Keyword.get(opts, :http_get, &http_get/1),
-      typst_version: Keyword.get_lazy(opts, :typst_version, &Typsty.typst_version/0)
+      typst_version: Keyword.get_lazy(opts, :typst_version, &Typsty.typst_version/0),
+      registry: Keyword.get(opts, :registry, @registry)
     }
 
     specs
@@ -122,7 +124,7 @@ defmodule Typsty.Packages do
   end
 
   defp index!(context) do
-    url = "#{@registry}/preview/index.json"
+    url = "#{context.registry}/preview/index.json"
 
     case context.http_get.(url) do
       {:ok, body} ->
@@ -181,7 +183,7 @@ defmodule Typsty.Packages do
   defp package_dir(dir, {namespace, name, version}), do: Path.join([dir, namespace, name, version])
 
   defp download({namespace, name, version} = package, imported_by, dir, context) do
-    url = "#{@registry}/#{namespace}/#{name}-#{version}.tar.gz"
+    url = "#{context.registry}/#{namespace}/#{name}-#{version}.tar.gz"
 
     case context.http_get.(url) do
       {:ok, archive} ->
@@ -412,8 +414,8 @@ defmodule Typsty.Packages do
   defp describe(reason), do: inspect(reason)
 
   # Gets a URL with :httpc, verifying the server's certificate. Honors the HTTPS_PROXY,
-  # HTTP_PROXY and NO_PROXY environment variables. The body is read as it arrives, and the
-  # download is stopped once it's larger than @max_download_size.
+  # HTTP_PROXY and NO_PROXY environment variables, as they are when it's called. The body is
+  # read as it arrives, and the download is stopped once it's larger than @max_download_size.
   defp http_get(url) do
     {:ok, _apps} = Application.ensure_all_started(:inets)
     {:ok, _apps} = Application.ensure_all_started(:ssl)
@@ -510,9 +512,10 @@ defmodule Typsty.Packages do
         _ -> nil
       end
 
-    # The profile is the task's own, and has no proxy until one is set
+    # The profile is the task's own, and keeps the proxy it was given last
     case proxy do
       nil ->
+        :httpc.set_options([{option, no_proxy(host)}], @profile)
         []
 
       %URI{host: proxy_host, port: port, userinfo: userinfo} ->
@@ -527,6 +530,10 @@ defmodule Typsty.Packages do
         end
     end
   end
+
+  # A proxy setting for none: one that the host is exempt from, which is never used, since
+  # httpc can't remove the proxy an earlier download (with other variables) was given
+  defp no_proxy(host), do: {{~c"localhost", 1}, [String.to_charlist(host || "")]}
 
   # An environment variable's value, with an empty value counting as unset
   defp env(name) do

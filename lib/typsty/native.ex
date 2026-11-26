@@ -50,6 +50,8 @@ defmodule Typsty.Native do
     Typsty.WorkerBuild.build!()
   end
 
+  # The NIF's functions, which replace these when it loads, so they never run
+  # coveralls-ignore-start
   def start_render(_reference, _template, _assigns, _files, _options), do: :erlang.nif_error(:nif_not_loaded)
   def cancel_render(_job), do: :erlang.nif_error(:nif_not_loaded)
   def syntax_errors(_template), do: :erlang.nif_error(:nif_not_loaded)
@@ -59,4 +61,5 @@ defmodule Typsty.Native do
   def package_imports(_text), do: :erlang.nif_error(:nif_not_loaded)
   def typst_version, do: :erlang.nif_error(:nif_not_loaded)
   def running_renders, do: :erlang.nif_error(:nif_not_loaded)
+  # coveralls-ignore-stop
 end

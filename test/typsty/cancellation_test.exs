@@ -129,6 +129,21 @@ defmodule Typsty.CancellationTest do
 
   # Here rather than with the other option tests, since they change the config, which this
   # module's tests run on their own for
+  test "a pool starts while the config is invalid, and its renders say what's wrong" do
+    # The pool's workers load their fonts with the options renders get by default, which
+    # come from the config: they start without doing that, and renders report the config
+    Application.put_env(:typsty, :ppi, 0)
+    on_exit(fn -> Application.delete_env(:typsty, :ppi) end)
+    pool = start_supervised!({Typsty.Pool, size: 1})
+
+    assert_raise ArgumentError, ~r/invalid value for :ppi option: .* \(in the :typsty application config\)/, fn ->
+      Typsty.to_pdf("x", %{}, pool: pool)
+    end
+
+    Application.delete_env(:typsty, :ppi)
+    assert {:ok, "%PDF-" <> _} = Typsty.to_pdf("x", %{}, pool: pool)
+  end
+
   test "the config is checked too, catching typos, but not other modules' config" do
     Application.put_env(:typsty, :font_path, ["fonts"])
     on_exit(fn -> Application.delete_env(:typsty, :font_path) end)

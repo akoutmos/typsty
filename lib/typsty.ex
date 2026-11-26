@@ -547,7 +547,7 @@ defmodule Typsty do
   def __check__!(%Template{source: source} = template, :component) do
     validate!(template)
 
-    case native_check(&Native.component_errors/1, source) do
+    case __native_check__(&Native.component_errors/1, source) do
       [] -> :ok
       :unavailable -> :ok
       diagnostics -> SyntaxError.raise!(diagnostics, template, :component)
@@ -555,16 +555,18 @@ defmodule Typsty do
   end
 
   defp validate!(%Template{source: source} = template) do
-    case native_check(&Native.syntax_errors/1, source) do
+    case __native_check__(&Native.syntax_errors/1, source) do
       [] -> :ok
       :unavailable -> :ok
       diagnostics -> SyntaxError.raise!(diagnostics, template)
     end
   end
 
+  @doc false
   # When cross-compiling (for Nerves, say), the NIF is built for another machine and can't
   # load where the code compiles: templates are then compiled without checking them
-  defp native_check(check, source) do
+  @spec __native_check__((String.t() -> [Diagnostic.t()]), String.t()) :: [Diagnostic.t()] | :unavailable
+  def __native_check__(check, source) do
     check.(source)
   rescue
     error in [UndefinedFunctionError, ErlangError] ->

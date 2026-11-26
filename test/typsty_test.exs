@@ -122,6 +122,11 @@ defmodule TypstyTest do
       assert_raise ArgumentError, ~r/the assigns must be a map, got a URI struct/, fn ->
         Typsty.to_pdf("x", URI.parse("https://typst.app"))
       end
+
+      assert_raise ArgumentError, "the assigns must be a map, got: 42", fn ->
+        # credo:disable-for-next-line Credo.Check.Refactor.Apply
+        apply(Typsty, :to_svg, ["x", 42])
+      end
     end
 
     test "takes the first of an option given more than once, like Keyword.get/2" do
@@ -141,6 +146,31 @@ defmodule TypstyTest do
 
       assert_raise ArgumentError, ~r/:files option: expected paths \(strings\) mapped to binaries, got: nil/, fn ->
         Typsty.to_pdf("x", %{}, files: [nil])
+      end
+
+      assert_raise ArgumentError,
+                   ~s|invalid value for :files option: expected a map or a list of tuples, got: "logo.png"|,
+                   fn ->
+                     Typsty.to_pdf("x", %{}, files: "logo.png")
+                   end
+    end
+
+    test "takes nil for the options that are off by default" do
+      assert {:ok, _pdf} = Typsty.to_pdf(~s|#read("note.txt")|, %{}, root: nil, pool: nil, files: %{"note.txt" => "x"})
+    end
+
+    test "returns an error for a pool that isn't running, and raises for one on another node" do
+      assert {:error, %RenderError{reason: :crashed, diagnostics: [%{message: message}]}} =
+               Typsty.to_pdf("x", %{}, pool: Typsty.Test.NoSuchPool)
+
+      assert message ==
+               "the pool Typsty.Test.NoSuchPool isn't running (a Typsty.Pool in a supervision tree may be restarting)"
+
+      assert {:error, %RenderError{reason: :crashed}} = Typsty.to_pdf("x", %{}, pool: {:global, :typsty_no_such_pool})
+
+      # A pid on another node, as a registry could return
+      assert_raise ArgumentError, ~r/the :pool option must be a Typsty.Pool on this node .*, got: {:via, /, fn ->
+        Typsty.to_pdf("x", %{}, pool: {:via, Typsty.Test.RemoteRegistry, :pool})
       end
     end
 
@@ -179,6 +209,15 @@ defmodule TypstyTest do
       assert_raise ArgumentError, ~r/the Typst source isn't valid UTF-8/, fn -> Typsty.to_pdf(<<"= Hi ", 0xFF>>) end
       assert_raise ArgumentError, ~r/the Typst source isn't valid UTF-8/, fn -> Typsty.validate(<<0xFF>>) end
       assert_raise ArgumentError, ~r/the Typst source isn't valid UTF-8/, fn -> Typsty.format(<<0xFF>>) end
+
+      for other <- [123, [:not, :source], nil] do
+        assert_raise ArgumentError,
+                     "expected Typst source (a string) or a Typsty.Template, got: #{inspect(other)}",
+                     fn ->
+                       # credo:disable-for-next-line Credo.Check.Refactor.Apply
+                       apply(Typsty, :to_pdf, [other])
+                     end
+      end
 
       assert_raise ArgumentError,
                    ~r/To render a document module, call its functions, like Typsty.Test.Greeting.to_pdf/,
@@ -262,6 +301,35 @@ defmodule TypstyTest do
 
       assert_raise ArgumentError, ~r/^unknown options \[:ppi\], valid options are: \[:font_paths/, fn ->
         Typsty.font_families(ppi: 1)
+      end
+    end
+  end
+
+  describe "documentation" do
+    test "has every option, from the schemas that check them" do
+      {:docs_v1, _anno, :elixir, _format, %{"en" => typsty}, _metadata, _docs} = Code.fetch_docs(Typsty)
+      assert typsty =~ Typsty.Options.docs(:render)
+      assert typsty =~ Typsty.Options.docs(:config)
+
+      {:docs_v1, _anno, :elixir, _format, %{"en" => pool}, _metadata, _docs} = Code.fetch_docs(Typsty.Pool)
+      assert pool =~ Typsty.Options.docs(:pool)
+    end
+
+    test "the option type has every documented option" do
+      documented =
+        for [key] <- Regex.scan(~r/^\* `:(\w+)`/m, Typsty.Options.docs(:render), capture: :all_but_first), do: key
+
+      assert "components" in documented
+      assert "files" in documented
+
+      {:ok, types} = Code.Typespec.fetch_types(Typsty)
+      {:type, option} = Enum.find(types, &match?({:type, {:option, _type, []}}, &1))
+      compiled = option |> Code.Typespec.type_to_quoted() |> Macro.to_string()
+      generated = :render |> Typsty.Options.typespec() |> Macro.to_string()
+
+      for key <- documented do
+        assert compiled =~ "{:#{key}, ", "#{key} isn't in Typsty.option()"
+        assert generated =~ "{:#{key}, "
       end
     end
   end

@@ -78,6 +78,18 @@ defmodule Typsty.PackagesTest do
       "lib.typ" => "#let x = 1"
     },
     {"evil", "1.0.0"} => %{"../../escaped.typ" => "#let x = 1"},
+    # A file where the archive later needs a directory
+    {"clash", "1.0.0"} => %{"lib" => "a file", "lib/x.typ" => "#let x = 1"},
+    # Two packages that import the same one
+    {"left", "1.0.0"} => %{"lib.typ" => ~s|#import "@preview/shout:0.2.0": shout|},
+    {"right", "1.0.0"} => %{"lib.typ" => ~s|#import "@preview/shout:0.2.0": shout|},
+    # Imports from namespaces other than @preview, which aren't on Typst Universe
+    {"mixed", "1.0.0"} => %{
+      "lib.typ" => ~s|#import "@local/thing:1.0.0": x\n#import "@preview/shout:0.2.0": shout|
+    },
+    # Compiler bounds with only a major version, and one that isn't a version
+    {"bounds", "1.0.0"} => %{"typst.toml" => ~s|[package]\ncompiler = "1"\n|, "lib.typ" => "#let x = 1"},
+    {"bounds", "0.5.0"} => %{"typst.toml" => ~s|[package]\ncompiler = "next"\n|, "lib.typ" => "#let x = 1"},
     {"dot", "1.0.0"} => %{"." => "x"},
     {"empty", "1.0.0"} => %{},
     {"commented", "1.0.0"} => %{
@@ -99,6 +111,8 @@ defmodule Typsty.PackagesTest do
     %{"name" => "future", "version" => "2.0.0", "compiler" => "99.0.0"},
     %{"name" => "newer", "version" => "0.9.0"},
     %{"name" => "newer", "version" => "1.0.0", "compiler" => "0.16"},
+    %{"name" => "bounds", "version" => "1.0.0", "compiler" => "1"},
+    %{"name" => "bounds", "version" => "0.5.0", "compiler" => "next"},
     # Versions become paths
     %{"name" => "escape", "version" => "../../../../escaped"},
     %{"name" => "escape", "version" => ["1.0.0"]}
@@ -320,6 +334,111 @@ defmodule Typsty.PackagesTest do
     end
   end
 
+  test "raises for an archive with a file where it needs a directory", %{dir: dir, opts: opts} do
+    assert_raise Mix.Error, ~r"^the archive of @preview/clash:1.0.0 is invalid: lib/x.typ: ", fn ->
+      Packages.get(["@preview/clash:1.0.0"], dir, opts)
+    end
+
+    refute File.exists?(Path.join(dir, "preview/clash/1.0.0"))
+    assert Path.wildcard(Path.join(dir, "preview/clash/.*"), match_dot: true) == []
+  end
+
+  test "raises for gzip files that aren't tar archives", %{dir: dir, opts: opts} do
+    opts = Keyword.put(opts, :http_get, fn _url -> {:ok, :zlib.gzip(String.duplicate("not a tar archive ", 100))} end)
+
+    assert_raise Mix.Error, ~r"^the archive of @preview/shout:0.2.0 is invalid: ", fn ->
+      Packages.get(["@preview/shout:0.2.0"], dir, opts)
+    end
+  end
+
+  test "refuses archives that expand past 256 MiB, before they're all decompressed", %{dir: dir, opts: opts} do
+    # 257 MiB of zeros, compressed a MiB at a time, which takes about 256 KiB
+    z = :zlib.open()
+    :ok = :zlib.deflateInit(z, :best_compression, :deflated, 31, 8, :default)
+    zeros = :binary.copy(<<0>>, 1024 * 1024)
+    bomb = IO.iodata_to_binary([for(_ <- 1..257, do: :zlib.deflate(z, zeros)), :zlib.deflate(z, [], :finish)])
+    :zlib.close(z)
+    assert byte_size(bomb) < 1024 * 1024
+
+    opts = Keyword.put(opts, :http_get, fn _url -> {:ok, bomb} end)
+
+    assert_raise Mix.Error, "the archive of @preview/shout:0.2.0 expands to more than 256 MiB", fn ->
+      Packages.get(["@preview/shout:0.2.0"], dir, opts)
+    end
+  end
+
+  test "extracts large files whole", %{dir: dir, opts: opts, tmp_dir: tmp_dir} do
+    data = :crypto.strong_rand_bytes(3 * 1024 * 1024)
+    archive = tar_gz(tmp_dir, %{"lib.typ" => "#let x = 1", "data/blob.bin" => data})
+    opts = Keyword.put(opts, :http_get, fn _url -> {:ok, archive} end)
+
+    assert [{_package, :fetched, nil}] = Packages.get(["@preview/shout:0.2.0"], dir, opts)
+    assert File.read!(Path.join(dir, "preview/shout/0.2.0/data/blob.bin")) == data
+  end
+
+  test "raises when the directory can't be created", %{opts: opts, tmp_dir: tmp_dir} do
+    file = Path.join(tmp_dir, "a-file")
+    File.write!(file, "")
+
+    assert_raise Mix.Error, ~r"^failed to save @preview/shout:0.2.0: #{file}/preview/shout: ", fn ->
+      Packages.get(["@preview/shout:0.2.0"], file, opts)
+    end
+  end
+
+  test "raises when something that isn't a package is in the package's place", %{dir: dir, opts: opts} do
+    path = Path.join(dir, "preview/shout/0.2.0")
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, "a file, not a directory")
+
+    assert_raise Mix.Error, ~r"^failed to save @preview/shout:0.2.0 in #{path}: ", fn ->
+      Packages.get(["@preview/shout:0.2.0"], dir, opts)
+    end
+
+    assert File.read!(path) == "a file, not a directory"
+    assert Path.wildcard(Path.join(dir, "preview/shout/.*"), match_dot: true) == []
+  end
+
+  test "fetches a package that several packages import once", %{dir: dir, opts: opts} do
+    assert [
+             {{"preview", "left", "1.0.0"}, :fetched, nil},
+             {{"preview", "right", "1.0.0"}, :fetched, nil},
+             {{"preview", "shout", "0.2.0"}, :fetched, {"preview", "left", "1.0.0"}}
+           ] = Packages.get(["@preview/left:1.0.0", "@preview/right:1.0.0"], dir, opts)
+
+    assert_received {:get, "#{@registry}/shout-0.2.0.tar.gz"}
+    refute_received {:get, "#{@registry}/shout-0.2.0.tar.gz"}
+  end
+
+  test "only fetches the imports in @preview", %{dir: dir, opts: opts} do
+    assert [_mixed, {{"preview", "shout", "0.2.0"}, :fetched, _}] = Packages.get(["@preview/mixed:1.0.0"], dir, opts)
+    refute_received {:get, "https://packages.typst.org/local/" <> _}
+  end
+
+  test "reads compiler bounds with only a major version, and takes ones that aren't versions as met",
+       %{dir: dir, opts: opts} do
+    # 1.0.0 needs Typst 1, and 0.5.0's bound can't be read
+    assert [{{"preview", "bounds", "0.5.0"}, :fetched, nil}] = Packages.get(["@preview/bounds"], dir, opts)
+    refute_received {:warn, _message}
+
+    Packages.get(["@preview/bounds:1.0.0"], dir, opts)
+    assert_received {:warn, "warning: @preview/bounds:1.0.0 requires Typst 1 or later, but Typsty uses Typst 0.15.1"}
+  end
+
+  test "gets the latest version of the packages given without one, alongside pinned ones", %{dir: dir, opts: opts} do
+    assert [
+             {{"preview", "shout", "0.2.0"}, :fetched, nil},
+             {{"preview", "greet", "1.0.0"}, :fetched, nil}
+           ] = Packages.get(["@preview/shout:0.2.0", "@preview/greet"], dir, opts)
+
+    assert_received {:get, "#{@registry}/index.json"}
+  end
+
+  test "takes no reporting functions", %{dir: dir, opts: opts} do
+    opts = Keyword.drop(opts, [:report, :warn])
+    assert [{_package, :fetched, nil}] = Packages.get(["@preview/future:2.0.0"], dir, opts)
+    assert [{_package, :present, nil}] = Packages.get(["@preview/future:2.0.0"], dir, opts)
+  end
+
   test "raises for invalid packages", %{dir: dir, opts: opts} do
     assert_raise Mix.Error, ~r/invalid package "cetz". Packages look like @preview\/cetz:0.4.2/, fn ->
       Packages.get(["cetz"], dir, opts)
@@ -401,6 +520,63 @@ defmodule Typsty.PackagesTest do
       assert_received {:mix_shell, :info, [summary]}
       assert summary =~ "Downloaded 0 of 1 package into #{dir}."
       assert summary =~ "config :typsty, package_paths:"
+    end
+  end
+
+  describe "mix typsty.packages.get, with packages already downloaded" do
+    setup do
+      Mix.shell(Mix.Shell.Process)
+      on_exit(fn -> Mix.shell(Mix.Shell.IO) end)
+    end
+
+    test "warns about packages that need a newer Typst", %{dir: dir, opts: opts} do
+      Packages.get(["@preview/future:2.0.0"], dir, opts)
+      Get.run(["--path", dir, "@preview/future:2.0.0"])
+
+      assert_received {:mix_shell, :error,
+                       ["warning: @preview/future:2.0.0 requires Typst 99.0.0 or later, but Typsty uses Typst " <> _]}
+    end
+
+    test "fetches the packages in the config", %{dir: dir, opts: opts} do
+      on_exit(fn -> Application.delete_env(:typsty, :packages) end)
+      Packages.get(["@preview/shout:0.2.0"], dir, opts)
+      Application.put_env(:typsty, :packages, ["@preview/shout:0.2.0"])
+
+      Get.run(["--path", dir])
+      assert_received {:mix_shell, :info, ["* Already have @preview/shout:0.2.0"]}
+    end
+
+    test "suggests finding a directory in priv with Application.app_dir/2", %{opts: opts, tmp_dir: tmp_dir} do
+      File.cd!(tmp_dir, fn ->
+        Packages.get(["@preview/shout:0.2.0"], "priv/typst/packages", opts)
+        Get.run(["--path", "priv/typst/packages", "@preview/shout:0.2.0"])
+      end)
+
+      assert_received {:mix_shell, :info, ["* Already have @preview/shout:0.2.0"]}
+      assert_received {:mix_shell, :info, [summary]}
+      assert summary =~ ~s|config :typsty, package_paths: [Application.app_dir(:typsty, "priv/typst/packages")]|
+    end
+  end
+
+  test "mix typsty.packages.get needs the config's packages to be a list" do
+    on_exit(fn -> Application.delete_env(:typsty, :packages) end)
+    Application.put_env(:typsty, :packages, "@preview/shout:0.2.0")
+
+    assert_raise Mix.Error, ~s|the :packages config must be a list of packages, got: "@preview/shout:0.2.0"|, fn ->
+      Get.run([])
+    end
+  end
+
+  test "mix typsty.packages.get needs a --path in an umbrella project", %{tmp_dir: tmp_dir} do
+    File.write!(Path.join(tmp_dir, "mix.exs"), """
+    defmodule Typsty.PackagesTest.Umbrella.MixProject do
+      use Mix.Project
+      def project, do: [apps_path: "apps", deps: []]
+    end
+    """)
+
+    assert_raise Mix.Error, ~r/which an umbrella project doesn't have. .* or give a --path/, fn ->
+      Mix.Project.in_project(:umbrella, tmp_dir, fn _module -> Get.run(["@preview/shout:0.2.0"]) end)
     end
   end
 
