@@ -321,9 +321,10 @@ defmodule Typsty.PoolTest do
       Pool.start_link(memory_limit: 1_000)
     end
 
-    # Enough to start, but not to load the fonts renders use
-    assert_raise ArgumentError, ~r/the :memory_limit option \(1500000 bytes\) is too low for a worker to/, fn ->
-      Pool.start_link(memory_limit: 1_500_000)
+    # Enough to start (about 140 KB), but not for a first render, which needs about 490 KB
+    # with no system fonts at all, and more for each system font, so this holds on any machine
+    assert_raise ArgumentError, ~r/the :memory_limit option \(300000 bytes\) is too low for a worker to load/, fn ->
+      Pool.start_link(memory_limit: 300_000)
     end
   end
 
