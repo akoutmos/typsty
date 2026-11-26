@@ -42,14 +42,6 @@ defmodule Typsty.PoolProcessesTest do
            end)
   end
 
-  # Waits until the pool's workers have all started. They start in the background, after the
-  # pool does, and the worker programs are running before they're ready for renders
-  defp wait_until_ready(pool, size) do
-    assert eventually(fn ->
-             pool |> :sys.get_state() |> Map.fetch!(:resources) |> :queue.len() == size
-           end)
-  end
-
   defp eventually(fun, tries \\ 200) do
     cond do
       fun.() -> true
@@ -65,7 +57,7 @@ defmodule Typsty.PoolProcessesTest do
 
   test "workers are started with the pool, and end with it" do
     pid = start_supervised!({Pool, name: :pool_lifecycle, size: 3})
-    assert eventually(fn -> length(workers()) == 3 end)
+    assert length(workers()) == 3
 
     stop_supervised!(:pool_lifecycle)
     refute Process.alive?(pid)
@@ -74,7 +66,6 @@ defmodule Typsty.PoolProcessesTest do
 
   test "a worker whose render times out is replaced" do
     start_supervised!({Pool, name: :pool_timeout, size: 2})
-    wait_until_ready(:pool_timeout, 2)
     assert length(workers()) == 2
     before = workers()
 
@@ -86,7 +77,7 @@ defmodule Typsty.PoolProcessesTest do
 
   test "a worker is stopped when the process rendering with it exits" do
     start_supervised!({Pool, name: :pool_caller_exits, size: 1})
-    assert eventually(fn -> length(workers()) == 1 end)
+    assert length(workers()) == 1
     [worker] = workers()
 
     caller = spawn(fn -> Typsty.to_pdf(@busy, %{}, pool: :pool_caller_exits, timeout: :infinity) end)
@@ -100,7 +91,7 @@ defmodule Typsty.PoolProcessesTest do
 
   test "workers are replaced after :max_renders renders" do
     start_supervised!({Pool, name: :pool_recycled, size: 1, max_renders: 2})
-    assert eventually(fn -> length(workers()) == 1 end)
+    assert length(workers()) == 1
     [first] = workers()
 
     assert {:ok, _} = Typsty.to_pdf("1", %{}, pool: :pool_recycled)

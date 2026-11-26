@@ -341,7 +341,8 @@ defmodule Typsty.PackagesTest do
     assert {:error, %Typsty.RenderError{diagnostics: [diagnostic]}} =
              Typsty.to_pdf(~S|#import "@preview/greet:1.0.0": greet|, %{}, package_paths: ["/no/such/dir"])
 
-    assert List.last(diagnostic.hints) =~ "Searched /no/such/dir (which doesn't exist)"
+    # The path as it was searched, which on Windows has the current drive
+    assert List.last(diagnostic.hints) =~ "Searched #{Path.expand("/no/such/dir")} (which doesn't exist)"
   end
 
   test "rendering only hints at packages for Typst's own message" do

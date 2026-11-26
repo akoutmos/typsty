@@ -61,11 +61,13 @@ and musl) and Windows (x86-64).
   that isn't well validated. A render that runs past its timeout is stopped
   right away, a render can be given a memory limit (`:memory_limit`), and a
   worker that crashes takes nothing else down. Workers get only the environment
-  variables that finding fonts needs. Workers are replaced when they're stopped,
-  can be recycled after a number of renders (`:max_renders`), and end with the
-  pool, with the process rendering with them, and with the VM. Renders return
-  what they return in the NIF, and can also read PDF files. The worker program
-  is built from the same code as the NIF, and precompiled downloads include it.
+  variables that finding fonts needs. A pool starts once its workers have
+  started and loaded their fonts, so that the first renders don't wait for them.
+  Workers are replaced when they're stopped, can be recycled after a number of
+  renders (`:max_renders`), and end with the pool, with the process rendering
+  with them, and with the VM. Renders return what they return in the NIF, and
+  can also read PDF files. The worker program is built from the same code as the
+  NIF, and precompiled downloads include it.
 - Protection for the VM:
   - Renders run on threads of their own with large stacks (as does Typst's
     thread pool), so deep recursion can't overflow a scheduler's stack, and
@@ -99,3 +101,5 @@ and musl) and Windows (x86-64).
     given in `:files` over the life of the VM (or of a pool's worker), and
     renders needing a new path are stopped before the table runs out. A
     `Typsty.Pool` replaces a worker whose table is nearly full.
+- `THIRD_PARTY_NOTICES.txt`, with the licenses of what the precompiled binaries
+  are built from, which ships with them.
