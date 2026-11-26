@@ -112,8 +112,9 @@ defmodule Typsty.ComponentTest do
                Typsty.to_pdf(~s(#import "components/brand.typ": blue))
 
       assert diagnostic.message =~
-               "/components/brand.typ is not one of the render's components (components/ only has the components given to it). " <>
-                 "Add the component's module to `use Typsty, components: [...]`, or to the :components option"
+               "/components/brand.typ is not one of the render's components, or one of their files (components/ only " <>
+                 "has the components given to the render, and their files). Add the component's module to " <>
+                 "`use Typsty, components: [...]`, or to the :components option"
     end
   end
 

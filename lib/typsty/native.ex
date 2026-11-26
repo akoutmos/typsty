@@ -56,6 +56,7 @@ defmodule Typsty.Native do
   def cancel_render(_job), do: :erlang.nif_error(:nif_not_loaded)
   def syntax_errors(_template), do: :erlang.nif_error(:nif_not_loaded)
   def component_errors(_source), do: :erlang.nif_error(:nif_not_loaded)
+  def file_paths(_source), do: :erlang.nif_error(:nif_not_loaded)
   def format(_template, _options), do: :erlang.nif_error(:nif_not_loaded)
   def font_families(_options), do: :erlang.nif_error(:nif_not_loaded)
   def package_imports(_text), do: :erlang.nif_error(:nif_not_loaded)

@@ -157,6 +157,75 @@ fn is_sys(path: &[&str]) -> bool {
     matches!(path, ["sys"] | ["std", "sys"])
 }
 
+/// The functions that read a file from a path given as their first argument.
+const READERS: &[&str] = &[
+    "image",
+    "read",
+    "json",
+    "yaml",
+    "toml",
+    "csv",
+    "xml",
+    "cbor",
+    "plugin",
+    "bibliography",
+];
+
+/// The paths that a component reads files from, written as strings: the first argument of
+/// `image`, `read`, the data loading functions, `plugin` and `bibliography` (which takes an
+/// array of them too), with the 1-based line and column of each string. They're checked
+/// against the component's files when it compiles; paths built at runtime can't be.
+pub fn file_paths(source: &Source) -> Vec<(String, usize, usize)> {
+    let mut paths = Vec::new();
+
+    // Walked with a stack rather than recursively, since the tree can be deep
+    let mut nodes = vec![LinkedNode::new(source.root())];
+    while let Some(node) = nodes.pop() {
+        if let Some(path) = read_path(&node) {
+            let strings: Vec<LinkedNode> = match path.kind() {
+                SyntaxKind::Str => vec![path],
+                SyntaxKind::Array => path
+                    .children()
+                    .filter(|item| item.kind() == SyntaxKind::Str)
+                    .collect(),
+                _ => Vec::new(),
+            };
+
+            for string in strings {
+                let value = string.cast::<ast::Str>().map(|string| string.get());
+                let position = source.lines().byte_to_line_column(string.offset());
+
+                if let (Some(value), Some((line, column))) = (value, position) {
+                    paths.push((value.to_string(), line + 1, column + 1));
+                }
+            }
+        }
+
+        nodes.extend(node.children());
+    }
+
+    paths.sort_by_key(|(_path, line, column)| (*line, *column));
+    paths
+}
+
+/// The first positional argument of a call to one of the `READERS`.
+fn read_path<'a>(node: &LinkedNode<'a>) -> Option<LinkedNode<'a>> {
+    let call = node.cast::<ast::FuncCall>()?;
+    let Expr::Ident(callee) = call.callee() else {
+        return None;
+    };
+
+    if !READERS.contains(&callee.as_str()) {
+        return None;
+    }
+
+    let args = node
+        .children()
+        .find(|child| child.kind() == SyntaxKind::Args)?;
+    args.children()
+        .find(|child| matches!(child.cast::<ast::Arg>(), Some(ast::Arg::Pos(_))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +312,32 @@ mod tests {
         ] {
             assert_eq!(problems(text), vec![], "{text}");
         }
+    }
+
+    #[test]
+    fn finds_the_paths_files_are_read_from() {
+        let text = r##"#let logo = image("stamp/seal.svg", width: 1cm)
+#let codes = json("stamp/data/codes.json")
+#let refs = bibliography(("a.bib", "stamp/b.bib"), title: none)
+#let dynamic(name) = image("stamp/" + name)
+#let other = custom("stamp/not-read.svg")
+#let text = read(encoding: none, "stamp/raw.bin")
+"##;
+        let paths: Vec<_> = file_paths(&Source::detached(text))
+            .into_iter()
+            .map(|(path, line, column)| (path, (line, column)))
+            .collect();
+
+        assert_eq!(
+            paths,
+            vec![
+                ("stamp/seal.svg".to_string(), (1, 19)),
+                ("stamp/data/codes.json".to_string(), (2, 19)),
+                ("a.bib".to_string(), (3, 27)),
+                ("stamp/b.bib".to_string(), (3, 36)),
+                ("stamp/raw.bin".to_string(), (6, 34)),
+            ]
+        );
     }
 
     #[test]

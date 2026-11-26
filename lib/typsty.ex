@@ -565,7 +565,7 @@ defmodule Typsty do
   @doc false
   # When cross-compiling (for Nerves, say), the NIF is built for another machine and can't
   # load where the code compiles: templates are then compiled without checking them
-  @spec __native_check__((String.t() -> [Diagnostic.t()]), String.t()) :: [Diagnostic.t()] | :unavailable
+  @spec __native_check__((String.t() -> list()), String.t()) :: list() | :unavailable
   def __native_check__(check, source) do
     check.(source)
   rescue
@@ -768,13 +768,12 @@ defmodule Typsty do
       pool = pool!(opts[:pool])
       native_opts = __native_options__(opts, format)
 
-      # The components are files in components/, and the templates their errors point into
-      components = Typsty.Component.__files__(document_components(module) ++ opts[:components])
-
-      files =
-        Enum.map(components, fn {path, component} -> {path, component.source} end) ++ Keyword.get(opts, :files, [])
-
-      locations = Map.new(components, fn {path, component} -> {"/" <> path, component} end)
+      # The components are files in components/, with their own files, and their sources are
+      # the templates their errors point into
+      {sources, component_files} = Typsty.Component.__files__(document_components(module) ++ opts[:components])
+      files = Enum.map(sources, fn {path, source} -> {path, source.source} end) ++ component_files
+      files = files ++ Keyword.get(opts, :files, [])
+      locations = Map.new(sources, fn {path, source} -> {"/" <> path, source} end)
 
       case render_with(pool, template.source, assigns, files, native_opts) do
         {:ok, output, warnings} ->

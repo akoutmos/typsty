@@ -331,6 +331,12 @@ fn component_errors(source: String) -> Vec<Diagnostic> {
     diagnostics(render::component_errors(source))
 }
 
+/// The paths a component reads files from, written as strings, as `{path, line, column}`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn file_paths(source: String) -> Vec<(String, usize, usize)> {
+    render::file_paths(source)
+}
+
 /// Formats a template with typstyle. Returns `{:error, diagnostics}` when the template has
 /// syntax errors, since it can't be formatted then.
 #[rustler::nif(schedule = "DirtyCpu")]

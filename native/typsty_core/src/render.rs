@@ -197,6 +197,15 @@ pub fn component_errors(source: String) -> Vec<Diagnostic> {
         .unwrap_or_else(|interrupted| vec![Diagnostic::error(interrupted.message())])
 }
 
+/// The paths a component reads files from, as strings (see `components::file_paths`), with
+/// their lines and columns.
+pub fn file_paths(source: String) -> Vec<(String, usize, usize)> {
+    isolate::run(move || {
+        crate::components::file_paths(&Source::detached(world::strip_bom(&source)))
+    })
+    .unwrap_or_default()
+}
+
 /// Formats a template with typstyle. A template with syntax errors can't be formatted, so it
 /// returns them instead.
 pub fn format(

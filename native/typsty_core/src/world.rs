@@ -291,7 +291,7 @@ impl TypstyWorld {
             VirtualRoot::Project if is_component_path(id.vpath().get_with_slash()) => {
                 return Err(FileError::Other(Some(
                     format!(
-                        "{} is not one of the render's components (components/ only has the components given to it). Add the component's module to `use Typsty, components: [...]`, or to the :components option",
+                        "{} is not one of the render's components, or one of their files (components/ only has the components given to the render, and their files). Add the component's module to `use Typsty, components: [...]`, or to the :components option",
                         id.vpath().get_with_slash()
                     )
                     .into(),

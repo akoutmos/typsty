@@ -25,7 +25,10 @@ and musl) and Windows (x86-64).
   definitions and imports, and they can't read `sys.inputs`, so they only get
   data as arguments. Their errors point at the lines of their files. Documents
   only depend on them at runtime, and `components/` is reserved for them, so a
-  file in `:files` can't take a component's place.
+  file in `:files` can't take a component's place. A component's own files
+  (images, data and `.typ` files) go in a folder next to it, and renders get
+  them at `components/<name>/`: they're kept in its module when it compiles,
+  and the paths it reads them from are checked then.
 - `Typsty.to_pdf/3`, `Typsty.to_png/3` and `Typsty.to_svg/3` for templates and
   Typst source.
 - The assigns (a map) are passed to the template as a dictionary named `assigns`

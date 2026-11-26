@@ -329,6 +329,14 @@ imports (`#import`), so a component can't be used as a partial, and they can't
 read `sys.inputs`, where the document's assigns are. Set and show rules go
 inside functions, like the letterhead's `set page(...)`.
 
+A component's own files, such as its images and data, go in a folder next to
+it with the same base name (`letterhead/` next to `letterhead.ex`). Renders get
+them at `components/<name>/`, so the component reads them as
+`image("letterhead/seal.svg")`. They're read when the component compiles and
+kept in its module, so they work in releases and in a `Typsty.Pool`, and paths
+to them that are written out are checked then too. Files that change from
+document to document, like the logo above, are passed as arguments instead.
+
 Errors in a component point at the line in its `.typ` file or its sigil.
 Documents only depend on their components at runtime, so changing a component
 doesn't recompile them. A component can list the components it imports
