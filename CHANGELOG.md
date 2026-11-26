@@ -17,6 +17,15 @@ and musl) and Windows (x86-64).
 - Document modules with `use Typsty`: `render/1` with the `~TYPST` sigil, or a
   colocated `.typ` template (or one given with the `:template` option), and
   generated `to_pdf/2`, `to_png/2` and `to_svg/2`, with bang variants.
+- Components, with `use Typsty.Component`: reusable Typst functions (tables,
+  letterheads, headers and footers) in a `.typ` file or a `~TYPST` sigil, which
+  documents list (`use Typsty, components: [...]`, or the `:components` option)
+  and import from `components/<name>.typ`, with the components they list.
+  Components are checked when they compile: their top level can only have
+  definitions and imports, and they can't read `sys.inputs`, so they only get
+  data as arguments. Their errors point at the lines of their files. Documents
+  only depend on them at runtime, and `components/` is reserved for them, so a
+  file in `:files` can't take a component's place.
 - `Typsty.to_pdf/3`, `Typsty.to_png/3` and `Typsty.to_svg/3` for templates and
   Typst source.
 - The assigns (a map) are passed to the template as a dictionary named `assigns`
@@ -25,8 +34,8 @@ and musl) and Windows (x86-64).
   maps (as dictionaries sorted by key), dates and times, decimals, `MapSet`s and
   `Range`s. Other structs implement `Typsty.Encoder`, by deriving it
   (`@derive {Typsty.Encoder, only: [...]}`) or implementing it. Using an assign
-  that wasn't given comes with a hint that says so. Imported files can read the
-  assigns from `sys.inputs.assigns`.
+  that wasn't given comes with a hint that says so. Imported files other than
+  components can read the assigns from `sys.inputs.assigns`.
 - A virtual file system: images, data files and `.typ` files are passed as
   binaries with the `:files` option. Files can also be read from a `:root`
   directory, which documents can't read outside of, even through symbolic links.

@@ -286,6 +286,17 @@ impl TypstyWorld {
     /// package directory.
     fn load(&self, id: FileId) -> FileResult<Bytes> {
         let (root, outside) = match id.root() {
+            // The directory is reserved for the components given to the render, which are in
+            // `files`
+            VirtualRoot::Project if is_component_path(id.vpath().get_with_slash()) => {
+                return Err(FileError::Other(Some(
+                    format!(
+                        "{} is not one of the render's components (components/ only has the components given to it). Add the component's module to `use Typsty, components: [...]`, or to the :components option",
+                        id.vpath().get_with_slash()
+                    )
+                    .into(),
+                )));
+            }
             VirtualRoot::Project => {
                 let root = self.root.as_ref().ok_or_else(|| {
                     FileError::Other(Some(
@@ -514,6 +525,12 @@ fn given_file(path: &str) -> Result<FileId, PrepareError> {
     let id = FileId::new(RootedPath::new(VirtualRoot::Project, vpath));
     observe(id);
     Ok(id)
+}
+
+/// Whether a path in the project (starting with a slash) is in the `components/` directory,
+/// which only has the components given to the render.
+fn is_component_path(path: &str) -> bool {
+    path.starts_with("/components/")
 }
 
 /// Typst's parser doesn't skip a byte order mark, which would become part of the first line.

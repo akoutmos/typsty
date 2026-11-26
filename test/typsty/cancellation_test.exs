@@ -162,6 +162,14 @@ defmodule Typsty.CancellationTest do
     end
 
     Application.delete_env(:typsty, :files)
+    Application.put_env(:typsty, :components, [Typsty.Test.Brand])
+    on_exit(fn -> Application.delete_env(:typsty, :components) end)
+
+    assert_raise ArgumentError, "the :components option can't be set in the config, only given to a render", fn ->
+      Typsty.to_pdf("x")
+    end
+
+    Application.delete_env(:typsty, :components)
 
     # Options given to a render override the config
     Application.put_env(:typsty, :ppi, 72)

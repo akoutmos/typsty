@@ -195,9 +195,11 @@ defmodule TypstyTest do
     end
 
     test "raises for invalid options, saying which one" do
-      assert_raise ArgumentError, ~r/^unknown options \[:bogus\], valid options are: \[:files, :root/, fn ->
-        Typsty.to_pdf("x", %{}, bogus: 1)
-      end
+      assert_raise ArgumentError,
+                   ~r/^unknown options \[:bogus\], valid options are: \[:files, :components, :root/,
+                   fn ->
+                     Typsty.to_pdf("x", %{}, bogus: 1)
+                   end
 
       # Config-only options can't be given to a render
       assert_raise ArgumentError, ~r/^unknown options \[:max_concurrent_renders\]/, fn ->

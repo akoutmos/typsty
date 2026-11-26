@@ -98,6 +98,22 @@ impl Diagnostic {
         }
     }
 
+    /// An error at a position in a template that was parsed on its own (not as part of a
+    /// world), with a hint.
+    pub fn at(source: &Source, offset: usize, message: &str, hint: &str) -> Self {
+        let position = source
+            .lines()
+            .byte_to_line_column(offset)
+            .map(|(line, column)| (line + 1, column + 1));
+
+        Self {
+            hints: vec![hint.to_string()],
+            line: position.map(|(line, _)| line),
+            column: position.map(|(_, column)| column),
+            ..Self::error(message)
+        }
+    }
+
     /// A syntax error in a template that was parsed on its own (not as part of a world).
     pub fn from_syntax(diagnostic: &SyntaxDiagnostic, source: &Source) -> Self {
         let position = range(diagnostic.span, source).and_then(|range| {

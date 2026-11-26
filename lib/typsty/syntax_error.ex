@@ -1,40 +1,48 @@
 defmodule Typsty.SyntaxError do
   @moduledoc """
-  A template has invalid Typst syntax. Raised when a module with a `~TYPST` sigil or a `.typ`
+  A template has invalid Typst syntax, or a component has something that components can't
+  have (see `Typsty.Component`). Raised when a module with a `~TYPST` sigil or a `.typ`
   template is compiled, so that the problem fails the build instead of a render, and when
   `mix format` formats one with `Typsty.Formatter`.
 
-  `:diagnostics` has every syntax error in the template, and `:file`, `:line` and `:column`
-  point at the first one.
+  `:diagnostics` has every problem in the template, and `:file`, `:line` and `:column` point
+  at the first one. `:kind` is `:syntax` for syntax errors, and `:component` for what a
+  component can't have.
   """
 
-  defexception [:file, :line, :column, :snippet, diagnostics: []]
+  defexception [:file, :line, :column, :snippet, diagnostics: [], kind: :syntax]
 
   @type t :: %__MODULE__{
           file: String.t() | nil,
           line: pos_integer() | nil,
           column: pos_integer() | nil,
           snippet: String.t() | nil,
-          diagnostics: [Typsty.Diagnostic.t()]
+          diagnostics: [Typsty.Diagnostic.t()],
+          kind: :syntax | :component
         }
 
   @impl Exception
-  def message(%__MODULE__{diagnostics: [first | _] = diagnostics, snippet: snippet}) do
+  def message(%__MODULE__{diagnostics: [first | _] = diagnostics, snippet: snippet} = error) do
     others =
       case diagnostics do
         [_] -> ""
         [_ | rest] -> "\n\n" <> Enum.map_join(rest, "\n\n", &Typsty.Diagnostic.format/1)
       end
 
-    "invalid Typst syntax: " <> Typsty.Diagnostic.format(first) <> (snippet || "") <> others
+    headline(error) <> ": " <> Typsty.Diagnostic.format(first) <> (snippet || "") <> others
   end
 
-  def message(%__MODULE__{}), do: "invalid Typst syntax"
+  def message(%__MODULE__{} = error), do: headline(error)
+
+  defp headline(%__MODULE__{kind: :component}), do: "invalid component"
+  defp headline(%__MODULE__{}), do: "invalid Typst syntax"
 
   @doc false
-  # Raises for the syntax errors of a template, pointing at the template's file
+  # Raises for the syntax errors of a template (or what a component can't have), pointing at
+  # the template's file
   @spec raise!([Typsty.Diagnostic.t()], Typsty.Template.t()) :: no_return()
-  def raise!([_ | _] = diagnostics, %Typsty.Template{} = template) do
+  @spec raise!([Typsty.Diagnostic.t()], Typsty.Template.t(), :syntax | :component) :: no_return()
+  def raise!([_ | _] = diagnostics, %Typsty.Template{} = template, kind \\ :syntax) do
     [first | _] = diagnostics = Enum.map(diagnostics, &Typsty.Diagnostic.locate(&1, template))
 
     raise __MODULE__,
@@ -42,7 +50,8 @@ defmodule Typsty.SyntaxError do
       line: first.line,
       column: first.column,
       snippet: snippet(template, first),
-      diagnostics: diagnostics
+      diagnostics: diagnostics,
+      kind: kind
   end
 
   # The template's line with the error, with a caret under the column

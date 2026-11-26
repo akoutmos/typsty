@@ -324,6 +324,13 @@ fn syntax_errors(template: String) -> Vec<Diagnostic> {
     diagnostics(render::syntax_errors(template))
 }
 
+/// Checks a component's source: its syntax, and that it only defines things and doesn't read
+/// `sys.inputs`. Returns the problems, which is an empty list for a valid component.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn component_errors(source: String) -> Vec<Diagnostic> {
+    diagnostics(render::component_errors(source))
+}
+
 /// Formats a template with typstyle. Returns `{:error, diagnostics}` when the template has
 /// syntax errors, since it can't be formatted then.
 #[rustler::nif(schedule = "DirtyCpu")]

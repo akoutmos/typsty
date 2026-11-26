@@ -109,19 +109,12 @@ defmodule Typsty do
   need as arguments, which keeps them independent of where their data comes from:
 
   ```typst
-  // components.typ
-  #let line-items(items) = table(
-    columns: 2,
-    ..items.map(item => (item.name, [#item.price])).flatten(),
-  )
-  ```
-
-  ```typst
-  #import "components.typ": line-items
+  #import "components/tables.typ": line-items
   #line-items(assigns.items)
   ```
 
-  (Imported files can also read the assigns from `sys.inputs.assigns`.)
+  (Imported files other than components can also read the assigns from
+  `sys.inputs.assigns`.)
 
   `render/1` gets the assigns before the template does, so it can compute values for it:
 
@@ -134,6 +127,30 @@ defmodule Typsty do
     \"\"\"
   end
   ```
+
+  ## Components
+
+  Reusable parts of documents, such as tables, letterheads, headers and footers, are
+  components: Typst functions in modules that `use Typsty.Component`, which documents list
+  and import:
+
+  ```elixir
+  defmodule MyApp.Invoice do
+    use Typsty, components: [MyApp.Documents.Letterhead, MyApp.Documents.Tables]
+
+    def render(assigns) do
+      ~TYPST\"\"\"
+      #import "components/letterhead.typ": letterhead
+      #import "components/tables.typ": line-items
+      #show: letterhead.with(title: [Invoice #assigns.number])
+
+      #line-items(assigns.items)
+      \"\"\"
+    end
+  end
+  ```
+
+  See `Typsty.Component`.
 
   ## Files
 
@@ -150,9 +167,10 @@ defmodule Typsty do
   ```
 
   Paths are relative to the project root (`"logo.png"` and `"/logo.png"` are the same file),
-  and `main.typ` is the template itself. To also read files from a directory, set `:root`;
-  files given with `:files` take precedence. Without `:root`, the document can only read
-  the files it's given. Files read from `:root` may be at most 512 MiB.
+  `main.typ` is the template itself, and `components/` is reserved for components. To also
+  read files from a directory, set `:root`; files given with `:files` take precedence.
+  Without `:root`, the document can only read the files it's given. Files read from `:root`
+  may be at most 512 MiB.
 
   Typst keeps every file path it sees for the life of the VM, and has room for 65,535 of
   them. Use stable names, like `logo.png` or `photos/1.jpg`, rather than a unique name per
@@ -169,8 +187,8 @@ defmodule Typsty do
 
   ## Options
 
-  Rendering takes these options. All of them, except `:files`, can also be set in your
-  application config, as defaults for every render:
+  Rendering takes these options. All of them, except `:files` and `:components`, can also be
+  set in your application config, as defaults for every render:
 
   ```elixir
   # config/runtime.exs
@@ -283,6 +301,9 @@ defmodule Typsty do
   - `:template` - the template file, relative to the module's file. Defaults to the
     module's file name with the `.typ` extension. A module that defines `render/1` can't
     have a template.
+  - `:components` - the components the template imports (see `Typsty.Component`), as a
+    list of modules. They're served at `components/<name>.typ`, with the components they
+    list.
 
   ## Overriding the generated functions
 
@@ -297,19 +318,9 @@ defmodule Typsty do
   ```
   """
   defmacro __using__(opts) do
-    opts = Keyword.validate!(opts, [:template])
-
-    {template, explicit?} =
-      case Keyword.fetch(opts, :template) do
-        {:ok, path} when is_binary(path) ->
-          {Path.expand(path, Path.dirname(__CALLER__.file)), true}
-
-        {:ok, other} ->
-          raise ArgumentError, "the :template option must be a path, got: #{Macro.to_string(other)}"
-
-        :error ->
-          {Path.rootname(__CALLER__.file) <> @template_extension, false}
-      end
+    opts = Keyword.validate!(opts, [:template, :components])
+    {template, explicit?} = __template_path__(opts, __CALLER__)
+    components = __components__!(opts)
 
     quote do
       @behaviour Typsty
@@ -318,6 +329,11 @@ defmodule Typsty do
 
       @__typsty_template__ {unquote(template), unquote(explicit?)}
       @before_compile Typsty
+
+      # In a function, so that documents only depend on their components at runtime: changing
+      # a component doesn't recompile them
+      @doc false
+      def __typsty_components__, do: unquote(components)
 
       @doc "Renders the document as a PDF. See `Typsty.to_pdf/3` for the options."
       @spec to_pdf(Typsty.assigns(), [Typsty.option()]) :: {:ok, binary()} | {:error, Typsty.RenderError.t()}
@@ -348,6 +364,38 @@ defmodule Typsty do
   end
 
   @doc false
+  # The template file of a document or component module, and whether it was given with the
+  # :template option
+  @spec __template_path__(keyword(), Macro.Env.t()) :: {Path.t(), boolean()}
+  def __template_path__(opts, caller) do
+    case Keyword.fetch(opts, :template) do
+      {:ok, path} when is_binary(path) ->
+        {Path.expand(path, Path.dirname(caller.file)), true}
+
+      {:ok, other} ->
+        raise ArgumentError, "the :template option must be a path, got: #{Macro.to_string(other)}"
+
+      :error ->
+        {Path.rootname(caller.file) <> @template_extension, false}
+    end
+  end
+
+  @doc false
+  # The :components option of a document or component module, as written: a list of aliases,
+  # which are expanded where the list is used
+  @spec __components__!(keyword()) :: [Macro.t()]
+  def __components__!(opts) do
+    components = Keyword.get(opts, :components, [])
+
+    if not is_list(components) or not Enum.all?(components, &(is_atom(&1) or match?({:__aliases__, _, _}, &1))) do
+      raise ArgumentError,
+            "the :components option must be a list of component modules, got: #{Macro.to_string(components)}"
+    end
+
+    components
+  end
+
+  @doc false
   defmacro __before_compile__(env) do
     {template, explicit?} = Module.get_attribute(env.module, :__typsty_template__)
     render_defined? = Module.defines?(env.module, {:render, 1}, :def)
@@ -355,6 +403,7 @@ defmodule Typsty do
     relative = Path.relative_to_cwd(template)
 
     check_render_is_public!(env)
+    __check_not_both__!(env)
 
     cond do
       render_defined? and (template_exists? or explicit?) ->
@@ -403,8 +452,27 @@ defmodule Typsty do
     end
   end
 
-  # Reads a .typ template, checking its syntax
-  defp read_template!(template, env) do
+  @doc false
+  @spec __check_not_both__!(Macro.Env.t()) :: :ok
+  def __check_not_both__!(env) do
+    if Module.has_attribute?(env.module, :__typsty_template__) and
+         Module.has_attribute?(env.module, :__typsty_component__) do
+      raise CompileError,
+        file: env.file,
+        line: env.line,
+        description:
+          "#{inspect(env.module)} uses both Typsty and Typsty.Component: a module is a document or a component, not both"
+    end
+
+    :ok
+  end
+
+  defp read_template!(template, env), do: __read_template__!(template, env, :document)
+
+  @doc false
+  # Reads a .typ template or component, checking it
+  @spec __read_template__!(Path.t(), Macro.Env.t(), :document | :component) :: String.t()
+  def __read_template__!(template, env, kind) do
     source = File.read!(template)
 
     if not String.valid?(source) do
@@ -414,7 +482,7 @@ defmodule Typsty do
         description: "the template #{Path.relative_to_cwd(template)} isn't valid UTF-8. Save it as UTF-8"
     end
 
-    validate!(%Template{source: source, file: template})
+    __check__!(%Template{source: source, file: template}, kind)
     source
   end
 
@@ -437,16 +505,7 @@ defmodule Typsty do
         description: "~TYPST requires a variable named \"assigns\" to exist and be set to a map"
     end
 
-    # A heredoc's content starts on the next line, indented. Other sigils start after `~TYPST"`
-    position =
-      case Keyword.fetch(meta, :indentation) do
-        {:ok, indentation} ->
-          [line: __CALLER__.line + 1, column: indentation + 1, indentation: indentation]
-
-        :error ->
-          [line: __CALLER__.line, column: Keyword.get(meta, :column, 1) + byte_size(~s(~TYPST")), indentation: 0]
-      end
-
+    position = __sigil_position__(meta, __CALLER__)
     validate!(struct!(Template, [source: source, file: __CALLER__.file] ++ position))
 
     quote do
@@ -465,8 +524,38 @@ defmodule Typsty do
     raise ArgumentError, "~TYPST only supports the noformat modifier, got: #{modifiers}"
   end
 
+  @doc false
+  # Where a ~TYPST sigil's source starts in its file. A heredoc's content starts on the next
+  # line, indented. Other sigils start after `~TYPST"`
+  @spec __sigil_position__(keyword(), Macro.Env.t()) :: keyword()
+  def __sigil_position__(meta, caller) do
+    case Keyword.fetch(meta, :indentation) do
+      {:ok, indentation} ->
+        [line: caller.line + 1, column: indentation + 1, indentation: indentation]
+
+      :error ->
+        [line: caller.line, column: Keyword.get(meta, :column, 1) + byte_size(~s(~TYPST")), indentation: 0]
+    end
+  end
+
+  @doc false
+  # Checks a template when it compiles: its syntax, and for a component, the rules for
+  # components (see Typsty.Component)
+  @spec __check__!(Template.t(), :document | :component) :: :ok
+  def __check__!(%Template{} = template, :document), do: validate!(template)
+
+  def __check__!(%Template{source: source} = template, :component) do
+    validate!(template)
+
+    case native_check(&Native.component_errors/1, source) do
+      [] -> :ok
+      :unavailable -> :ok
+      diagnostics -> SyntaxError.raise!(diagnostics, template, :component)
+    end
+  end
+
   defp validate!(%Template{source: source} = template) do
-    case syntax_errors(source) do
+    case native_check(&Native.syntax_errors/1, source) do
       [] -> :ok
       :unavailable -> :ok
       diagnostics -> SyntaxError.raise!(diagnostics, template)
@@ -474,9 +563,9 @@ defmodule Typsty do
   end
 
   # When cross-compiling (for Nerves, say), the NIF is built for another machine and can't
-  # load where the code compiles: templates are then compiled without checking their syntax
-  defp syntax_errors(source) do
-    Native.syntax_errors(source)
+  # load where the code compiles: templates are then compiled without checking them
+  defp native_check(check, source) do
+    check.(source)
   rescue
     error in [UndefinedFunctionError, ErlangError] ->
       if match?(%UndefinedFunctionError{module: Native}, error) or
@@ -484,7 +573,11 @@ defmodule Typsty do
         # Once per compilation, rather than for every template
         if not :persistent_term.get({__MODULE__, :warned_unavailable}, false) do
           :persistent_term.put({__MODULE__, :warned_unavailable}, true)
-          IO.warn("Typsty can't check templates' syntax, since its NIF couldn't be loaded (cross-compiling?)", [])
+
+          IO.warn(
+            "Typsty can't check templates and components, since its NIF couldn't be loaded (cross-compiling?)",
+            []
+          )
         end
 
         :unavailable
@@ -673,9 +766,17 @@ defmodule Typsty do
       pool = pool!(opts[:pool])
       native_opts = __native_options__(opts, format)
 
-      case render_with(pool, template.source, assigns, Keyword.get(opts, :files, []), native_opts) do
+      # The components are files in components/, and the templates their errors point into
+      components = Typsty.Component.__files__(document_components(module) ++ opts[:components])
+
+      files =
+        Enum.map(components, fn {path, component} -> {path, component.source} end) ++ Keyword.get(opts, :files, [])
+
+      locations = Map.new(components, fn {path, component} -> {"/" <> path, component} end)
+
+      case render_with(pool, template.source, assigns, files, native_opts) do
         {:ok, output, warnings} ->
-          warnings = Enum.map(warnings, &Diagnostic.locate(&1, template))
+          warnings = Enum.map(warnings, &Diagnostic.locate(&1, template, locations))
           log_warnings(warnings, opts[:log_warnings])
           {{:ok, output}, Map.merge(metadata, %{result: :ok, diagnostics: warnings})}
 
@@ -683,7 +784,7 @@ defmodule Typsty do
           raise ArgumentError, message
 
         {:error, reason, details} ->
-          diagnostics = diagnostics(reason, details, template, native_opts)
+          diagnostics = diagnostics(reason, details, {template, locations}, native_opts)
           error = %RenderError{reason: reason, diagnostics: diagnostics}
           {{:error, error}, Map.merge(metadata, %{result: :error, reason: reason, diagnostics: diagnostics})}
       end
@@ -721,13 +822,31 @@ defmodule Typsty do
     }
   end
 
-  defp diagnostics(:typst, diagnostics, template, native_opts) do
-    Enum.map(diagnostics, &(&1 |> Diagnostic.locate(template) |> rewrite_hints(native_opts)))
+  defp document_components(nil), do: []
+  defp document_components(module), do: module.__typsty_components__()
+
+  defp diagnostics(:typst, diagnostics, {template, locations}, native_opts) do
+    Enum.map(diagnostics, fn diagnostic ->
+      diagnostic
+      |> component_hint()
+      |> Diagnostic.locate(template, locations)
+      |> rewrite_hints(native_opts)
+    end)
   end
 
   defp diagnostics(_reason, message, _template, _native_opts) when is_binary(message) do
     [%Diagnostic{severity: :error, message: message}]
   end
+
+  # Like other imported files, components don't see the template's `assigns`
+  defp component_hint(%Diagnostic{file: "/components/" <> _, message: "unknown variable: assigns"} = diagnostic) do
+    hint =
+      "components don't see the document's assigns: take what the component needs as arguments, and pass it from the document"
+
+    %{diagnostic | hints: diagnostic.hints ++ [hint]}
+  end
+
+  defp component_hint(diagnostic), do: diagnostic
 
   # A package that isn't in the :package_paths directories. The whole message must match, since
   # messages can quote a template's data

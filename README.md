@@ -31,6 +31,7 @@
 - [Level Up Your Elixir Skills!](#level-up-your-elixir-skills)
 - [Using Typsty](#using-typsty)
 - [Assigns](#assigns)
+- [Components](#components)
 - [Files](#files)
 - [Fonts](#fonts)
 - [Packages](#packages)
@@ -241,23 +242,16 @@ ones that don't hide anything it uses from Typst, such as `title` or `page`:
 
 `assigns` is bound at the top of the template, like a `#let` binding, so it's
 only visible in the template itself. Pass the files it imports, such as
-components, the values they need as arguments, which keeps them independent of
-where their data comes from:
+[components](#components), the values they need as arguments, which keeps them
+independent of where their data comes from:
 
 ```typst
-// components.typ
-#let line-items(items) = table(
-  columns: 2,
-  ..items.map(item => (item.name, [#item.price])).flatten(),
-)
-```
-
-```typst
-#import "components.typ": line-items
+#import "components/tables.typ": line-items
 #line-items(assigns.items)
 ```
 
-(Imported files can also read the assigns from `sys.inputs.assigns`.)
+(Imported files other than components can also read the assigns from
+`sys.inputs.assigns`.)
 
 `render/1` gets the assigns first, so it can compute values for the template
 with all of Elixir:
@@ -272,6 +266,76 @@ def render(assigns) do
 end
 ```
 
+## Components
+
+Reusable parts of documents, such as tables, letterheads, headers and footers,
+are components: Typst functions in a module that does `use Typsty.Component`.
+The source is in a `.typ` file next to the module (`tables.ex` and
+`tables.typ`), or in a `render/0` with the `~TYPST` sigil:
+
+```elixir
+defmodule MyApp.Documents.Tables do
+  use Typsty.Component
+
+  def render do
+    ~TYPST"""
+    #let line-items(items, currency: "$") = table(
+      columns: (1fr, auto),
+      [*Item*], [*Price*],
+      ..items.map(item => (item.name, [#currency#item.price])).flatten(),
+    )
+    """
+  end
+end
+```
+
+Headers and footers go in a template function, which takes the document's
+content as its last argument and lays out the pages around it:
+
+```typst
+// lib/my_app/documents/letterhead.typ, next to letterhead.ex
+#let letterhead(title: none, logo: none, body) = {
+  set page(
+    header: [#logo #h(1fr) #title],
+    footer: context [Page #counter(page).display() of #counter(page).final().first()],
+  )
+  body
+}
+```
+
+A document lists its components, and imports each one from
+`components/<name>.typ`, where the name is the last part of the module's name,
+in snake case. A show rule applies the letterhead to everything after it:
+
+```elixir
+defmodule MyApp.Invoice do
+  use Typsty, components: [MyApp.Documents.Letterhead, MyApp.Documents.Tables]
+
+  def render(assigns) do
+    ~TYPST"""
+    #import "components/letterhead.typ": letterhead
+    #import "components/tables.typ": line-items
+    #show: letterhead.with(title: [Invoice #assigns.number], logo: image("logo.png", height: 1cm))
+
+    #line-items(assigns.items)
+    """
+  end
+end
+```
+
+Components only define things, and only get data as arguments. That's checked
+when they compile: their top level can only have definitions (`#let`) and
+imports (`#import`), so a component can't be used as a partial, and they can't
+read `sys.inputs`, where the document's assigns are. Set and show rules go
+inside functions, like the letterhead's `set page(...)`.
+
+Errors in a component point at the line in its `.typ` file or its sigil.
+Documents only depend on their components at runtime, so changing a component
+doesn't recompile them. A component can list the components it imports
+(`use Typsty.Component, components: [MyApp.Documents.Brand]`), and templates
+rendered from strings get components with the `:components` option. See
+`Typsty.Component` for the details.
+
 ## Files
 
 Images, data files and other `.typ` files are passed as binaries in the `:files`
@@ -284,13 +348,13 @@ MyApp.Report.to_pdf(assigns,
     "logo.png" => logo,
     "charts/revenue.svg" => chart_svg,
     "data/sales.csv" => csv,
-    "components.typ" => File.read!(Application.app_dir(:my_app, "priv/typst/components.typ"))
+    "styles.typ" => File.read!(Application.app_dir(:my_app, "priv/typst/styles.typ"))
   }
 )
 ```
 
 ```typst
-#import "components.typ": callout
+#import "styles.typ": callout
 #image("charts/revenue.svg")
 #let sales = csv("data/sales.csv")
 ```
@@ -298,7 +362,8 @@ MyApp.Report.to_pdf(assigns,
 Name files yourself, rather than with names that come from users (an upload's
 file name, say): a `.typ` file in `:files` takes the place of the one the
 template imports, which would let a user run their own Typst code. Use names
-like `uploads/#{id}.png`.
+like `uploads/#{id}.png`. (Components can't be replaced that way:
+`components/` is reserved for them, so `:files` can't have files there.)
 
 Without the `:root` option, a document can only read the files it's given. Set
 `:root` to a directory to also read files from it (files in `:files` take
