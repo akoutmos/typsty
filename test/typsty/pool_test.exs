@@ -78,6 +78,8 @@ defmodule Typsty.PoolTest do
       # and the external term format in different orders
       large_map = Map.new(1..40, &{"k#{&1}", &1})
 
+      # A PDF has the time it was rendered in it, to the second, unless the document's date is
+      # none: cases that render set that, or a second could pass between the two renders
       cases = [
         {"#set document(date: none)\n= Hello #assigns.name\n#for (k, v) in assigns.d [#k=#v ]",
          %{"name" => "World", "d" => %{"b" => 2, "a" => 1, "c" => [3, 4.5, nil, true]}}, []},
@@ -100,7 +102,7 @@ defmodule Typsty.PoolTest do
          [{"a.typ", "text"}, {"i.png", png}]},
         {"line 1\n#nobody\n#import \"lib.typ\": f\n#f()", %{}, [{"lib.typ", "#let f() = missing"}]},
         {"#for i in range(10001) { context read(str(i)) }", %{}, []},
-        {"#assigns.at(\"bad name\")", %{"bad name" => 1}, []},
+        {"#set document(date: none)\n#assigns.at(\"bad name\")", %{"bad name" => 1}, []},
         {"x", %{"bad" => "\xFF"}, []},
         {"x", %{"v" => {:decimal, "1E+40"}}, []},
         {"x", %{}, [{"../x", "x"}]}
