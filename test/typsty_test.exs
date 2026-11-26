@@ -1,8 +1,6 @@
 defmodule TypstyTest do
   use ExUnit.Case, async: true
 
-  import ExUnit.CaptureLog
-
   alias Typsty.{Diagnostic, RenderError, Template}
 
   # A 1x1 transparent PNG
@@ -13,48 +11,79 @@ defmodule TypstyTest do
       assert {:ok, "%PDF-" <> _} = Typsty.to_pdf("= Hello")
     end
 
-    test "binds the assigns as variables" do
-      assert {:ok, _pdf} = Typsty.to_pdf(~s|#assert.eq(name, "World")|, %{name: "World"})
-      assert {:ok, _pdf} = Typsty.to_pdf(~s|#assert.eq(name, "World")|, name: "World")
-      assert {:ok, _pdf} = Typsty.to_pdf(~s|#assert.eq(name, "World")|, %{"name" => "World"})
+    test "passes the assigns in the assigns dictionary" do
+      assert {:ok, _pdf} = Typsty.to_pdf(~s|#assert.eq(assigns.name, "World")|, %{name: "World"})
+      assert {:ok, _pdf} = Typsty.to_pdf(~s|#assert.eq(assigns.name, "World")|, %{"name" => "World"})
+      assert {:ok, _pdf} = Typsty.to_pdf(~s|#assert.eq(assigns, (:))|)
     end
 
-    test "binds kebab-case variable names" do
-      assert {:ok, _pdf} = Typsty.to_pdf("#assert.eq(invoice-number, 7)", %{"invoice-number" => 7})
-    end
-
-    test "makes the variables available in sys.inputs" do
+    test "takes any key, including ones that aren't Typst identifiers" do
       source = ~S"""
-      #assert.eq(sys.inputs.name, "World")
-      #assert.eq(sys.inputs.at("missing", default: none), none)
+      #assert.eq(assigns.invoice-number, 7)
+      #assert.eq(assigns.at("invoice number"), 8)
+      #assert.eq(assigns.for, 9)
+      #assert.eq(assigns.at("_"), 10)
+      #assert.eq(assigns.at("missing", default: none), none)
       """
 
-      assert {:ok, _pdf} = Typsty.to_pdf(source, %{name: "World"})
+      assigns = %{"invoice-number" => 7, "invoice number" => 8, for: 9, _: 10}
+      assert {:ok, _pdf} = Typsty.to_pdf(source, assigns)
     end
 
-    test "shadows standard library names in the template only" do
+    test "doesn't shadow anything in Typst" do
       source = ~S"""
-      #assert.eq(title, "My title")
-      #std.title[Still a function]
+      #assert.eq(type(title), function)
+      #assert.eq(assigns.title, "My title")
+      #title[#assigns.title]
       #import "helper.typ": shout
       #assert.eq(shout("x"), "X")
       """
 
-      # The imported file still sees the standard library's title and upper
+      # Imported files don't see the assigns variable, but can read sys.inputs
       helper = ~S"""
-      #let shout(text) = { assert.eq(type(title), function); upper(text) }
+      #let shout(text) = { assert.eq(sys.inputs.assigns.title, "My title"); upper(text) }
       """
 
-      assert {:ok, _pdf} =
-               Typsty.to_pdf(source, %{title: "My title", upper: "shadowed"}, files: %{"helper.typ" => helper})
+      assert {:ok, _pdf} = Typsty.to_pdf(source, %{title: "My title", upper: "x"}, files: %{"helper.typ" => helper})
     end
 
-    test "points errors at lines of the template, not counting the variables" do
+    test "points errors at lines of the template, not counting the line that binds the assigns" do
       assert {:error, %RenderError{diagnostics: [diagnostic]}} =
-               Typsty.to_pdf("first line\nsecond #nmae", %{name: "World"})
+               Typsty.to_pdf("first line\nsecond #assigns.nmae", %{name: "World"})
 
-      assert %Diagnostic{severity: :error, message: "unknown variable: nmae", file: nil, line: 2, column: 9} =
-               diagnostic
+      assert %Diagnostic{severity: :error, file: nil, line: 2, column: 17} = diagnostic
+      assert diagnostic.message =~ ~s(dictionary does not contain key "nmae")
+    end
+
+    test "hints at assigns that weren't given" do
+      hint =
+        ~s|there's no "customer" in the assigns. Pass it from Elixir, or read it with | <>
+          ~s|`assigns.at("customer", default: none)` if it's optional|
+
+      for source <- ["#assigns.customer.name", ~S|#assigns.at("customer")|, "#let (customer,) = assigns"] do
+        assert {:error, %RenderError{diagnostics: [diagnostic]}} = Typsty.to_pdf(source, %{name: "World"})
+        assert diagnostic.hints == [hint], source
+      end
+
+      # Other dictionaries are left alone
+      for source <- ["#let d = (a: 1)\n#d.customer", "#assigns.items.first().customer"] do
+        assert {:error, %RenderError{diagnostics: [diagnostic]}} = Typsty.to_pdf(source, %{items: [%{}]})
+        assert diagnostic.hints == [], source
+      end
+    end
+
+    test "lets a template give assigns short names, and pass them to components" do
+      source = ~S"""
+      #import "components.typ": greeting
+      #let (name, items) = assigns
+      #assert.eq(greeting(name), "Hello World")
+      #assert.eq(items.len(), 2)
+      """
+
+      components = ~S|#let greeting(name) = "Hello " + name|
+
+      assert {:ok, _pdf} =
+               Typsty.to_pdf(source, %{name: "World", items: [1, 2]}, files: %{"components.typ" => components})
     end
 
     test "returns errors with hints" do
@@ -66,11 +95,11 @@ defmodule TypstyTest do
     end
 
     test "merges the assigns into a template's assigns" do
-      template = %Template{source: "#assert.eq((a, b), (1, 3))", assigns: %{a: 1, b: 2}}
+      template = %Template{source: "#assert.eq((assigns.a, assigns.b), (1, 3))", assigns: %{a: 1, b: 2}}
       assert {:ok, _pdf} = Typsty.to_pdf(template, %{b: 3})
     end
 
-    test "conforms to PDF standards" do
+    test "conforms to PDF standards, which are checked before rendering" do
       # PDF/A requires a date, which is the time of the render by default
       assert {:ok, pdf} = Typsty.to_pdf("#set document(title: [Doc])\nHello", %{}, pdf_standards: ["a-2b"])
       assert pdf =~ "pdfaid"
@@ -78,29 +107,160 @@ defmodule TypstyTest do
       assert {:error, %RenderError{diagnostics: [%{message: "PDF/A-2b error: missing document date"}]}} =
                Typsty.to_pdf("#set document(title: [Doc], date: none)\nHello", %{}, pdf_standards: ["a-2b"])
 
-      assert {:error, %RenderError{diagnostics: [%{message: "unknown PDF standard: z-1"}]}} =
-               Typsty.to_pdf("Hello", %{}, pdf_standards: ["z-1"])
-    end
-
-    test "raises for invalid variable names" do
-      assert_raise ArgumentError, ~r/"invoice number" is not a valid Typst variable name/, fn ->
-        Typsty.to_pdf("x", %{"invoice number" => 1})
-      end
-
-      assert_raise ArgumentError, ~r/"for" is not a valid Typst variable name/, fn ->
-        Typsty.to_pdf("x", %{for: 1})
+      assert_raise ArgumentError, ~r/invalid :pdf_standards option/, fn ->
+        Typsty.to_pdf("Hello", %{}, pdf_standards: ["a-2b", "a-3b"])
       end
     end
 
-    test "raises for invalid options" do
-      assert_raise ArgumentError, ~r/unknown keys \[:bogus\]/, fn -> Typsty.to_pdf("x", %{}, bogus: 1) end
-      assert_raise ArgumentError, ~r/:ppi option must be a positive number/, fn -> Typsty.to_png("x", %{}, ppi: 0) end
+    test "raises for assigns that aren't a map, which keeps options from being taken for them" do
+      assert_raise ArgumentError,
+                   ~r/the assigns must be a map, got a list: \[ppi: 300\]. Options go after the assigns/,
+                   fn ->
+                     Typsty.to_png("x", ppi: 300)
+                   end
 
-      assert_raise ArgumentError, ~r/:font_paths option must be a list of strings/, fn ->
-        Typsty.to_pdf("x", %{}, font_paths: "fonts")
+      assert_raise ArgumentError, ~r/the assigns must be a map, got a URI struct/, fn ->
+        Typsty.to_pdf("x", URI.parse("https://typst.app"))
+      end
+    end
+
+    test "takes the first of an option given more than once, like Keyword.get/2" do
+      assert {:ok, [small]} = Typsty.to_png("#set page(width: 1in, height: 1in)", %{}, ppi: 72, ppi: 300)
+      assert {:ok, [large]} = Typsty.to_png("#set page(width: 1in, height: 1in)", %{}, ppi: 300, ppi: 72)
+      assert byte_size(large) > byte_size(small)
+    end
+
+    test "raises for options with values the native code can't take" do
+      assert_raise ArgumentError, ~r/invalid value for :ppi option: expected a positive number of at most 10000/, fn ->
+        Typsty.to_png("x", %{}, ppi: Integer.pow(10, 400))
       end
 
-      assert_raise ArgumentError, ~r/must be a map or a keyword list/, fn -> Typsty.to_pdf("x", [1, 2]) end
+      assert_raise ArgumentError, ~r/:font_paths option: expected a list of paths .* and nil isn't one/, fn ->
+        Typsty.to_pdf("x", %{}, font_paths: [nil])
+      end
+
+      assert_raise ArgumentError, ~r/:files option: expected paths \(strings\) mapped to binaries, got: nil/, fn ->
+        Typsty.to_pdf("x", %{}, files: [nil])
+      end
+    end
+
+    test "returns the warnings that came before an error" do
+      source = ~s|#set text(font: "No Such Font")\nHi\n#assigns.missing|
+      assert {:error, %RenderError{diagnostics: diagnostics}} = Typsty.to_pdf(source)
+      assert [%{severity: :error}, %{severity: :warning, message: "unknown font family: no such font"}] = diagnostics
+    end
+
+    test "leaves links to URLs other than web, mail and phone ones out" do
+      source = ~S|#link(assigns.bad)[bad] #link(assigns.good)[good]|
+      assigns = %{bad: " JavaScript:alert(document.domain)", good: "https://example.com/?a=1&b=<2>"}
+
+      assert {:ok, [svg]} = Typsty.to_svg(source, assigns)
+      refute svg =~ ~r/javascript/i
+      assert svg =~ ~s|href="https://example.com/?a=1&amp;b=&lt;2&gt;"|
+      assert {_document, []} = svg |> String.to_charlist() |> :xmerl_scan.string(quiet: true)
+
+      assert {:ok, _pdf} = Typsty.to_pdf(source, assigns)
+    end
+
+    test "raises for templates that aren't Typst source" do
+      assert_raise ArgumentError, ~r/the template's source isn't valid UTF-8/, fn ->
+        Typsty.to_pdf(%Template{source: <<0xFF>>})
+      end
+
+      assert_raise ArgumentError, ~r/the template's source must be a string, got: nil/, fn ->
+        # credo:disable-for-next-line Credo.Check.Refactor.Apply
+        apply(Typsty, :to_pdf, [%Template{source: nil}])
+      end
+
+      assert_raise ArgumentError, ~r/:files option: expected paths that are valid UTF-8/, fn ->
+        Typsty.to_pdf("x", %{}, files: [{<<0xFF>>, "x"}])
+      end
+
+      assert_raise ArgumentError, ~r/the Typst source isn't valid UTF-8/, fn -> Typsty.to_pdf(<<"= Hi ", 0xFF>>) end
+      assert_raise ArgumentError, ~r/the Typst source isn't valid UTF-8/, fn -> Typsty.validate(<<0xFF>>) end
+      assert_raise ArgumentError, ~r/the Typst source isn't valid UTF-8/, fn -> Typsty.format(<<0xFF>>) end
+
+      assert_raise ArgumentError,
+                   ~r/To render a document module, call its functions, like Typsty.Test.Greeting.to_pdf/,
+                   fn ->
+                     # Through apply/3, which keeps Elixir's type checker from flagging the call
+                     # credo:disable-for-next-line Credo.Check.Refactor.Apply
+                     apply(Typsty, :to_pdf, [Typsty.Test.Greeting, %{}])
+                   end
+    end
+
+    test "ignores a byte order mark at the start of the template" do
+      assert {:ok, _pdf} = Typsty.to_pdf("\uFEFF= Title\n#context assert.eq(query(heading).len(), 1)")
+      assert Typsty.validate("\uFEFF= Title") == :ok
+    end
+
+    test "raises for invalid options, saying which one" do
+      assert_raise ArgumentError, ~r/^unknown options \[:bogus\], valid options are: \[:files, :root/, fn ->
+        Typsty.to_pdf("x", %{}, bogus: 1)
+      end
+
+      # Config-only options can't be given to a render
+      assert_raise ArgumentError, ~r/^unknown options \[:max_concurrent_renders\]/, fn ->
+        Typsty.to_pdf("x", %{}, max_concurrent_renders: 2)
+      end
+
+      assert_raise ArgumentError,
+                   "invalid value for :ppi option: expected a positive number of at most 10000, got: 0",
+                   fn ->
+                     Typsty.to_png("x", %{}, ppi: 0)
+                   end
+
+      assert_raise ArgumentError,
+                   ~s|invalid value for :font_paths option: expected a list of paths, got: "fonts"|,
+                   fn ->
+                     Typsty.to_pdf("x", %{}, font_paths: "fonts")
+                   end
+
+      assert_raise ArgumentError, ~r/^invalid list in :pdf_standards option: .* expected one of \["1.4"/, fn ->
+        Typsty.to_pdf("x", %{}, pdf_standards: ["z-1"])
+      end
+
+      assert_raise ArgumentError, "the options must be a keyword list, got: %{ppi: 1}", fn ->
+        Typsty.to_pdf("x", %{}, %{ppi: 1})
+      end
+
+      assert_raise ArgumentError, "invalid value for :root option: expected a path (a string) or nil, got: :foo", fn ->
+        Typsty.to_pdf("x", %{}, root: :foo)
+      end
+
+      assert_raise ArgumentError,
+                   ~r/^invalid value for :timeout option: expected a positive integer .* \(at most 4294967295\)/,
+                   fn ->
+                     Typsty.to_pdf("x", %{}, timeout: 5_000_000_000)
+                   end
+
+      # A pool that isn't running may be restarting, which is an error like a pool that stops
+      assert {:error, %RenderError{reason: :crashed, diagnostics: [%{message: message}]}} =
+               Typsty.to_pdf("x", %{}, pool: :no_such_pool)
+
+      assert message == "the pool :no_such_pool isn't running (a Typsty.Pool in a supervision tree may be restarting)"
+
+      assert_raise ArgumentError, ~r/^the :pool option must be a Typsty.Pool, got: #PID/, fn ->
+        Typsty.to_pdf("x", %{}, pool: self())
+      end
+
+      assert_raise ArgumentError,
+                   ~r/^invalid value for :pool option: expected the name or pid of a Typsty.Pool, or nil/,
+                   fn ->
+                     Typsty.to_pdf("x", %{}, pool: false)
+                   end
+
+      assert_raise ArgumentError, ~r/^unknown options \[:indnet\]/, fn -> Typsty.format("x", indnet: 2) end
+
+      assert_raise ArgumentError,
+                   ~r/^invalid value for :line_length option: expected a positive integer of at most 10000, got: 0/,
+                   fn ->
+                     Typsty.format("x", line_length: 0)
+                   end
+
+      assert_raise ArgumentError, ~r/^unknown options \[:ppi\], valid options are: \[:font_paths/, fn ->
+        Typsty.font_families(ppi: 1)
+      end
     end
   end
 
@@ -175,9 +335,10 @@ defmodule TypstyTest do
       assert {:ok, _pdf} = Typsty.to_pdf(source, %{}, root: root, files: %{"b.txt" => "from files"})
     end
 
-    test "can't read files outside the :root directory" do
-      root = tmp_dir!("confined")
-      assert {:error, %RenderError{}} = Typsty.to_pdf(~S|#read("../../mix.exs")|, %{}, root: root)
+    test "raises for a :root directory that doesn't exist" do
+      assert_raise ArgumentError, ~r/the :root directory ".*no_such_dir" doesn't exist, or isn't a directory/, fn ->
+        Typsty.to_pdf("x", %{}, root: "no_such_dir")
+      end
     end
 
     test "returns an error for a file that wasn't given, without reading from disk" do
@@ -203,7 +364,12 @@ defmodule TypstyTest do
     end
 
     test "raises for invalid files" do
-      assert_raise ArgumentError, ~r/must map paths to binaries/, fn -> Typsty.to_pdf("x", %{}, files: %{logo: "y"}) end
+      assert_raise ArgumentError,
+                   ~r/^invalid value for :files option: expected paths \(strings\) mapped to binaries/,
+                   fn ->
+                     Typsty.to_pdf("x", %{}, files: %{logo: "y"})
+                   end
+
       assert_raise ArgumentError, ~r/invalid file path/, fn -> Typsty.to_pdf("x", %{}, files: %{"../up.txt" => "y"}) end
     end
   end
@@ -225,24 +391,13 @@ defmodule TypstyTest do
 
       source = ~S"""
       #import "@local/greet:0.1.0": greet
-      #assert.eq(greet(name), "Hello World")
+      #assert.eq(greet(assigns.name), "Hello World")
       """
 
       assert {:ok, _pdf} = Typsty.to_pdf(source, %{name: "World"}, package_paths: [packages])
 
       assert {:error, %RenderError{diagnostics: [diagnostic]}} = Typsty.to_pdf(source, %{name: "World"})
       assert diagnostic.message =~ "@local/greet:0.1.0"
-    end
-  end
-
-  describe "warnings" do
-    test "are logged" do
-      Application.put_env(:typsty, :log_warnings, true)
-      on_exit(fn -> Application.put_env(:typsty, :log_warnings, false) end)
-
-      log = capture_log(fn -> assert {:ok, _pdf} = Typsty.to_pdf(~s|#set text(font: "No Such Font")\nHi|) end)
-      assert log =~ "[Typsty] 1:"
-      assert log =~ "warning: unknown font family: no such font"
     end
   end
 
@@ -254,6 +409,16 @@ defmodule TypstyTest do
     test "returns the syntax errors" do
       assert {:error, [%Diagnostic{message: "unclosed delimiter", line: 2, column: 10}]} =
                Typsty.validate("Fine\n#let x = (1, 2")
+    end
+
+    test "raises for anything but a string, as format/2 does" do
+      # Through apply/3, which keeps Elixir's type checker from flagging the calls
+      for {function, args} <- [validate: [nil], format: [nil], format: [123, []]] do
+        assert_raise ArgumentError, ~r/expected Typst source \(a string\), got: (nil|123)/, fn ->
+          # credo:disable-for-next-line Credo.Check.Refactor.Apply
+          apply(Typsty, function, args)
+        end
+      end
     end
   end
 
@@ -281,34 +446,6 @@ defmodule TypstyTest do
                "New Computer Modern",
                "New Computer Modern Math"
              ]
-    end
-
-    test "lists the fonts from the font paths" do
-      assert Typsty.font_families(system_fonts: false, embedded_fonts: false) == []
-
-      fonts = tmp_dir!("fonts")
-      font = system_font!()
-      File.cp!(font, Path.join(fonts, "font" <> Path.extname(font)))
-
-      assert [family | _] = Typsty.font_families(system_fonts: false, embedded_fonts: false, font_paths: [fonts])
-
-      # Without the embedded fonts, the text can only use the font from the font path
-      Application.put_env(:typsty, :log_warnings, true)
-      on_exit(fn -> Application.put_env(:typsty, :log_warnings, false) end)
-
-      source = "#set text(font: family)\nHello"
-      opts = [system_fonts: false, embedded_fonts: false, font_paths: [fonts]]
-      assert capture_log(fn -> assert {:ok, _pdf} = Typsty.to_pdf(source, %{family: family}, opts) end) == ""
-    end
-  end
-
-  # A font installed on the system, to copy into a font path
-  defp system_font! do
-    ["/System/Library/Fonts", "/usr/share/fonts", "C:/Windows/Fonts"]
-    |> Enum.flat_map(&Path.wildcard(Path.join(&1, "**/*.{ttf,otf}")))
-    |> case do
-      [font | _] -> font
-      [] -> flunk("no font found on the system to test font paths with")
     end
   end
 

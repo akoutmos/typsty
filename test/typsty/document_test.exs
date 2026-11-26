@@ -7,7 +7,7 @@ defmodule Typsty.DocumentTest do
   describe "a module with render/1" do
     test "renders the ~TYPST sigil with the assigns render/1 computed" do
       assert {:ok, "%PDF-" <> _} = Greeting.to_pdf(%{name: "World", items: ["one", "two"]})
-      assert {:ok, [<<137, "PNG", _::binary>>]} = Greeting.to_png(name: "World", items: [])
+      assert {:ok, [<<137, "PNG", _::binary>>]} = Greeting.to_png(%{name: "World", items: []})
       assert {:ok, ["<svg" <> _]} = Greeting.to_svg(%{name: "World", items: []})
     end
 
@@ -125,6 +125,27 @@ defmodule Typsty.DocumentTest do
         compile!(dir, "both.ex", """
         defmodule Typsty.Test.Both do
           use Typsty
+          def render(assigns), do: ~TYPST"Hello"
+        end
+        """)
+      end
+    end
+
+    test "requires render/1 to be public, and not combined with a :template", %{tmp_dir: dir} do
+      assert_raise CompileError, ~r/defines render\/1 as private: it must be public/, fn ->
+        compile!(dir, "private.ex", """
+        defmodule Typsty.Test.Private do
+          use Typsty
+          defp render(assigns), do: ~TYPST"Hello"
+          def preview, do: render(%{})
+        end
+        """)
+      end
+
+      assert_raise CompileError, ~r/defines render\/1 and has a template/, fn ->
+        compile!(dir, "explicit.ex", """
+        defmodule Typsty.Test.Explicit do
+          use Typsty, template: "missing.typ"
           def render(assigns), do: ~TYPST"Hello"
         end
         """)

@@ -2679,13 +2679,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "typsty_nif"
+name = "typsty_core"
 version = "0.1.0"
 dependencies = [
+ "biblatex",
  "comemo",
+ "data-url",
+ "flate2",
  "imagesize",
+ "libc",
+ "memchr",
  "rayon",
- "rustler",
+ "roxmltree 0.21.2",
  "time",
  "typst",
  "typst-kit",
@@ -2694,6 +2699,25 @@ dependencies = [
  "typst-render",
  "typst-svg",
  "typstyle-core",
+ "usvg",
+]
+
+[[package]]
+name = "typsty_nif"
+version = "0.1.0"
+dependencies = [
+ "rustler",
+ "typst",
+ "typsty_core",
+]
+
+[[package]]
+name = "typsty_worker"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "typst",
+ "typsty_core",
 ]
 
 [[package]]

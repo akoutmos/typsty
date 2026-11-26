@@ -1,0 +1,46 @@
+# Typsty's native code:
+#
+# - typsty_core: compiling and exporting documents with Typst, shared by the other two
+# - typsty_nif: the NIF that renders inside the BEAM (the default)
+# - typsty_worker: the program `Typsty.Pool` runs renders in, as separate OS processes
+[workspace]
+members = ["typsty_core", "typsty_nif", "typsty_worker"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Typst 0.15 needs Rust 1.92
+rust-version = "1.92"
+publish = false
+
+[workspace.dependencies]
+typsty_core = { path = "typsty_core" }
+comemo = "0.5"
+typst = "0.15.1"
+typst-kit = { version = "0.15.1", default-features = false, features = ["embedded-fonts", "scan-fonts"] }
+typst-layout = "0.15.1"
+typst-pdf = "0.15.1"
+typst-render = "0.15.1"
+typst-svg = "0.15.1"
+typstyle-core = "0.15.3"
+time = "0.3"
+rayon = "1"
+imagesize = "0.14"
+flate2 = "1"
+memchr = "2"
+roxmltree = "0.21"
+data-url = "0.3"
+libc = "0.2"
+# The libraries Typst parses bibliographies and SVGs with, which checks.rs parses them with too
+biblatex = "0.12"
+usvg = { version = "0.47", default-features = false }
+
+[profile.release]
+# Panics must unwind, so that they become errors instead of aborting the VM
+panic = "unwind"
+# Smaller and faster binaries, at the cost of longer release builds
+lto = true
+codegen-units = 1
+# Panics are reported with their message and location, so the binaries don't need symbols
+strip = true

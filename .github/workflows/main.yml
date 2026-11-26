@@ -1,8 +1,6 @@
 name: Typsty CI
 
 env:
-  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  SHELL: sh
   # Build the NIF from source, since a commit's precompiled NIFs don't exist yet
   TYPSTY_BUILD: "1"
   # Link-time optimization is for the released NIFs. Tests don't need it, and it's slow
@@ -15,6 +13,15 @@ on:
   pull_request:
     branches: [master]
 
+permissions:
+  contents: read
+
+# A newer push to a pull request supersedes its running checks. Every master commit gets a
+# complete run
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   rust_checks:
     name: Rust checks
@@ -24,19 +31,25 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          # The version in .tool-versions, so that new lints don't fail the build unannounced
+          toolchain: "1.92.0"
           components: rustfmt, clippy
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: native/typsty_nif
+          workspaces: native
       - name: Rustfmt
-        working-directory: native/typsty_nif
-        run: cargo fmt --check
+        working-directory: native
+        run: cargo fmt --all --check
       - name: Clippy
-        working-directory: native/typsty_nif
-        run: cargo clippy -- -D warnings
+        working-directory: native
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # The NIF crate can only be loaded by the VM, so its code is tested through ExUnit
+      - name: Rust tests
+        working-directory: native
+        run: cargo test -p typsty_core -p typsty_worker
 
   static_analysis:
     name: Static Analysis
@@ -52,11 +65,13 @@ jobs:
           elixir-version: "1.19.4"
           otp-version: "28.2"
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: native/typsty_nif
+          workspaces: native
           shared-key: nif
       - name: Restore dependencies cache
         uses: actions/cache@v4
@@ -90,6 +105,7 @@ jobs:
   unit_test:
     name: Tests (Elixir ${{ matrix.version.elixir }}, OTP ${{ matrix.version.otp }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
 
     strategy:
       fail-fast: false
@@ -103,6 +119,18 @@ jobs:
           - otp: "29"
             elixir: "1.20"
             coverage: true
+        # The pool's worker is a separate program, whose process handling differs by OS
+        include:
+          - os: macos-latest
+            version:
+              otp: "28"
+              elixir: "1.19"
+          # Windows hasn't been tested as much: its failures are reported, but don't fail CI
+          - os: windows-latest
+            experimental: true
+            version:
+              otp: "28"
+              elixir: "1.19"
 
     steps:
       - name: Checkout code
@@ -113,12 +141,14 @@ jobs:
           elixir-version: ${{ matrix.version.elixir }}
           otp-version: ${{ matrix.version.otp }}
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
       # The NIF only depends on the NIF version (2.15), so every job can share its build
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: native/typsty_nif
+          workspaces: native
           shared-key: nif
       - name: Restore dependencies cache
         uses: actions/cache@v4
@@ -138,4 +168,6 @@ jobs:
         env:
           MIX_ENV: test
           SHELL: /bin/bash
+          # Only this step needs the token, to report coverage
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: mix coveralls.github --warnings-as-errors

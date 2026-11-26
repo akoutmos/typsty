@@ -1,7 +1,7 @@
 //! Exports compiled documents to PDF, PNG and SVG.
 
 use typst::foundations::Smart;
-use typst::layout::{Frame, FrameItem, Ratio, Transform};
+use typst::layout::{Frame, FrameItem, FrameKind, Ratio, Size, Transform};
 use typst::text::TextItem;
 use typst::utils::Scalar;
 use typst::visualize::{Paint, RelativeTo, Tiling};
@@ -9,13 +9,20 @@ use typst_layout::{Page, PagedDocument};
 use typst_pdf::{PdfOptions, PdfStandard, PdfStandards, Timestamp};
 
 use crate::diagnostics::{self, Diagnostic};
+use crate::links;
 use crate::world::TypstyWorld;
 
 /// The most pixels rasterizing a page may take, for the page itself and for the images,
-/// gradients and tilings on it: 2^28 pixels, which is 1 GiB. Typst sizes these by the
-/// content, so content placed far outside the page, or an extreme `:ppi`, could otherwise
-/// ask for more memory than exists, and a failed allocation aborts the VM.
+/// gradients and tilings on it: 2^28 pixels, which is 1 GiB of textures. Typst sizes these by
+/// the content, so content placed far outside the page, or an extreme `:ppi`, could otherwise
+/// ask for more memory than exists, and a failed allocation aborts the VM. (Resizing images
+/// and encoding the page take memory on top of this, a few times as much at worst.)
 pub const MAX_PNG_PIXELS: f64 = (1u64 << 28) as f64;
+
+/// How far from the page, in pixels, content may be placed or scaled for PNG export:
+/// drawing content far outside the page takes typst-render minutes, which can't be
+/// cancelled.
+const MAX_PNG_REACH: f64 = 1e8;
 
 pub enum Output {
     Pdf(Vec<u8>),
@@ -24,17 +31,12 @@ pub enum Output {
 
 pub fn pdf(
     document: &PagedDocument,
-    standards: &[String],
+    standards: PdfStandards,
     world: &TypstyWorld,
+    warnings: &mut Vec<Diagnostic>,
 ) -> Result<Output, Vec<Diagnostic>> {
-    let standards = standards
-        .iter()
-        .map(|standard| pdf_standard(standard))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|message| vec![Diagnostic::error(message)])?;
-
-    let standards = PdfStandards::new(&standards)
-        .map_err(|error| vec![Diagnostic::error(error.message().to_string())])?;
+    let changed = links::for_pdf(document, warnings);
+    let document = changed.as_ref().unwrap_or(document);
 
     let options = PdfOptions {
         standards,
@@ -89,7 +91,11 @@ pub fn png(
     Ok(Output::Pages(pages))
 }
 
-pub fn svg(document: &PagedDocument, world: &TypstyWorld) -> Output {
+pub fn svg(
+    document: &PagedDocument,
+    world: &TypstyWorld,
+    warnings: &mut Vec<Diagnostic>,
+) -> Output {
     let options = typst_svg::SvgOptions::default();
 
     Output::Pages(
@@ -98,10 +104,22 @@ pub fn svg(document: &PagedDocument, world: &TypstyWorld) -> Output {
             .iter()
             .map(|page| {
                 world.check_cancelled();
-                typst_svg::svg(page, &options).into_bytes()
+                let page = links::for_svg(page, warnings);
+                typst_svg::svg(&page, &options).into_bytes()
             })
             .collect(),
     )
+}
+
+/// The PDF standards named in the `:pdf_standards` option, checked for conflicts.
+pub fn pdf_standards(names: &[String]) -> Result<PdfStandards, String> {
+    let standards = names
+        .iter()
+        .map(|name| pdf_standard(name))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    PdfStandards::new(&standards)
+        .map_err(|error| format!("invalid :pdf_standards option: {}", error.message()))
 }
 
 fn pdf_standard(name: &str) -> Result<PdfStandard, String> {
@@ -123,7 +141,11 @@ fn pdf_standard(name: &str) -> Result<PdfStandard, String> {
         "a-4f" => PdfStandard::A_4f,
         "a-4e" => PdfStandard::A_4e,
         "ua-1" => PdfStandard::Ua_1,
-        other => return Err(format!("unknown PDF standard: {other}")),
+        other => {
+            return Err(format!(
+                "unknown PDF standard in the :pdf_standards option: {other:?}. The standards are \"1.4\" to \"1.7\", \"2.0\", \"a-1b\", \"a-1a\", \"a-2b\", \"a-2u\", \"a-2a\", \"a-3b\", \"a-3u\", \"a-3a\", \"a-4\", \"a-4f\", \"a-4e\" and \"ua-1\""
+            ))
+        }
     })
 }
 
@@ -141,8 +163,14 @@ fn check_raster_size(page: &Page, pixel_per_pt: f64) -> Result<(), String> {
         (size.y.to_pt() * pixel_per_pt).round().max(1.0),
     )?;
 
+    // The page's own fill is painted like a shape the size of the page
+    if let Some(fill) = page.fill_or_white() {
+        let page_size = (size.x.to_pt(), size.y.to_pt());
+        check_paint(&fill, page_size, false, size, pixel_per_pt, &mut budget)?;
+    }
+
     let scale = Transform::scale(Ratio::new(pixel_per_pt), Ratio::new(pixel_per_pt));
-    walk(&page.frame, scale, pixel_per_pt, &mut budget)
+    walk(&page.frame, scale, size, pixel_per_pt, &mut budget)
 }
 
 #[derive(Default)]
@@ -165,18 +193,47 @@ impl Budget {
     }
 }
 
+/// Adds up the frame's textures. `container` is the size of the nearest hard frame it's in
+/// (the page, a block or a box), which is what gradients relative to their parent are sized
+/// by.
 fn walk(
     frame: &Frame,
     ts: Transform,
+    container: Size,
     pixel_per_pt: f64,
     budget: &mut Budget,
 ) -> Result<(), String> {
-    for (_position, item) in frame.items() {
+    for (position, item) in frame.items() {
+        let ts = ts.pre_concat(Transform::translate(position.x, position.y));
+
+        let reach = [
+            ts.sx.get(),
+            ts.ky.get(),
+            ts.kx.get(),
+            ts.sy.get(),
+            ts.tx.to_pt(),
+            ts.ty.to_pt(),
+        ];
+        if reach
+            .iter()
+            .any(|value| !value.is_finite() || value.abs() > MAX_PNG_REACH)
+        {
+            return Err(format!(
+                "content is placed or scaled more than {MAX_PNG_REACH:e} pixels away from the page, which can't be drawn"
+            ));
+        }
+
         match item {
             FrameItem::Group(group) => {
+                let container = match group.frame.kind() {
+                    FrameKind::Hard => group.frame.size(),
+                    FrameKind::Soft => container,
+                };
+
                 walk(
                     &group.frame,
                     ts.pre_concat(group.transform),
+                    container,
                     pixel_per_pt,
                     budget,
                 )?;
@@ -203,10 +260,10 @@ fn walk(
 
                 for paint in paints {
                     let size = (bbox.x.to_pt(), bbox.y.to_pt());
-                    check_paint(paint, size, false, frame, pixel_per_pt, budget)?;
+                    check_paint(paint, size, false, container, pixel_per_pt, budget)?;
                 }
             }
-            FrameItem::Text(text) => check_text(text, frame, ts, pixel_per_pt, budget)?,
+            FrameItem::Text(text) => check_text(text, container, ts, pixel_per_pt, budget)?,
             FrameItem::Link(..) | FrameItem::Tag(..) => {}
         }
     }
@@ -216,7 +273,7 @@ fn walk(
 
 fn check_text(
     text: &TextItem,
-    frame: &Frame,
+    container: Size,
     ts: Transform,
     pixel_per_pt: f64,
     budget: &mut Budget,
@@ -238,19 +295,19 @@ fn check_text(
     let paints = std::iter::once(&text.fill).chain(text.stroke.iter().map(|stroke| &stroke.paint));
 
     for paint in paints {
-        check_paint(paint, size, true, frame, pixel_per_pt, budget)?;
+        check_paint(paint, size, true, container, pixel_per_pt, budget)?;
     }
 
     Ok(())
 }
 
-/// Gradients are sampled into a texture the size of the item (or of the frame it's in, for
-/// a gradient relative to its parent), and tilings into a texture the size of one tile.
+/// Gradients are sampled into a texture the size of the item (or of the hard frame it's in,
+/// for a gradient relative to its parent), and tilings into a texture the size of one tile.
 fn check_paint(
     paint: &Paint,
     (width, height): (f64, f64),
     on_text: bool,
-    frame: &Frame,
+    container: Size,
     pixel_per_pt: f64,
     budget: &mut Budget,
 ) -> Result<(), String> {
@@ -259,7 +316,7 @@ fn check_paint(
         Paint::Gradient(gradient) => {
             let (width, height) = match gradient.unwrap_relative(on_text) {
                 RelativeTo::Self_ => (width, height),
-                RelativeTo::Parent => (frame.width().to_pt(), frame.height().to_pt()),
+                RelativeTo::Parent => (container.x.to_pt(), container.y.to_pt()),
             };
 
             budget.add(
@@ -282,5 +339,11 @@ fn check_tiling(tiling: &Tiling, pixel_per_pt: f64, budget: &mut Budget) -> Resu
 
     // The tile's content is rendered at the page's resolution
     let scale = Transform::scale(Ratio::new(pixel_per_pt), Ratio::new(pixel_per_pt));
-    walk(tiling.frame(), scale, pixel_per_pt, budget)
+    walk(
+        tiling.frame(),
+        scale,
+        tiling.frame().size(),
+        pixel_per_pt,
+        budget,
+    )
 }

@@ -1,8 +1,10 @@
 name: Build precompiled NIFs
 
-# Builds the NIF for every target when a version is tagged (such as 0.1.0), and attaches the
-# builds to the tag's GitHub release, where RustlerPrecompiled downloads them from. See
-# RELEASING.md for the whole release process.
+# Builds the NIF and the worker for Typsty.Pool for every target when a version is tagged
+# (such as 0.1.0), and attaches them to the tag's GitHub release, where RustlerPrecompiled
+# downloads them from. Each target's tarball has both, so that RustlerPrecompiled, which
+# extracts the whole tarball, puts the worker next to the NIF. See RELEASING.md for the
+# whole release process.
 
 on:
   push:
@@ -26,9 +28,11 @@ jobs:
         job:
           - { target: aarch64-apple-darwin, os: macos-15 }
           - { target: x86_64-apple-darwin, os: macos-15 }
+          # cross links against an older glibc than the runner's, so that the NIF and the
+          # worker also run on older distributions (such as Debian 11 and RHEL 8)
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04, use-cross: true }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04, use-cross: true }
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, use-cross: true }
           - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04, use-cross: true }
           - { target: x86_64-pc-windows-gnu, os: windows-2022 }
           - { target: x86_64-pc-windows-msvc, os: windows-2022 }
@@ -51,30 +55,54 @@ jobs:
           fi
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          # The version in .tool-versions, which Typst 0.15 needs at least
+          toolchain: "1.92.0"
           targets: ${{ matrix.job.target }}
 
-      - name: Build the NIF
-        id: build-crate
-        uses: philss/rustler-precompiled-action@v1.1.5
+      - name: Install cross
+        if: ${{ matrix.job.use-cross }}
+        uses: taiki-e/install-action@v2
         with:
-          project-name: typsty_nif
-          project-version: ${{ env.PROJECT_VERSION }}
-          target: ${{ matrix.job.target }}
-          nif-version: ${{ matrix.nif }}
-          use-cross: ${{ matrix.job.use-cross }}
-          project-dir: "native/typsty_nif"
+          tool: cross
 
+      - name: Build the NIF and the worker
+        id: build
+        shell: bash
+        run: |
+          tarball=$(.github/scripts/build-native.sh "${{ matrix.job.target }}" "${{ matrix.nif }}" "$PROJECT_VERSION" "${{ matrix.job.use-cross || false }}" | tail -n 1)
+          echo "file-path=$tarball" >> "$GITHUB_OUTPUT"
+          echo "file-name=$(basename "$tarball")" >> "$GITHUB_OUTPUT"
+
+      # The worker for targets this runner can run: it must start, and on Linux, the glibc
+      # version it needs is shown
+      - name: Smoke test the worker
+        if: ${{ contains(fromJSON('["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu"]'), matrix.job.target) }}
+        shell: bash
+        run: |
+          worker=$(ls dist/${{ matrix.job.target }}/typsty_worker*)
+          "$worker" --check
+          if [[ "${{ matrix.job.target }}" == *-linux-gnu ]]; then
+            echo "Newest glibc symbol versions:"
+            objdump -T "$worker" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 3
+          fi
+
+      # Both steps fail when the tarball is missing, rather than succeed without it
       - name: Upload the build
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.build-crate.outputs.file-name }}
-          path: ${{ steps.build-crate.outputs.file-path }}
+          name: ${{ steps.build.outputs.file-name }}
+          path: ${{ steps.build.outputs.file-path }}
+          if-no-files-found: error
+          # A re-run of a failed job replaces what it uploaded
+          overwrite: true
 
       - name: Publish the build to the GitHub release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
+          fail_on_unmatched_files: true
+          generate_release_notes: true
           files: |
-            ${{ steps.build-crate.outputs.file-path }}
+            ${{ steps.build.outputs.file-path }}

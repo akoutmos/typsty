@@ -1,41 +1,40 @@
-//! Turns Typst's errors and warnings into `Typsty.Diagnostic` structs.
+//! Typst's errors and warnings, with their locations, for `Typsty.Diagnostic` structs.
 
-use rustler::{NifMap, NifStruct, NifUnitEnum};
 use typst::diag::SourceDiagnostic;
-use typst::syntax::{DiagSpan, Source, SyntaxDiagnostic, VirtualRoot};
+use typst::syntax::ast::{self, Expr};
+use typst::syntax::{DiagSpan, LinkedNode, Side, Source, SyntaxDiagnostic, VirtualRoot};
 use typst::WorldExt;
 
 use crate::world::TypstyWorld;
 
-// Diagnostics are built on the thread that runs Typst and encoded on the NIF's thread, so
-// they hold plain data rather than terms or atoms.
-#[derive(NifUnitEnum, Clone, Copy)]
+// Diagnostics are built on the thread that runs Typst, and encoded as terms by the NIF or
+// the worker, so they're plain data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
     Error,
     Warning,
 }
 
-#[derive(NifStruct)]
-#[module = "Typsty.Diagnostic"]
+#[derive(Clone, Debug)]
 pub struct Diagnostic {
-    severity: Severity,
-    message: String,
-    hints: Vec<String>,
-    /// `nil` for the template itself, otherwise the path of the file in the project, or
+    pub severity: Severity,
+    pub message: String,
+    pub hints: Vec<String>,
+    /// `None` for the template itself, otherwise the path of the file in the project, or
     /// `@namespace/name:version/path` for a file in a package.
-    file: Option<String>,
-    /// 1-based, or `nil` when the problem has no location.
-    line: Option<usize>,
-    column: Option<usize>,
-    trace: Vec<TracePoint>,
+    pub file: Option<String>,
+    /// 1-based, or `None` when the problem has no location.
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub trace: Vec<TracePoint>,
 }
 
-#[derive(NifMap)]
+#[derive(Clone, Debug)]
 pub struct TracePoint {
-    message: String,
-    file: Option<String>,
-    line: Option<usize>,
-    column: Option<usize>,
+    pub message: String,
+    pub file: Option<String>,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
 }
 
 impl Diagnostic {
@@ -49,6 +48,14 @@ impl Diagnostic {
             line: None,
             column: None,
             trace: Vec::new(),
+        }
+    }
+
+    /// A warning without a location, for problems that aren't in a Typst file.
+    pub fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Warning,
+            ..Self::error(message)
         }
     }
 
@@ -73,14 +80,17 @@ impl Diagnostic {
             })
             .collect();
 
+        let mut hints: Vec<String> = diagnostic
+            .hints
+            .iter()
+            .map(|hint| hint.v.to_string())
+            .collect();
+        hints.extend(missing_assign_hint(diagnostic, world));
+
         Self {
             severity,
             message: diagnostic.message.to_string(),
-            hints: diagnostic
-                .hints
-                .iter()
-                .map(|hint| hint.v.to_string())
-                .collect(),
+            hints,
             file,
             line,
             column,
@@ -127,6 +137,53 @@ pub fn from_sources<'a>(
         .collect()
 }
 
+/// A hint for an assign the template uses but wasn't given. Typst reports it like a key
+/// missing from any dictionary, so the hint is only added when the template reads the key
+/// from `assigns`: `assigns.customer`, `assigns.at("customer")`, or
+/// `let (customer,) = assigns`.
+fn missing_assign_hint(diagnostic: &SourceDiagnostic, world: &TypstyWorld) -> Option<String> {
+    // The key is quoted, as a Typst string
+    let key = diagnostic
+        .message
+        .strip_prefix("dictionary does not contain key ")?;
+    let key = key
+        .strip_suffix(" and no default value was specified")
+        .unwrap_or(key);
+
+    if diagnostic.span.id()? != world.main_source().id() {
+        return None;
+    }
+
+    let range = world.range(diagnostic.span)?;
+    let root = LinkedNode::new(world.main_source().root());
+    let mut node = root.leaf_at(range.start, Side::After)?;
+
+    // The nearest expression that reads from a dictionary decides
+    let reads_assigns = loop {
+        if let Some(access) = node.cast::<ast::FieldAccess>() {
+            break is_assigns(access.target());
+        }
+
+        if let Some(call) = node.cast::<ast::FuncCall>() {
+            break matches!(call.callee(), Expr::FieldAccess(access) if is_assigns(access.target()));
+        }
+
+        if let Some(binding) = node.cast::<ast::LetBinding>() {
+            break binding.init().is_some_and(is_assigns);
+        }
+
+        node = node.parent()?.clone();
+    };
+
+    reads_assigns.then(|| {
+        format!("there's no {key} in the assigns. Pass it from Elixir, or read it with `assigns.at({key}, default: none)` if it's optional")
+    })
+}
+
+fn is_assigns(expr: Expr) -> bool {
+    matches!(expr, Expr::Ident(ident) if ident.as_str() == "assigns")
+}
+
 fn range(span: DiagSpan, source: &Source) -> Option<std::ops::Range<usize>> {
     match span.get() {
         typst::syntax::DiagSpanKind::Number { num, sub_range, .. } => source.range(num, sub_range),
@@ -136,7 +193,7 @@ fn range(span: DiagSpan, source: &Source) -> Option<std::ops::Range<usize>> {
 }
 
 /// The file, line and column (both 1-based) of a span. Lines in the template don't count
-/// the preamble that binds the variables.
+/// the preamble that binds the assigns.
 fn locate(span: DiagSpan, world: &TypstyWorld) -> (Option<String>, Option<usize>, Option<usize>) {
     let Some(id) = span.id() else {
         return (None, None, None);
@@ -154,13 +211,13 @@ fn locate(span: DiagSpan, world: &TypstyWorld) -> (Option<String>, Option<usize>
     };
 
     let position = world.range(span).and_then(|range| {
-        let source = if main {
-            world.main_source().clone()
+        let lines = if main {
+            world.main_source().lines().clone()
         } else {
-            typst::World::source(world, id).ok()?
+            world.lines(id)?
         };
 
-        source.lines().byte_to_line_column(range.start)
+        lines.byte_to_line_column(range.start)
     });
 
     match position {

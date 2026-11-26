@@ -6,10 +6,10 @@ defmodule Typsty.Test.Greeting do
     assigns = Map.put(assigns, :shout, String.upcase(assigns.name))
 
     ~TYPST"""
-    = Hello #name
+    = Hello #assigns.name
 
-    #assert.eq(shout, upper(name))
-    #for item in items [
+    #assert.eq(assigns.shout, upper(assigns.name))
+    #for item in assigns.items [
       - #item
     ]
     """

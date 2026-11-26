@@ -2,6 +2,8 @@ defmodule Typsty.Diagnostic do
   @moduledoc """
   An error or warning reported by Typst.
 
+  - `:severity` - `:error` or `:warning`.
+  - `:message` - what the problem is.
   - `:file` - the file the problem is in. For a problem in the template itself, it's the
     template's file (the module's `.ex` file for the `~TYPST` sigil, or its `.typ` file), or
     `nil` for a template rendered from a string. For other files, it's their path in the
@@ -46,8 +48,16 @@ defmodule Typsty.Diagnostic do
     }
 
     # The template's first line starts at its column (after `~TYPST"`, for a sigil on one
-    # line), and the others at its indentation (for a heredoc)
-    column = if line == 1, do: column + template.column - 1, else: column + template.indentation
+    # line), and the others at its indentation (for a heredoc). They're unknown when the
+    # formatter reports an error
+    column =
+      cond do
+        is_nil(column) -> nil
+        line == 1 and is_integer(template.column) -> column + template.column - 1
+        line > 1 and is_integer(template.indentation) -> column + template.indentation
+        true -> nil
+      end
+
     diagnostic = %{diagnostic | column: column}
 
     locate_trace(diagnostic, template)
