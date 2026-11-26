@@ -50,11 +50,6 @@ cp "$built/$lib" "$staging/$name"
 cp "$built/$worker" "$staging/$worker"
 chmod 755 "$staging/$worker"
 
-# The binaries' licenses travel with them (see .github/scripts/third_party_notices.exs)
-notices="typsty-LICENSE.txt typsty-THIRD_PARTY_NOTICES.txt"
-cp "$root/LICENSE" "$staging/typsty-LICENSE.txt"
-cp "$root/THIRD_PARTY_NOTICES.txt" "$staging/typsty-THIRD_PARTY_NOTICES.txt"
-
 # The plain ustar format leaves out extended attributes and macOS metadata, which
 # COPYFILE_DISABLE alone doesn't
 tarball="dist/$name.tar.gz"
