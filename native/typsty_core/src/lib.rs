@@ -4,6 +4,7 @@
 //! Everything Typst does runs on a thread of its own, with a large stack (see `isolate`).
 
 pub mod checks;
+pub mod components;
 pub mod diagnostics;
 pub mod export;
 pub mod fonts;

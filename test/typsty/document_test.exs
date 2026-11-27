@@ -4,6 +4,8 @@ defmodule Typsty.DocumentTest do
   alias Typsty.{RenderError, SyntaxError, Template}
   alias Typsty.Test.{Greeting, Invoice, Receipt}
 
+  import Typsty.Test.Helpers, only: [compile!: 3]
+
   describe "a module with render/1" do
     test "renders the ~TYPST sigil with the assigns render/1 computed" do
       assert {:ok, "%PDF-" <> _} = Greeting.to_pdf(%{name: "World", items: ["one", "two"]})
@@ -173,6 +175,87 @@ defmodule Typsty.DocumentTest do
     end
   end
 
+  describe "compile-time checks of templates and options" do
+    @describetag :tmp_dir
+
+    test "compile a module's .typ template, which renders", %{tmp_dir: dir} do
+      File.write!(Path.join(dir, "letter.typ"), "= Dear #assigns.name\n#lorem(10)")
+
+      [{module, _binary}] =
+        compile!(dir, "letter.ex", "defmodule Typsty.Test.Letter do\n  use Typsty\nend\n")
+
+      assert %Template{source: "= Dear #assigns.name" <> _, file: file, line: 1} = module.render(%{name: "Ada"})
+      assert Path.basename(file) == "letter.typ"
+      assert {:ok, "%PDF-" <> _} = module.to_pdf(%{name: "Ada"})
+      assert {:error, %RenderError{diagnostics: [%{line: 1}]}} = module.to_pdf(%{})
+    end
+
+    test "refuse a template file that isn't UTF-8", %{tmp_dir: dir} do
+      File.write!(Path.join(dir, "latin1.typ"), <<"Caf", 0xE9>>)
+
+      assert_raise CompileError, ~r/the template .*latin1.typ isn't valid UTF-8. Save it as UTF-8/, fn ->
+        compile!(dir, "latin1.ex", "defmodule Typsty.Test.Latin1 do\n  use Typsty\nend\n")
+      end
+    end
+
+    test "refuse a :template option that isn't a path", %{tmp_dir: dir} do
+      assert_raise ArgumentError, "the :template option must be a path, got: :invoice", fn ->
+        compile!(
+          dir,
+          "atom_template.ex",
+          "defmodule Typsty.Test.AtomTemplate do\n  use Typsty, template: :invoice\nend\n"
+        )
+      end
+    end
+  end
+
+  describe "without the NIF, when cross-compiling" do
+    # The NIF is built for another machine then, so templates compile without being checked,
+    # with one warning
+    setup do
+      key = {Typsty, :warned_unavailable}
+      warned = :persistent_term.get(key, false)
+      :persistent_term.put(key, false)
+      on_exit(fn -> :persistent_term.put(key, warned) end)
+    end
+
+    test "templates compile unchecked, with one warning" do
+      unloaded = fn _source ->
+        raise UndefinedFunctionError, module: Typsty.Native, function: :syntax_errors, arity: 1
+      end
+
+      not_loaded = fn _source -> :erlang.nif_error(:nif_not_loaded) end
+
+      warnings =
+        ExUnit.CaptureIO.capture_io(:stderr, fn ->
+          assert Typsty.__native_check__(unloaded, "#let x = (") == :unavailable
+          assert Typsty.__native_check__(not_loaded, "#let x = (") == :unavailable
+        end)
+
+      assert warnings =~
+               "Typsty can't check templates and components, since its NIF couldn't be loaded (cross-compiling?)"
+
+      assert length(String.split(warnings, "can't check templates")) == 2
+    end
+
+    test "other errors aren't hidden" do
+      other_module = fn _source -> raise UndefinedFunctionError, module: Typsty.Elsewhere, function: :f, arity: 1 end
+      other_error = fn _source -> :erlang.error(:badarg) end
+
+      assert_raise UndefinedFunctionError, ~r/Typsty.Elsewhere.f\/1/, fn ->
+        Typsty.__native_check__(other_module, "")
+      end
+
+      assert_raise ArgumentError, fn -> Typsty.__native_check__(other_error, "") end
+      assert Typsty.__native_check__(&Typsty.Native.syntax_errors/1, "= Fine") == []
+    end
+  end
+
+  test "SyntaxError's message without diagnostics says what kind of problem it is" do
+    assert Exception.message(%SyntaxError{}) == "invalid Typst syntax"
+    assert Exception.message(%SyntaxError{kind: :component}) == "invalid component"
+  end
+
   describe "render/1 returning something else" do
     test "raises ArgumentError" do
       defmodule NotATemplate do
@@ -184,11 +267,5 @@ defmodule Typsty.DocumentTest do
         NotATemplate.to_pdf(%{})
       end
     end
-  end
-
-  defp compile!(dir, name, source) do
-    file = Path.join(dir, name)
-    File.write!(file, source)
-    Code.compile_file(file)
   end
 end

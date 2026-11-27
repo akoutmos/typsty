@@ -57,6 +57,18 @@ defmodule Typsty.FormatterTest do
     assert format_elixir(code) == String.trim_trailing(code)
   end
 
+  test "formats a heredoc sigil with nothing in it to nothing" do
+    code = ~S'''
+    def render(assigns) do
+      ~TYPST"""
+
+      """
+    end
+    '''
+
+    assert format_elixir(code) == ~s|def render(assigns) do\n  ~TYPST"""\n  """\nend|
+  end
+
   test "formats single-line sigils" do
     assert format_elixir(~S|~TYPST"#let   x=1"|) == ~S|~TYPST"#let x = 1"|
   end

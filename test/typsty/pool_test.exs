@@ -55,6 +55,15 @@ defmodule Typsty.PoolTest do
     pool |> :sys.get_state() |> Map.fetch!(:resources) |> :queue.to_list() |> Enum.map(&elem(&1, 0))
   end
 
+  # Stops an OS process at once. On Windows, kill would look for the pid among the shell's own
+  # processes, and not find it
+  defp kill_process(os_pid) do
+    case :os.type() do
+      {:win32, _} -> System.cmd("taskkill", ["/F", "/PID", Integer.to_string(os_pid)], stderr_to_stdout: true)
+      {:unix, _} -> System.cmd("kill", ["-9", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    end
+  end
+
   # Waits until a worker is checked out: NimblePool keeps its checked out workers with the
   # requests it served
   defp wait_until_busy(pool, tries \\ 500) do
@@ -292,7 +301,7 @@ defmodule Typsty.PoolTest do
 
       # The idle workers' OS processes, killed the way the system's OOM killer would
       for %{port: port} <- idle_workers(pool), {:os_pid, os_pid} = Port.info(port, :os_pid) do
-        System.cmd("kill", ["-9", Integer.to_string(os_pid)])
+        assert {_output, 0} = kill_process(os_pid)
       end
 
       assert {:ok, _pdf} = Typsty.to_pdf("still works", %{}, pool: pool)
@@ -327,6 +336,11 @@ defmodule Typsty.PoolTest do
                    Pool.start_link(memory_limit: -1)
                  end
 
+    assert_raise ArgumentError,
+                 "invalid value for :memory_limit option: expected a number of bytes of at most 4611686018427387904, " <>
+                   "or nil, got: 4611686018427387905",
+                 fn -> Pool.start_link(memory_limit: Integer.pow(2, 62) + 1) end
+
     assert_raise ArgumentError, ~r/^unknown options \[:workers\], valid options are: \[:name, :size/, fn ->
       Pool.start_link(workers: 2)
     end
@@ -338,6 +352,19 @@ defmodule Typsty.PoolTest do
     assert_raise ArgumentError, ~r/invalid value for :pool option: expected the name or pid of a Typsty.Pool/, fn ->
       Typsty.to_pdf("x", %{}, pool: "pool")
     end
+  end
+
+  test "a pool can be named globally or through a registry, and rendered with by that name" do
+    global = {:global, {__MODULE__, System.unique_integer([:positive])}}
+    start_supervised!({Pool, name: global, size: 1})
+    assert {:ok, "%PDF-" <> _} = Typsty.to_pdf("Hello", %{}, pool: global)
+
+    registry = Module.concat(__MODULE__, "Registry#{System.unique_integer([:positive])}")
+    start_supervised!({Registry, keys: :unique, name: registry})
+    via = {:via, Registry, {registry, :pool}}
+    start_supervised!({Pool, name: via, size: 1})
+    assert {:ok, ["<svg" <> _]} = Typsty.to_svg("Hello", %{}, pool: via)
+    assert [{_pid, nil}] = Registry.lookup(registry, :pool)
   end
 
   test "a pool whose workers can't start fails to start" do

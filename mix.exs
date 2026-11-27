@@ -80,7 +80,7 @@ defmodule Typsty.MixProject do
       assets: %{"images" => "images"},
       extras: ["README.md", "CHANGELOG.md"],
       groups_for_modules: [
-        Documents: [Typsty, Typsty.Template, Typsty.Pool],
+        Documents: [Typsty, Typsty.Component, Typsty.Template, Typsty.Pool],
         Data: [Typsty.Encoder],
         Errors: [Typsty.RenderError, Typsty.SyntaxError, Typsty.Diagnostic],
         Tooling: [Typsty.Formatter, Typsty.Telemetry, Mix.Tasks.Typsty.Packages.Get]

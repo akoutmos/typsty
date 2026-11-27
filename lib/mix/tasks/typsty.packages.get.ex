@@ -55,7 +55,9 @@ defmodule Mix.Tasks.Typsty.Packages.Get do
   - `--force` - download packages again, even if they're already in the directory.
 
   Downloads go through the proxy in `HTTPS_PROXY` (or `HTTP_PROXY`) when one is set,
-  except for the hosts in `NO_PROXY`.
+  except for the hosts in `NO_PROXY`. The proxy must be an HTTP one (`http://`, which can
+  still forward HTTPS): the task can't talk to proxies over HTTPS or SOCKS, and refuses
+  them rather than send them a password in the clear or go around them.
   """
 
   use Mix.Task

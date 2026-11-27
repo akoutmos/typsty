@@ -190,6 +190,22 @@ fn collect_syntax_errors(template: &str) -> Vec<Diagnostic> {
         .collect()
 }
 
+/// Checks a component's source (see `components`). Returns its problems, which is empty for
+/// a valid component.
+pub fn component_errors(source: String) -> Vec<Diagnostic> {
+    isolate::run(move || crate::components::errors(&Source::detached(world::strip_bom(&source))))
+        .unwrap_or_else(|interrupted| vec![Diagnostic::error(interrupted.message())])
+}
+
+/// The paths a component reads files from, as strings (see `components::file_paths`), with
+/// their lines and columns.
+pub fn file_paths(source: String) -> Vec<(String, usize, usize)> {
+    isolate::run(move || {
+        crate::components::file_paths(&Source::detached(world::strip_bom(&source)))
+    })
+    .unwrap_or_default()
+}
+
 /// Formats a template with typstyle. A template with syntax errors can't be formatted, so it
 /// returns them instead.
 pub fn format(

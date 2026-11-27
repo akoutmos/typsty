@@ -14,9 +14,12 @@ defmodule Typsty.Packages do
   @spec_format ~r/\A@([a-z0-9][a-z0-9_-]*)\/([A-Za-z0-9][A-Za-z0-9_-]*)(?::(\d+\.\d+\.\d+))?\z/
   @version_format ~r/\A\d+\.\d+\.\d+\z/
 
-  # The HTTP client's profile, so that the task's proxy settings don't change the VM's
-  # default profile
+  # The HTTP client's profiles, so that the task's proxy settings don't change the VM's
+  # default profile. Downloads that go straight to the server use one that's never given a
+  # proxy, and downloads through a proxy one whose proxy is set for each: httpc can't take a
+  # proxy off a profile, and a request (and the redirects it follows) uses its profile's
   @profile :typsty_packages
+  @proxied_profile :typsty_packages_proxied
 
   # Temporary directories older than this are left over from runs that were interrupted
   @stale_after_seconds 600
@@ -43,6 +46,8 @@ defmodule Typsty.Packages do
   # - :http_get - a function that gets a URL, returning {:ok, body}, {:error, :not_found} or
   #   {:error, reason}
   # - :typst_version - the Typst version packages must work with
+  # - :registry - the URL packages are downloaded from (Typst Universe's), for tests
+  # - :max_package_size - the most an archive may expand to (256 MiB), for tests
   @spec get([String.t()], Path.t(), keyword()) :: [result()]
   def get(specs, dir, opts \\ []) do
     context = %{
@@ -51,7 +56,9 @@ defmodule Typsty.Packages do
       report: Keyword.get(opts, :report, fn _message -> :ok end),
       warn: Keyword.get(opts, :warn, fn _message -> :ok end),
       http_get: Keyword.get(opts, :http_get, &http_get/1),
-      typst_version: Keyword.get_lazy(opts, :typst_version, &Typsty.typst_version/0)
+      typst_version: Keyword.get_lazy(opts, :typst_version, &Typsty.typst_version/0),
+      registry: Keyword.get(opts, :registry, @registry),
+      max_package_size: Keyword.get(opts, :max_package_size, @max_package_size)
     }
 
     specs
@@ -122,7 +129,7 @@ defmodule Typsty.Packages do
   end
 
   defp index!(context) do
-    url = "#{@registry}/preview/index.json"
+    url = "#{context.registry}/preview/index.json"
 
     case context.http_get.(url) do
       {:ok, body} ->
@@ -181,7 +188,7 @@ defmodule Typsty.Packages do
   defp package_dir(dir, {namespace, name, version}), do: Path.join([dir, namespace, name, version])
 
   defp download({namespace, name, version} = package, imported_by, dir, context) do
-    url = "#{@registry}/#{namespace}/#{name}-#{version}.tar.gz"
+    url = "#{context.registry}/#{namespace}/#{name}-#{version}.tar.gz"
 
     case context.http_get.(url) do
       {:ok, archive} ->
@@ -209,7 +216,7 @@ defmodule Typsty.Packages do
   # so that runs at the same time don't write into each other's files. With :force, the old
   # package is moved aside first, and only deleted once the new one is in place.
   defp extract!(archive, package, dir, context) do
-    files = files!(archive, package)
+    files = files!(archive, package, context.max_package_size)
 
     parent = Path.dirname(dir)
     mkdir!(parent, package)
@@ -271,8 +278,8 @@ defmodule Typsty.Packages do
     end
   end
 
-  defp files!(archive, package) do
-    with {:ok, tar} <- gunzip(archive, package),
+  defp files!(archive, package, max_size) do
+    with {:ok, tar} <- gunzip(archive, package, max_size),
          {:tar, {:ok, files}} <- {:tar, :erl_tar.extract({:binary, tar}, [:memory])} do
       files
     else
@@ -284,13 +291,13 @@ defmodule Typsty.Packages do
     end
   end
 
-  # Decompresses the archive up to @max_package_size, rather than all of it at once
-  defp gunzip(archive, package) do
+  # Decompresses the archive up to the size (@max_package_size), rather than all of it at once
+  defp gunzip(archive, package, max_size) do
     z = :zlib.open()
 
     try do
       :zlib.inflateInit(z, 31)
-      inflate(z, :zlib.safeInflate(z, archive), [], 0, package)
+      inflate(z, :zlib.safeInflate(z, archive), [], 0, {package, max_size})
     rescue
       ErlangError -> {:error, "it isn't a valid gzip file"}
     after
@@ -298,15 +305,15 @@ defmodule Typsty.Packages do
     end
   end
 
-  defp inflate(z, {status, output}, acc, size, package) do
+  defp inflate(z, {status, output}, acc, size, {package, max_size} = limit) do
     size = size + IO.iodata_length(output)
 
     cond do
-      size > @max_package_size ->
-        Mix.raise("the archive of #{format(package)} expands to more than #{div(@max_package_size, 1024 * 1024)} MiB")
+      size > max_size ->
+        Mix.raise("the archive of #{format(package)} expands to more than #{div(max_size, 1024 * 1024)} MiB")
 
       status == :continue ->
-        inflate(z, :zlib.safeInflate(z, []), [acc, output], size, package)
+        inflate(z, :zlib.safeInflate(z, []), [acc, output], size, limit)
 
       status == :finished ->
         {:ok, IO.iodata_to_binary([acc, output])}
@@ -412,18 +419,20 @@ defmodule Typsty.Packages do
   defp describe(reason), do: inspect(reason)
 
   # Gets a URL with :httpc, verifying the server's certificate. Honors the HTTPS_PROXY,
-  # HTTP_PROXY and NO_PROXY environment variables. The body is read as it arrives, and the
-  # download is stopped once it's larger than @max_download_size.
+  # HTTP_PROXY and NO_PROXY environment variables, as they are when it's called. The body is
+  # read as it arrives, and the download is stopped once it's larger than @max_download_size.
   defp http_get(url) do
     {:ok, _apps} = Application.ensure_all_started(:inets)
     {:ok, _apps} = Application.ensure_all_started(:ssl)
 
-    case :inets.start(:httpc, profile: @profile) do
-      {:ok, _pid} -> :ok
-      {:error, {:already_started, _pid}} -> :ok
-    end
+    uri = URI.parse(url)
 
-    proxy_auth = configure_proxy(URI.parse(url))
+    {profile, proxy_auth} =
+      case proxy!(uri) do
+        nil -> {start_profile(@profile), []}
+        proxy -> {start_profile(@proxied_profile), use_proxy(@proxied_profile, uri, proxy)}
+      end
+
     headers = [{~c"user-agent", ~c"typsty/#{@version}"}]
 
     http_options =
@@ -438,11 +447,23 @@ defmodule Typsty.Packages do
         ]
       ] ++ proxy_auth
 
-    options = [sync: false, stream: :self, body_format: :binary]
+    # The request's messages go to a process of its own, so that none can be left for this
+    # one: httpc may still send some after a request is cancelled
+    Task.async(fn ->
+      options = [sync: false, stream: :self, body_format: :binary]
 
-    case :httpc.request(:get, {String.to_charlist(url), headers}, http_options, options, @profile) do
-      {:ok, request} -> receive_body(request, [], 0)
-      {:error, reason} -> {:error, reason}
+      case :httpc.request(:get, {String.to_charlist(url), headers}, http_options, options, profile) do
+        {:ok, request} -> receive_body(request, profile, [], 0)
+        {:error, reason} -> {:error, reason}
+      end
+    end)
+    |> Task.await(:infinity)
+  end
+
+  defp start_profile(profile) do
+    case :inets.start(:httpc, profile: profile) do
+      {:ok, _pid} -> profile
+      {:error, {:already_started, _pid}} -> profile
     end
   end
 
@@ -457,19 +478,19 @@ defmodule Typsty.Packages do
   end
 
   # Successful responses are streamed; others come whole
-  defp receive_body(request, body, size) do
+  defp receive_body(request, profile, body, size) do
     receive do
       {:http, {^request, :stream_start, _headers}} ->
-        receive_body(request, body, size)
+        receive_body(request, profile, body, size)
 
       {:http, {^request, :stream, chunk}} ->
         size = size + byte_size(chunk)
 
         if size > @max_download_size do
-          :httpc.cancel_request(request, @profile)
+          :httpc.cancel_request(request, profile)
           {:error, "it's larger than #{div(@max_download_size, 1024 * 1024)} MiB"}
         else
-          receive_body(request, [body, chunk], size)
+          receive_body(request, profile, [body, chunk], size)
         end
 
       {:http, {^request, :stream_end, _headers}} ->
@@ -488,43 +509,52 @@ defmodule Typsty.Packages do
         {:error, reason}
     after
       130_000 ->
-        :httpc.cancel_request(request, @profile)
+        :httpc.cancel_request(request, profile)
         {:error, :timeout}
     end
   end
 
-  # Sets the proxy for the URL, returning the options for a proxy with a user and password
-  defp configure_proxy(%URI{scheme: scheme, host: host}) do
-    option = if scheme == "https", do: :https_proxy, else: :proxy
-
+  # The proxy for the URL, from the environment variables, or nil to go straight to the
+  # server. httpc only talks to proxies over plain HTTP (which can still forward HTTPS), so
+  # other proxies are refused rather than given credentials in the clear, or skipped
+  defp proxy!(%URI{scheme: scheme, host: host}) do
     variables =
       if scheme == "https", do: ~w(HTTPS_PROXY https_proxy HTTP_PROXY http_proxy), else: ~w(HTTP_PROXY http_proxy)
 
-    proxy =
-      with value when is_binary(value) <- Enum.find_value(variables, &env/1),
-           false <- no_proxy?(host),
-           value = if(String.contains?(value, "://"), do: value, else: "http://" <> value),
-           %URI{host: proxy_host} = proxy when proxy_host not in [nil, ""] <- URI.parse(value) do
-        proxy
-      else
-        _ -> nil
+    with {variable, value} <- Enum.find_value(variables, &(env(&1) && {&1, env(&1)})),
+         false <- no_proxy?(host) do
+      value = if String.contains?(value, "://"), do: value, else: "http://" <> value
+
+      # The value isn't quoted in errors: it can have a password in it
+      case URI.parse(value) do
+        %URI{scheme: "http", host: proxy_host, port: port} = proxy
+        when proxy_host not in [nil, ""] and is_integer(port) ->
+          proxy
+
+        %URI{scheme: "http"} ->
+          Mix.raise("the #{variable} variable isn't a proxy's URL, like http://proxy.example.com:3128")
+
+        %URI{scheme: proxy_scheme} ->
+          Mix.raise(
+            "the #{variable} variable has a #{proxy_scheme}:// proxy, which mix typsty.packages.get can't use: " <>
+              "it only talks to proxies over HTTP (http://), which can still forward HTTPS"
+          )
       end
+    else
+      _none -> nil
+    end
+  end
 
-    # The profile is the task's own, and has no proxy until one is set
-    case proxy do
-      nil ->
-        []
+  # Sets the proxy on the profile, returning the options for a proxy with a user (and a
+  # password)
+  defp use_proxy(profile, %URI{scheme: scheme}, %URI{host: proxy_host, port: port, userinfo: userinfo}) do
+    option = if scheme == "https", do: :https_proxy, else: :proxy
+    :ok = :httpc.set_options([{option, {{String.to_charlist(proxy_host), port}, []}}], profile)
 
-      %URI{host: proxy_host, port: port, userinfo: userinfo} ->
-        :httpc.set_options([{option, {{String.to_charlist(proxy_host), port}, []}}], @profile)
-
-        case userinfo && String.split(userinfo, ":", parts: 2) do
-          [user, password] ->
-            [proxy_auth: {String.to_charlist(URI.decode(user)), String.to_charlist(URI.decode(password))}]
-
-          _ ->
-            []
-        end
+    case userinfo && String.split(userinfo, ":", parts: 2) do
+      [user, password] -> [proxy_auth: {String.to_charlist(URI.decode(user)), String.to_charlist(URI.decode(password))}]
+      [user] -> [proxy_auth: {String.to_charlist(URI.decode(user)), ~c""}]
+      nil -> []
     end
   end
 
