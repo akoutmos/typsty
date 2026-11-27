@@ -161,6 +161,8 @@ returning an error.
 
 Templates are checked when your code compiles: a syntax error in a `~TYPST`
 sigil or a `.typ` template fails the build, pointing at the line in your file.
+A component that breaks the rules for components (see [Components](#components))
+fails the build the same way, with `invalid component: …`.
 
 For templates that don't live in a module, such as ones stored in a database,
 render a string of Typst source with `Typsty.to_pdf/3`, `Typsty.to_png/3` and
@@ -323,19 +325,23 @@ defmodule MyApp.Invoice do
 end
 ```
 
-Components only define things, and only get data as arguments. That's checked
-when they compile: their top level can only have definitions (`#let`) and
-imports (`#import`), so a component can't be used as a partial, and they can't
-read `sys.inputs`, where the document's assigns are. Set and show rules go
-inside functions, like the letterhead's `set page(...)`.
+Components only define things, and only get data as arguments. Both are checked
+when they compile. Their top level can only have definitions (`#let`) and
+imports (`#import`), so a component can't be used as a partial. Set and show
+rules go inside functions, like the letterhead's `set page(...)`. And they
+can't read `sys.inputs`, where the document's assigns are: they can only use
+`sys` to read its other fields, and can't use `eval`.
 
 A component's own files, such as its images and data, go in a folder next to
 it with the same base name (`letterhead/` next to `letterhead.ex`). Renders get
-them at `components/<name>/`, so the component reads them as
+them at `components/<name>/`. Paths in a component are relative to
+`components/`, where its `.typ` file is, so it reads them as
 `image("letterhead/seal.svg")`. They're read when the component compiles and
-kept in its module, so they work in releases and in a `Typsty.Pool`, and paths
-to them that are written out are checked then too. Files that change from
-document to document, like the logo above, are passed as arguments instead.
+kept in its module, so they work in releases and in a `Typsty.Pool`. Paths to
+them written as strings, such as `image("letterhead/seal.svg")`, are checked
+then too. Files that change from document to document, like the logo above, are
+passed as arguments instead: pass the file itself (`image("logo.png")`), since
+a path given to a component would be read relative to `components/`.
 
 Errors in a component point at the line in its `.typ` file or its sigil.
 Documents only depend on their components at runtime, so changing a component
@@ -371,7 +377,8 @@ Name files yourself, rather than with names that come from users (an upload's
 file name, say): a `.typ` file in `:files` takes the place of the one the
 template imports, which would let a user run their own Typst code. Use names
 like `uploads/#{id}.png`. (Components can't be replaced that way:
-`components/` is reserved for them, so `:files` can't have files there.)
+`components/` is reserved for them, so `:files` can't have files there, and it
+isn't read from `:root`.)
 
 Without the `:root` option, a document can only read the files it's given. Set
 `:root` to a directory to also read files from it (files in `:files` take
@@ -666,8 +673,8 @@ To leave a sigil as it is, use the `noformat` modifier:
 
 ## Configuration
 
-Every rendering option except `:files` can be set in your application config, as
-a default for every render:
+Every rendering option except `:files` and `:components` can be set in your
+application config, as a default for every render:
 
 ```elixir
 config :typsty,

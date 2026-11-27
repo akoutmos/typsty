@@ -18,17 +18,23 @@ and musl) and Windows (x86-64).
   colocated `.typ` template (or one given with the `:template` option), and
   generated `to_pdf/2`, `to_png/2` and `to_svg/2`, with bang variants.
 - Components, with `use Typsty.Component`: reusable Typst functions (tables,
-  letterheads, headers and footers) in a `.typ` file or a `~TYPST` sigil, which
-  documents list (`use Typsty, components: [...]`, or the `:components` option)
-  and import from `components/<name>.typ`, with the components they list.
-  Components are checked when they compile: their top level can only have
-  definitions and imports, and they can't read `sys.inputs`, so they only get
-  data as arguments. Their errors point at the lines of their files. Documents
-  only depend on them at runtime, and `components/` is reserved for them, so a
-  file in `:files` can't take a component's place. A component's own files
-  (images, data and `.typ` files) go in a folder next to it, and renders get
-  them at `components/<name>/`: they're kept in its module when it compiles,
-  and the paths it reads them from are checked then.
+  letterheads, headers and footers), in a `.typ` file or a `~TYPST` sigil.
+  - Documents list them (`use Typsty, components: [...]`, or the `:components`
+    option) and import them from `components/<name>.typ`, with the components
+    they list. The `:name` option names a component.
+  - They're checked when they compile: their top level can only have
+    definitions and imports, and they can't read `sys.inputs` (or use `eval`),
+    so they only get data as arguments. Their errors point at the lines of
+    their files, and `Typsty.SyntaxError` has a `:kind` (`:syntax` or
+    `:component`).
+  - A component's own files (images, data and `.typ` files) go in a folder next
+    to it (or the one given with `files:`), are kept in its module, and are
+    served at `components/<name>/`. The paths it reads them from, written as
+    strings, are checked when it compiles.
+  - Documents depend on components at runtime only, so changing one doesn't
+    recompile them.
+  - `components/` is reserved: `:files` can't have files there, and it isn't
+    read from `:root`, so a file in `:files` can't take a component's place.
 - `Typsty.to_pdf/3`, `Typsty.to_png/3` and `Typsty.to_svg/3` for templates and
   Typst source.
 - The assigns (a map) are passed to the template as a dictionary named `assigns`
@@ -48,8 +54,10 @@ and musl) and Windows (x86-64).
 - Typst packages from local `:package_paths` directories, and
   `mix typsty.packages.get` to download packages from Typst Universe into the
   project (with the packages they import), as arguments or from
-  `config :typsty, packages:`. Rendering never downloads packages, and a missing
-  package's error says how to fetch it and where it looked.
+  `config :typsty, packages:`, through the HTTP proxy in `HTTPS_PROXY` or
+  `HTTP_PROXY` (but for the hosts in `NO_PROXY`). Rendering never downloads
+  packages, and a missing package's error says how to fetch it and where it
+  looked.
 - `Typsty.typst_version/0`.
 - Template syntax checked at compile time, with `Typsty.SyntaxError` pointing at
   the line and column in the module or `.typ` file. `Typsty.validate/1` checks
