@@ -6,7 +6,7 @@ defmodule Typsty.ComponentFilesTest do
   alias Typsty.{RenderError, SyntaxError}
   alias Typsty.Test.{Brand, Icons, LabelA, LabelB, PDF, Stamp}
 
-  import Typsty.Test.Helpers, only: [compile!: 3, position: 2]
+  import Typsty.Test.Helpers, only: [compile!: 3, position: 2, unload: 1]
 
   @no_date "#set document(date: none)\n"
   @stamp_dir "test/support/components/stamp"
@@ -262,6 +262,7 @@ defmodule Typsty.ComponentFilesTest do
         """)
 
       assert [{"rows.typ", %Typsty.Template{}}] = module.__typsty_files__()
+      unload(module)
 
       error =
         assert_raise SyntaxError, fn ->
@@ -328,6 +329,7 @@ defmodule Typsty.ComponentFilesTest do
 
       [{module, _binary}] = compile!(dir, "loopy.ex", component)
       assert Enum.map(module.__typsty_files__(), &elem(&1, 0)) == ["nested/a.txt"]
+      unload(module)
 
       File.write!(Path.join(dir, "loopy/back\\slash.txt"), "b")
 

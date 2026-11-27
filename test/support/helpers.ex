@@ -9,6 +9,12 @@ defmodule Typsty.Test.Helpers do
     Code.compile_file(file)
   end
 
+  @doc "Unloads a module compiled by a test, which the test can then compile again without a warning."
+  def unload(module) do
+    :code.delete(module)
+    :code.purge(module)
+  end
+
   @doc "A gzipped tar archive of the files (names to contents), as a package's archive is."
   def tar_gz(dir, files) do
     path = Path.join(dir, "archive-#{System.unique_integer([:positive])}.tar.gz")
