@@ -40,11 +40,11 @@ and musl) and Windows (x86-64).
 - The assigns (a map) are passed to the template as a dictionary named `assigns`
   (`#assigns.name`), as Typst values rather than generated code, so they never
   shadow anything in Typst: strings, numbers, booleans, `nil`, lists, tuples,
-  maps (as dictionaries sorted by key), dates and times, decimals, `MapSet`s and
-  `Range`s. Other structs implement `Typsty.Encoder`, by deriving it
-  (`@derive {Typsty.Encoder, only: [...]}`) or implementing it. Using an assign
-  that wasn't given comes with a hint that says so. Imported files other than
-  components can read the assigns from `sys.inputs.assigns`.
+  maps (as dictionaries sorted by key), dates and times, decimals, `MapSet`s,
+  `Range`s and `Date.Range`s. Other structs implement `Typsty.Encoder`, by
+  deriving it (`@derive {Typsty.Encoder, only: [...]}`) or implementing it. Using
+  an assign that wasn't given comes with a hint that says so. Imported files
+  other than components can read the assigns from `sys.inputs.assigns`.
 - A virtual file system: images, data files and `.typ` files are passed as
   binaries with the `:files` option. Files can also be read from a `:root`
   directory, which documents can't read outside of, even through symbolic links.

@@ -207,6 +207,26 @@ defmodule Typsty.ValueTest do
     )
   end
 
+  test "converts a Date.Range to an array of its dates, in steps and backwards" do
+    assert_typst(
+      ~S"""
+      #let october(day) = datetime(year: 2026, month: 10, day: day)
+      #assert.eq(assigns.month.len(), 31)
+      #assert.eq(assigns.month.first(), october(1))
+      #assert.eq(assigns.month.last(), october(31))
+      #assert.eq(assigns.weekly, (october(1), october(8), october(15)))
+      #assert.eq(assigns.backwards, (october(3), october(2), october(1)))
+      #assert.eq(assigns.empty, ())
+      """,
+      %{
+        month: Date.range(~D[2026-10-01], ~D[2026-10-31]),
+        weekly: Date.range(~D[2026-10-01], ~D[2026-10-20], 7),
+        backwards: Date.range(~D[2026-10-03], ~D[2026-10-01], -1),
+        empty: Date.range(~D[2026-10-02], ~D[2026-10-01], 1)
+      }
+    )
+  end
+
   test "refuses structs that don't implement Typsty.Encoder, rather than pass their fields" do
     assert_raise ArgumentError,
                  ~r/^assigns.plain is a %Typsty.ValueTest.Plain{} struct, which can only be passed/,
@@ -217,11 +237,19 @@ defmodule Typsty.ValueTest do
     assert_raise ArgumentError, ~r/^assigns.range is a range of 2000000 numbers/, fn ->
       Typsty.to_pdf("x", %{range: 1..2_000_000})
     end
+
+    assert_raise ArgumentError, ~r/^assigns.period is a range of 3652059 dates, more than 1000000\./, fn ->
+      Typsty.to_pdf("x", %{period: Date.range(~D[0001-01-01], ~D[9999-12-31])})
+    end
   end
 
   test "refuses dates and decimals Typst can't represent, with their path" do
     assert_raise ArgumentError, ~r/^assigns.d is in the year 10000/, fn ->
       Typsty.to_pdf("x", %{d: Date.new!(10_000, 1, 1)})
+    end
+
+    assert_raise ArgumentError, ~r/^assigns.period\[1\] is in the year 10000/, fn ->
+      Typsty.to_pdf("x", %{period: Date.range(~D[9999-12-31], Date.new!(10_000, 1, 1))})
     end
 
     for decimal <- ["79228162514264337593543950336", "1E-29", "1E+29"] do

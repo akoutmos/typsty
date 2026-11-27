@@ -3,9 +3,10 @@ defprotocol Typsty.Encoder do
   Converts structs into data that can be passed to a template.
 
   `Date`, `Time`, `NaiveDateTime`, `DateTime` and `Decimal` become Typst datetimes and
-  decimals, and `MapSet`s and `Range`s become arrays, without this protocol. Other structs
-  must implement it to be passed to a template, so that their internal fields (an Ecto
-  schema's metadata, or a password hash) don't reach templates by accident.
+  decimals, and `MapSet`s, `Range`s and `Date.Range`s become arrays, without this
+  protocol. Other structs must implement it to be passed to a template, so that their
+  internal fields (an Ecto schema's metadata, or a password hash) don't reach templates by
+  accident.
 
   Derive it to pass a struct as a dictionary of its fields, or of some of them:
 

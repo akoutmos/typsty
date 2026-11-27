@@ -197,7 +197,7 @@ format dates:
 | maps                                        | `dictionary`, with string keys, sorted      |
 | `Date`, `Time`, `NaiveDateTime`, `DateTime` | `datetime` (`DateTime` keeps its wall time) |
 | `Decimal`                                   | `decimal`                                   |
-| `MapSet`, `Range`                           | `array`                                     |
+| `MapSet`, `Range`, `Date.Range`             | `array`                                     |
 | other structs                               | see `Typsty.Encoder`                        |
 
 The assigns are a map with atom or string keys. A template reads keys that
@@ -209,9 +209,11 @@ that may be missing with a default:
 ```
 
 Keyword lists are lists of tuples, so they become arrays of pairs: pass maps for
-dictionaries. Typst's datetimes have no time zone or fractions of a second, so a
-`DateTime` keeps its wall time and times are truncated to the second, and its
-decimals have 28 significant digits.
+dictionaries. A `Date.Range` becomes an array of its dates, so a template shows
+a period with `assigns.period.first()` and `assigns.period.last()`. Typst's
+datetimes have no time zone or fractions of a second, so a `DateTime` keeps its
+wall time and times are truncated to the second, and its decimals have 28
+significant digits.
 
 Other structs are passed when they implement `Typsty.Encoder`, so that their
 internal fields (an Ecto schema's metadata, or a password hash) don't reach

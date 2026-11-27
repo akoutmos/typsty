@@ -30,7 +30,7 @@ defmodule Typsty.Value do
   # Typst's dates go from year -9999 to 9999
   @max_year 9999
 
-  # A range is passed as a list of its numbers, which a range can make enormous
+  # A range is passed as a list of its numbers or dates, which a range can make enormous
   @max_range_size 1_000_000
 
   # How many structs Typsty.Encoder may turn into other structs in a row, so that two
@@ -118,6 +118,18 @@ defmodule Typsty.Value do
   defp encode(%Range{} = range, path, _encodings) do
     if Range.size(range) > @max_range_size do
       invalid!(path, "is a range of #{Range.size(range)} numbers, more than #{@max_range_size}. Pass a list")
+    end
+
+    encode(Enum.to_list(range), path, 0)
+  end
+
+  # Each date is checked as it's converted, so a range that runs past Typst's years is
+  # refused at the first date out of them
+  defp encode(%Date.Range{} = range, path, _encodings) do
+    size = Enum.count(range)
+
+    if size > @max_range_size do
+      invalid!(path, "is a range of #{size} dates, more than #{@max_range_size}. Pass its first and last dates")
     end
 
     encode(Enum.to_list(range), path, 0)

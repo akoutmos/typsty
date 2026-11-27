@@ -11,7 +11,8 @@ defmodule TypstyExamples.Statement do
 
   - `:company`, and `:account`: a map with the `:holder`, the holder's `:address` (a list
     of lines), the account's `:name` and the `:last4` digits of its number
-  - `:starts_on` and `:ends_on` - the first and last days of the statement's period
+  - `:period` - a `Date.Range` of the statement's days, which the template gets as an array
+    of dates
   - `:opening_balance` - a `Decimal`
   - `:transactions` - maps with a `:date`, a `:description`, a `:category` and an
     `:amount`, a `Decimal` that's negative for money out, in date order
@@ -63,7 +64,7 @@ defmodule TypstyExamples.Statement do
       align: (left + bottom, right + bottom),
       [
         #text(size: 22pt, weight: "bold")[Account statement]\
-        #text(size: 11pt, fill: colors.muted)[#long-date(assigns.starts_on) to #long-date(assigns.ends_on)]
+        #text(size: 11pt, fill: colors.muted)[#long-date(assigns.period.first()) to #long-date(assigns.period.last())]
       ],
       [
         #label[Account holder]\
