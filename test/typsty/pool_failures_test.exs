@@ -248,21 +248,25 @@ defmodule Typsty.PoolFailuresTest do
       pid_file = Path.join(dir, "pid")
       pool = start_pool(FakeWorker.write!(dir, then: "read_request; wait_for_close", pid_file: pid_file))
 
+      # Read now: the worker that replaces it writes its own pid there
+      worker = read_pid(pid_file)
+
       assert {:error, %RenderError{reason: :timeout, diagnostics: [%{message: message}]}} = render(pool, timeout: 100)
       assert message == "rendering didn't finish within the timeout (100 ms), and its worker was stopped"
-      assert Helpers.wait_until(fn -> not running?(pid_file) end)
+      assert Helpers.wait_until(fn -> not running?(worker) end)
     end
 
     test "whose worker takes it but never answers is stopped once the timeout passes", %{tmp_dir: dir} do
       pid_file = Path.join(dir, "pid")
       pool = start_pool(FakeWorker.write!(dir, then: "read_request; started; wait_for_close", pid_file: pid_file))
+      worker = read_pid(pid_file)
 
       {elapsed, result} = :timer.tc(fn -> render(pool, timeout: 100) end, :millisecond)
       assert {:error, %RenderError{reason: :timeout}} = result
 
       # The worker gets a grace period to stop the render itself, and is then stopped
       assert elapsed >= 1_100
-      assert Helpers.wait_until(fn -> not running?(pid_file) end)
+      assert Helpers.wait_until(fn -> not running?(worker) end)
     end
 
     test "whose worker exits after answering is answered, and the next one gets a new worker", %{tmp_dir: dir} do
@@ -306,9 +310,12 @@ defmodule Typsty.PoolFailuresTest do
     end
   end
 
-  # Whether the fake worker whose pid is in the file still runs
-  defp running?(pid_file) do
-    {_output, status} = System.cmd("kill", ["-0", pid_file |> File.read!() |> String.trim()], stderr_to_stdout: true)
+  # The pid of the fake worker that last started
+  defp read_pid(pid_file), do: pid_file |> File.read!() |> String.trim()
+
+  # Whether the process still runs
+  defp running?(pid) do
+    {_output, status} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true)
     status == 0
   end
 end
