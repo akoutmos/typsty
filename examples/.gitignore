@@ -1,0 +1,9 @@
+/_build/
+/deps/
+erl_crash.dump
+
+# Downloaded by `mix typsty.packages.get`, from the list in config/config.exs
+/priv/typst/packages/
+
+# Written by `mix examples.render`
+/output/
