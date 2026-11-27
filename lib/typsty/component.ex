@@ -198,6 +198,9 @@ defmodule Typsty.Component do
   # warns, since that costs every render something
   @large_files 8 * 1024 * 1024
 
+  # The most folders deep a component's files are looked for
+  @max_depth 32
+
   @doc """
   Returns the component's source, as a `Typsty.Template` struct. Define it with the `~TYPST`
   sigil, or leave it out and put the source in a `.typ` file next to the module.
@@ -423,7 +426,9 @@ defmodule Typsty.Component do
   defp read_files!(_env, nil, _listing, _template), do: []
 
   defp read_files!(env, dir, listing, template) do
-    for relative <- listing, path = Path.join(dir, relative), path != template do
+    for relative <- listing,
+        path = Path.join(dir, relative),
+        Path.expand(path) != (template && Path.expand(template)) do
       if String.contains?(relative, "\\") do
         compile_error!(
           env,
@@ -449,31 +454,41 @@ defmodule Typsty.Component do
   def __listing__(dir) do
     # Walked rather than matched with a wildcard, which would take the folder's own path for
     # a pattern if it had characters like [ or { in it
-    if File.dir?(dir), do: dir |> walk("", MapSet.new()) |> elem(0) |> Enum.sort(), else: []
+    if File.dir?(dir), do: dir |> walk("", MapSet.new(), 0) |> elem(0) |> Enum.sort(), else: []
   end
 
   # The files in a folder and the folders in it, skipping folders already seen (through a
-  # symbolic link to one that holds it, say)
-  defp walk(dir, prefix, seen) do
-    with {:ok, %File.Stat{major_device: device, inode: inode}} <- File.stat(dir),
-         false <- MapSet.member?(seen, {device, inode}),
+  # symbolic link to one that holds it, say), and folders nested deeper than any component's
+  # would be: where folders can't be told apart (see folder/2), that's what ends a walk
+  # through links that lead back
+  defp walk(_dir, _prefix, seen, depth) when depth > @max_depth, do: {[], seen}
+
+  defp walk(dir, prefix, seen, depth) do
+    with {:ok, stat} <- File.stat(dir),
+         folder = folder(dir, stat),
+         false <- MapSet.member?(seen, folder),
          {:ok, names} <- File.ls(dir) do
       names
       |> Enum.sort()
       |> Enum.reject(&String.starts_with?(&1, "."))
-      |> Enum.reduce({[], MapSet.put(seen, {device, inode})}, &walk_entry(dir, prefix, &1, &2))
+      |> Enum.reduce({[], MapSet.put(seen, folder)}, &walk_entry(dir, prefix, depth, &1, &2))
     else
       _seen_or_unreadable -> {[], seen}
     end
   end
 
-  defp walk_entry(dir, prefix, name, {files, seen}) do
+  # A folder, as the file system knows it: by its device and inode, which a link to it shares.
+  # On Windows, Erlang gives every file the inode 0, so a folder is only known by its path
+  defp folder(dir, %File.Stat{inode: 0}), do: {:path, dir}
+  defp folder(_dir, %File.Stat{major_device: device, inode: inode}), do: {device, inode}
+
+  defp walk_entry(dir, prefix, depth, name, {files, seen}) do
     path = Path.join(dir, name)
     relative = if prefix == "", do: name, else: prefix <> "/" <> name
 
     cond do
       File.dir?(path) ->
-        {nested, seen} = walk(path, relative, seen)
+        {nested, seen} = walk(path, relative, seen, depth + 1)
         {files ++ nested, seen}
 
       File.regular?(path) ->
