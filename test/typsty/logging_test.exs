@@ -31,8 +31,8 @@ defmodule Typsty.LoggingTest do
   test "fonts from the font paths are used", %{tmp_dir: fonts} do
     assert Typsty.font_families(system_fonts: false, embedded_fonts: false) == []
 
-    font = system_font!()
-    File.cp!(font, Path.join(fonts, "font" <> Path.extname(font)))
+    # A font that comes with the tests (see test/support/fonts), whatever the system has
+    File.cp!(Path.expand("../support/fonts/colr_1.ttf", __DIR__), Path.join(fonts, "font.ttf"))
 
     assert [family | _] = Typsty.font_families(system_fonts: false, embedded_fonts: false, font_paths: [fonts])
 
@@ -41,15 +41,5 @@ defmodule Typsty.LoggingTest do
     source = "#set text(font: assigns.family)\nHello"
     opts = [system_fonts: false, embedded_fonts: false, font_paths: [fonts]]
     assert capture_log(fn -> assert {:ok, _pdf} = Typsty.to_pdf(source, %{family: family}, opts) end) == ""
-  end
-
-  # A font installed on the system, to copy into a font path
-  defp system_font! do
-    ["/System/Library/Fonts", "/usr/share/fonts", "C:/Windows/Fonts"]
-    |> Enum.flat_map(&Path.wildcard(Path.join(&1, "**/*.{ttf,otf}")))
-    |> case do
-      [font | _] -> font
-      [] -> flunk("no font found on the system to test font paths with")
-    end
   end
 end

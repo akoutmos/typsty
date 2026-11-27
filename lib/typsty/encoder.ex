@@ -76,6 +76,25 @@ defprotocol Typsty.Encoder do
 end
 
 defimpl Typsty.Encoder, for: MapSet do
-  # In order, so that the same set gives the same array
-  def encode(set), do: set |> MapSet.to_list() |> Enum.sort()
+  # In order, so that the same set gives the same array. Dates, times and decimals are sorted
+  # by value: in Erlang's term order, their structs would sort field by field, which puts
+  # dates in order of their day of the month
+  @by_value [Date, Time, NaiveDateTime, DateTime, Decimal]
+
+  def encode(set) do
+    members = MapSet.to_list(set)
+
+    case members do
+      [%module{} | _] when module in @by_value ->
+        if Enum.all?(members, &comparable?(&1, module)), do: Enum.sort(members, module), else: Enum.sort(members)
+
+      _members ->
+        Enum.sort(members)
+    end
+  end
+
+  # Decimals that aren't numbers (NaN, infinity) can't be compared, and are refused once
+  # they're encoded, as they are outside a set
+  defp comparable?(%{__struct__: Decimal, coef: coef}, Decimal), do: is_integer(coef)
+  defp comparable?(member, module), do: is_struct(member, module)
 end

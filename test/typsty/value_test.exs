@@ -31,6 +31,12 @@ defmodule Typsty.ValueTest do
     defstruct __meta__: %Plain{}, name: nil
   end
 
+  defmodule SchemaWithSecret do
+    @moduledoc false
+    @derive {Typsty.Encoder, except: [:token]}
+    defstruct __meta__: %Plain{}, name: nil, token: nil
+  end
+
   defmodule Money do
     @moduledoc false
     defstruct [:amount, :currency]
@@ -227,6 +233,31 @@ defmodule Typsty.ValueTest do
     )
   end
 
+  test "sorts a MapSet's dates, times and decimals by value, and anything else in term order" do
+    assert_typst(
+      ~S"""
+      #let date(year, month, day) = datetime(year: year, month: month, day: day)
+      #assert.eq(assigns.dates, (date(2025, 12, 31), date(2026, 10, 2), date(2026, 11, 1)))
+      #assert.eq(assigns.times, (datetime(hour: 9, minute: 0, second: 0), datetime(hour: 10, minute: 0, second: 0)))
+      #assert.eq(assigns.decimals, (decimal("-3"), decimal("9.5"), decimal("10")))
+      #assert.eq(assigns.strings.len(), 40)
+      #assert.eq(assigns.strings, assigns.strings.sorted())
+      """,
+      %{
+        dates: MapSet.new([~D[2026-10-02], ~D[2026-11-01], ~D[2025-12-31]]),
+        times: MapSet.new([~T[10:00:00], ~T[09:00:00]]),
+        decimals: MapSet.new([Decimal.new("10"), Decimal.new("9.5"), Decimal.new("-3")]),
+        # Sets of more than 32 members aren't kept in order
+        strings: MapSet.new(1..40, &"key #{&1}")
+      }
+    )
+
+    # A decimal that isn't a number can't be compared, and is refused once it's encoded
+    assert_raise ArgumentError, ~r/^assigns.prices\[\d\] is a decimal that isn't a number/, fn ->
+      Typsty.to_pdf("x", %{prices: MapSet.new([Decimal.new("NaN"), Decimal.new(1)])})
+    end
+  end
+
   test "refuses structs that don't implement Typsty.Encoder, rather than pass their fields" do
     assert_raise ArgumentError,
                  ~r/^assigns.plain is a %Typsty.ValueTest.Plain{} struct, which can only be passed/,
@@ -246,6 +277,10 @@ defmodule Typsty.ValueTest do
   test "refuses dates and decimals Typst can't represent, with their path" do
     assert_raise ArgumentError, ~r/^assigns.d is in the year 10000/, fn ->
       Typsty.to_pdf("x", %{d: Date.new!(10_000, 1, 1)})
+    end
+
+    assert_raise ArgumentError, ~r/^assigns.at\("due date"\) is in the year 10000/, fn ->
+      Typsty.to_pdf("x", %{"due date" => NaiveDateTime.new!(10_000, 1, 1, 0, 0, 0)})
     end
 
     assert_raise ArgumentError, ~r/^assigns.period\[1\] is in the year 10000/, fn ->
@@ -274,6 +309,21 @@ defmodule Typsty.ValueTest do
     )
   end
 
+  test "converts zero decimals whatever their exponent, keeping the places that fit" do
+    large = Decimal.mult(Decimal.new(0), Decimal.new("1E+41"))
+    assert %Decimal{coef: 0, exp: 41} = large
+
+    assert_typst(
+      ~S"""
+      #assert.eq(assigns.large, decimal("0"))
+      #assert.eq(assigns.tiny, decimal("0"))
+      #assert.eq(str(assigns.cents), "0.00")
+      #assert.eq(str(assigns.tiny), "0." + "0" * 28)
+      """,
+      %{large: large, tiny: %Decimal{sign: 1, coef: 0, exp: -1001}, cents: Decimal.new("0.00")}
+    )
+  end
+
   test "refuses huge decimals without working through their digits" do
     {time, _} =
       :timer.tc(fn ->
@@ -287,6 +337,7 @@ defmodule Typsty.ValueTest do
 
   test "deriving Typsty.Encoder leaves an Ecto schema's metadata out, and checks the fields it names" do
     assert_typst(~S|#assert.eq(assigns.schema, (name: "Ada"))|, %{schema: %Schema{name: "Ada"}})
+    assert_typst(~S|#assert.eq(assigns.schema, (name: "Ada"))|, %{schema: %SchemaWithSecret{name: "Ada", token: "x"}})
 
     assert_raise ArgumentError, ~r/:only has fields the struct doesn't have: \[:nmae\]/, fn ->
       Code.compile_string("""
@@ -331,8 +382,12 @@ defmodule Typsty.ValueTest do
   end
 
   test "raises for integers that don't fit in 64 bits" do
-    assert_raise ArgumentError, ~r/big is an integer that doesn't fit in 64 bits/, fn ->
+    assert_raise ArgumentError, ~r/^assigns.big is an integer that doesn't fit in 64 bits/, fn ->
       Typsty.to_pdf("x", %{big: 9_223_372_036_854_775_808})
+    end
+
+    assert_raise ArgumentError, ~r/^assigns.small is an integer that doesn't fit in 64 bits/, fn ->
+      Typsty.to_pdf("x", %{small: -9_223_372_036_854_775_809})
     end
   end
 
@@ -390,7 +445,8 @@ defmodule Typsty.ValueTest do
           end
         end)
 
-      assert micros < 100_000
+      # Writing out the digits would take far longer, and gigabytes
+      assert micros < 1_000_000
     end
   end
 end

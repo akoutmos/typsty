@@ -27,7 +27,9 @@ defmodule Typsty.Options do
       doc: """
       The files the document reads, such as images, data files and other `.typ` files, as
       binaries, by their path in the project (see [Files](Typsty.html#module-files)). Paths
-      in `components/` are reserved for components. This option can't be set in the config.
+      in `components/` are reserved for components. Use fixed paths, not ones made from ids:
+      the VM accepts at most 50,000 different ones over its life. This option can't be set
+      in the config.
       """
     ],
     components: [
@@ -48,7 +50,8 @@ defmodule Typsty.Options do
       doc: """
       A directory to read the files that aren't in `:files` from, except `components/`,
       which only has the render's components. Documents can't read outside it, even
-      through symbolic links.
+      through symbolic links, unless a link is swapped in while a document reads it, so
+      don't set it to a directory that others can write to.
       """
     ],
     font_paths: [

@@ -9,6 +9,18 @@ defmodule Typsty.Test.Helpers do
     Code.compile_file(file)
   end
 
+  @doc """
+  The files a module declared with `@external_resource`, which Mix recompiles it for when they
+  change, relative to the current directory and sorted.
+  """
+  def external_resources(module) do
+    binary = File.read!(:code.which(module))
+    {:ok, {^module, [debug_info: {:debug_info_v1, backend, data}]}} = :beam_lib.chunks(binary, [:debug_info])
+    {:ok, %{attributes: attributes}} = backend.debug_info(:elixir_v1, module, data, [])
+
+    attributes |> Keyword.get_values(:external_resource) |> Enum.map(&Path.relative_to_cwd/1) |> Enum.sort()
+  end
+
   @doc "Unloads a module compiled by a test, which the test can then compile again without a warning."
   def unload(module) do
     :code.delete(module)

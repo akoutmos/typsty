@@ -123,8 +123,12 @@ enum Forbidden {
 /// Whether the node is an identifier that the component can't use there: `sys` or `std`
 /// other than to read a field (or to import from them), or `eval`.
 fn forbidden_use(node: &LinkedNode) -> Option<Forbidden> {
-    let ident = node.cast::<ast::Ident>()?;
-    let name = ident.as_str();
+    // Identifiers in math, as in `$std.sys.inputs$`, are math identifiers
+    let name = match (node.cast::<ast::Ident>(), node.cast::<ast::MathIdent>()) {
+        (Some(ident), _) => ident.as_str(),
+        (_, Some(ident)) => ident.as_str(),
+        _ => return None,
+    };
     if !matches!(name, "sys" | "std" | "eval") || is_binding(node) {
         return None;
     }
@@ -448,6 +452,21 @@ mod tests {
             let problems = problems(text);
             assert_eq!(problems.len(), 1, "{text}: {problems:?}");
             assert_eq!(problems[0].2, INPUTS, "{text}");
+        }
+
+        // In math, where every `std` and `sys` is refused, since math doesn't read fields the
+        // way code does
+        for (text, message) in [
+            ("#let a() = $sys.inputs.assigns$", INPUTS),
+            ("#let a() = $std.sys.inputs.assigns.secret$", INPUTS),
+            ("#let a() = $eval(\"1\")$", EVAL),
+        ] {
+            let problems = problems(text);
+            assert!(!problems.is_empty(), "{text}");
+            assert!(
+                problems.iter().all(|problem| problem.2 == message),
+                "{text}: {problems:?}"
+            );
         }
 
         for text in [

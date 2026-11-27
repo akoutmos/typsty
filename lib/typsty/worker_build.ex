@@ -21,7 +21,9 @@ defmodule Typsty.WorkerBuild do
   end
 
   @doc false
-  # The worker's sources, which Typsty.Native tracks so that changing them rebuilds it
+  # The worker's sources, which Typsty.Native tracks so that changing them rebuilds it. They're
+  # matched within native/, so that its path isn't taken for a pattern if it has characters
+  # like [ or {
   @spec sources() :: [Path.t()]
   def sources do
     [
@@ -33,7 +35,12 @@ defmodule Typsty.WorkerBuild do
       "typsty_core/Cargo.toml",
       "typsty_core/src/**/*.rs"
     ]
-    |> Enum.flat_map(&Path.wildcard(Path.join(@native_dir, &1)))
+    |> Enum.flat_map(fn pattern ->
+      pattern
+      |> String.to_charlist()
+      |> :filelib.wildcard(String.to_charlist(@native_dir))
+      |> Enum.map(&Path.join(@native_dir, &1))
+    end)
   end
 
   @doc false

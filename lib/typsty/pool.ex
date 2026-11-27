@@ -36,11 +36,12 @@ defmodule Typsty.Pool do
   ```
 
   Renders return what they return without a pool: the same output, warnings and errors,
-  pointing at the same lines. Some errors are particular to the pool (see
-  `Typsty.RenderError`): a render that runs past its timeout (`:timeout`), a render that
-  waits past its timeout for a free worker (`:busy`), a render that goes over the memory
-  limit (`:memory_limit`), and a worker that crashes or a pool that stops before or during
-  the render (`:crashed`). A render can take up to a second longer than its timeout, while
+  pointing at the same lines. They can also read PDF files, and SVG images that contain
+  other SVG images, which renders inside the VM refuse. As inside the VM, a render that runs
+  past its timeout fails with `:timeout`, and one that waits past it for a free worker with
+  `:busy` (see `Typsty.RenderError`). A render that goes over the memory limit fails with
+  `:memory_limit`, and one whose worker crashes, or whose pool stops, before or during the
+  render with `:crashed`. A render can take up to a second longer than its timeout, while
   its worker is stopped.
 
   A pool serves the processes on its own node. A render's template, assigns and files
@@ -210,11 +211,12 @@ defmodule Typsty.Pool do
   end
 
   # Starts the worker program once, the way the workers start, so that a program that can't
-  # run fails here rather than in every render
+  # run fails here rather than in every render. Its stderr is kept with its output, since
+  # that's where it (or the system, for a program that can't load) says what went wrong
   defp check_worker!(executable, args, memory_limit) do
     result =
       try do
-        System.cmd(executable, ["--check" | args])
+        System.cmd(executable, ["--check" | args], stderr_to_stdout: true)
       rescue
         error in ErlangError ->
           reraise RuntimeError,
@@ -224,13 +226,17 @@ defmodule Typsty.Pool do
 
     case result do
       {output, 0} ->
-        if output |> String.split("\n", trim: true) |> List.last() != "typsty_worker #{@protocol_version}" do
+        if "typsty_worker #{@protocol_version}" not in String.split(output, "\n", trim: true) do
           raise "Typsty.Pool's worker program at #{executable} is from another version of Typsty " <>
                   "(it printed #{inspect(output)}). Recompile Typsty with `mix deps.compile typsty --force`"
         end
 
       {_output, @exit_memory_limit} ->
         raise ArgumentError, "the :memory_limit option (#{memory_limit} bytes) is too low for a worker to start"
+
+      {output, @exit_protocol} ->
+        raise "Typsty.Pool's worker program at #{executable} failed to start (it was started wrongly): " <>
+                String.trim(output)
 
       {output, status} ->
         raise "Typsty.Pool's worker program at #{executable} failed to start (#{describe_exit(status)}): " <>
@@ -243,17 +249,22 @@ defmodule Typsty.Pool do
   defp check_memory_limit!(executable, args, memory_limit) do
     port = open_worker(executable, args)
 
-    case warm_up([port]) do
-      %{^port => :ok} ->
-        close(port)
+    try do
+      case warm_up([port]) do
+        %{^port => :ok} ->
+          :ok
 
-      %{^port => {:error, @exit_memory_limit, _why}} ->
-        raise ArgumentError,
-              "the :memory_limit option (#{memory_limit} bytes) is too low for a worker to load the " <>
-                "fonts renders use by default: raise it, or turn :system_fonts off"
+        %{^port => {:error, @exit_memory_limit, _why}} ->
+          raise ArgumentError,
+                "the :memory_limit option (#{memory_limit} bytes) is too low for a worker to load the " <>
+                  "fonts renders use by default: raise it, or turn :system_fonts off"
 
-      %{^port => {:error, _status, why}} ->
-        raise "Typsty.Pool's worker program at #{executable} failed to start (#{why})"
+        %{^port => {:error, _status, why}} ->
+          raise "Typsty.Pool's worker program at #{executable} failed to start (#{why})"
+      end
+    after
+      # The warm-up can fail with the worker still running, when it answers out of step
+      close(port)
     end
   end
 

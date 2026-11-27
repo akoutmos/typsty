@@ -97,6 +97,10 @@ defmodule Typsty.FormatterTest do
     # :line_length is the default
     assert Formatter.format(source, extension: ".typ", line_length: 30) ==
              ~s|#let items = (\n  "first item",\n  "second item",\n)\n|
+
+    words = String.duplicate("word ", 40) |> String.trim()
+    wrapped = Formatter.format(words, extension: ".typ", typst_line_length: 40, typst_wrap_text: true)
+    assert wrapped |> String.split("\n", trim: true) |> length() == 5
   end
 
   test "raises for invalid syntax, pointing at the file" do

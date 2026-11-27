@@ -67,7 +67,7 @@ defmodule Typsty do
   | maps                                      | `dictionary`, with string keys         |
   | `Date`, `Time`, `NaiveDateTime`, `DateTime` | `datetime` (`DateTime` keeps its wall time) |
   | `Decimal`                                 | `decimal`                              |
-  | `MapSet`, `Range`                         | `array`                                |
+  | `MapSet`, `Range`, `Date.Range`           | `array`                                |
   | other structs                             | see `Typsty.Encoder`                   |
 
   The assigns are a map with atom or string keys, and the keys of maps inside the data can be
@@ -84,6 +84,10 @@ defmodule Typsty do
     integer keys sort as text (`"10"` before `"2"`).
   - Keyword lists are lists of tuples, so they become arrays of `(key, value)` pairs; pass
     maps for dictionaries. Charlists are lists of integers too.
+  - A `Date.Range` becomes an array of the dates it steps through, so a template shows a
+    range of days with `.first()` and `.last()`.
+  - A `MapSet` becomes a sorted array: dates, times and decimals in order of their values,
+    anything else in Erlang's term order.
   - Typst's datetimes have no fractions of a second or time zones: times are truncated to
     the second, and a `DateTime` keeps its wall time (convert it to the time zone the
     document should show first).
@@ -177,9 +181,11 @@ defmodule Typsty do
   Typst keeps every file path it sees for the life of the VM, and has room for 65,535 of
   them. Use stable names, like `logo.png` or `photos/1.jpg`, rather than a unique name per
   render: a template that builds paths from data (`image("photos/" + assigns.id)`) uses a new
-  one for every id. Typsty stops a render that reads more than 10,000 different files, and
-  stops renders that need a new path once Typst's table is nearly full, which inside the VM
-  lasts until it restarts. A `Typsty.Pool` replaces a worker whose table is nearly full.
+  one for every id. Typsty stops a render that reads more than 10,000 different files,
+  refuses new names in `:files` once 50,000 different ones have been given over the life of
+  the VM, and stops renders that need a new path once Typst's table is nearly full, which
+  inside the VM lasts until it restarts. A `Typsty.Pool` replaces a worker whose table is
+  nearly full.
   Typst keeps label names and bibliography keys for the life of the VM too, so make labels
   from fixed names, not from data such as ids.
 
@@ -233,15 +239,15 @@ defmodule Typsty do
   - **Files** (in `:files`, or under `:root`) are checked before Typst decodes them, for the
     files known to crash or hang its decoders: images that claim to be enormous, compressed
     SVGs, XML entities and PNG color profiles that expand without bound, SVGs with content
-    far outside their canvas, deeply nested XML, CBOR that declares billions of items,
-    bibliographies whose references cycle or nest deeply, PDFs. Typst decodes many formats
-    with many libraries, though, and the checks can't promise that every hostile file is
-    caught.
-    **Render documents that read files from people you don't trust, such as uploads, in a
-    `Typsty.Pool` with a `:memory_limit`.** Only the files a document reads are checked:
-    data a template turns into bytes itself (`image(bytes(assigns.svg))`) isn't, so pass
-    such data as a file. An SVG can read other files in the project too, by linking them,
-    so don't give documents a `:root` that holds other people's files.
+    far outside their canvas or with turbulence filters that take minutes to draw, deeply
+    nested XML, CBOR that declares billions of items, bibliographies whose references cycle
+    or nest deeply, PDFs. Typst decodes many formats with many libraries, though, and the
+    checks can't promise that every hostile file is caught. **Render documents that read
+    files from people you don't trust, such as uploads, in a `Typsty.Pool` with a
+    `:memory_limit`.** Only the files a document reads are checked: data a template turns
+    into bytes itself (`image(bytes(assigns.svg))`) isn't, so pass such data as a file. An
+    SVG can read other files in the project too, by linking them, so don't give documents a
+    `:root` that holds other people's files.
 
   A template, though, is code. A template that loops forever is stopped at its timeout only
   when it next calls into Typst, and what it does with its data decides how much work it
@@ -597,23 +603,29 @@ defmodule Typsty do
 
   @doc false
   # When cross-compiling (for Nerves, say), the NIF is built for another machine and can't
-  # load where the code compiles: templates are then compiled without checking them
+  # load where the code compiles: templates are then compiled without checking them. The NIF
+  # isn't tried again once it couldn't be loaded, since every try logs the failure
   @spec __native_check__((String.t() -> list()), String.t()) :: list() | :unavailable
   def __native_check__(check, source) do
+    if :persistent_term.get({__MODULE__, :native_unavailable}, false) do
+      :unavailable
+    else
+      native_check(check, source)
+    end
+  end
+
+  defp native_check(check, source) do
     check.(source)
   rescue
     error in [UndefinedFunctionError, ErlangError] ->
       if match?(%UndefinedFunctionError{module: Native}, error) or
            match?(%ErlangError{original: :nif_not_loaded}, error) do
-        # Once per compilation, rather than for every template
-        if not :persistent_term.get({__MODULE__, :warned_unavailable}, false) do
-          :persistent_term.put({__MODULE__, :warned_unavailable}, true)
+        :persistent_term.put({__MODULE__, :native_unavailable}, true)
 
-          IO.warn(
-            "Typsty can't check templates and components, since its NIF couldn't be loaded (cross-compiling?)",
-            []
-          )
-        end
+        IO.warn(
+          "Typsty can't check templates and components, since its NIF couldn't be loaded (cross-compiling?)",
+          []
+        )
 
         :unavailable
       else
