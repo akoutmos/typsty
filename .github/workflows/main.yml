@@ -171,3 +171,51 @@ jobs:
           # Only this step needs the token, to report coverage
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: mix coveralls.github --warnings-as-errors
+
+  examples:
+    name: Examples
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+      # The examples depend on Typsty in the parent directory, and build its NIF from native/
+      # the way the tests do
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+          shared-key: nif
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: examples/deps
+          key: ${{ runner.os }}-examples-deps-v1-${{ hashFiles('examples/mix.lock') }}
+          restore-keys: ${{ runner.os }}-examples-deps-v1-
+      # The packages config/config.exs lists, which don't change once they're published
+      - name: Restore Typst packages cache
+        uses: actions/cache@v4
+        with:
+          path: examples/priv/typst/packages
+          key: typst-packages-v1-${{ hashFiles('examples/config/config.exs') }}
+      - name: Install dependencies
+        run: mix deps.get
+      - name: Download Typst packages
+        run: mix typsty.packages.get
+      - name: ExUnit tests
+        run: mix test --warnings-as-errors
+      # After the tests, which compile Typsty: its formatter plugin needs the NIF
+      - name: Mix Formatter
+        run: mix format --check-formatted

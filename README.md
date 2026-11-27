@@ -39,6 +39,7 @@
 - [Running Typst inside the BEAM](#running-typst-inside-the-beam)
 - [Rendering in separate processes](#rendering-in-separate-processes)
 - [Formatting](#formatting)
+- [Examples](#examples)
 - [Configuration](#configuration)
 - [Building the NIF from source](#building-the-nif-from-source)
 - [Attribution](#attribution)
@@ -670,6 +671,15 @@ your `.formatter.exs`:
 
 To leave a sigil as it is, use the `noformat` modifier:
 `~TYPST"""..."""noformat`. See `Typsty.Formatter` for its options.
+
+## Examples
+
+The [examples](https://github.com/akoutmos/typsty/tree/master/examples)
+directory has documents that web applications commonly generate, with sample
+data: an invoice, a report with charts, a cheat sheet, an account statement,
+event tickets, shipping labels and a certificate. They share components for
+their branding and letterhead, and use packages for charts, QR codes and
+barcodes. See its README to render them.
 
 ## Configuration
 
