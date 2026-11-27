@@ -43,8 +43,8 @@ defmodule Typsty.Pool do
   the render (`:crashed`). A render can take up to a second longer than its timeout, while
   its worker is stopped.
 
-  A pool serves the processes on its own node. A render's template, assigns and files may
-  be at most 4 GiB together.
+  A pool serves the processes on its own node. A render's template, assigns and files
+  (with its components and their files) may be at most 4 GiB together.
 
   ## Options
 
@@ -54,11 +54,12 @@ defmodule Typsty.Pool do
 
   The memory limit counts what a worker allocates: the document being rendered, Typst's
   caches, and the fonts it has loaded, which it keeps (system fonts can be large: an emoji
-  font can take 200 MB). Allow for those, and for the files a render is given, which the
-  worker holds twice while it reads the request; a render whose template, assigns and files
-  are larger than the limit fails without being sent. Each worker keeps its own fonts and
-  caches, so a pool uses up to `size` times as much. The limit doesn't count thread stacks
-  or the allocator's overhead, so the operating system sees somewhat more.
+  font can take 200 MB). Allow for those, and for the files a render is given (its
+  components' files too), which the worker holds twice while it reads the request; a render
+  whose template, assigns and files are larger than the limit fails without being sent.
+  Each worker keeps its own fonts and caches, so a pool uses up to `size` times as much.
+  The limit doesn't count thread stacks or the allocator's overhead, so the operating
+  system sees somewhat more.
 
   A worker drops Typst's caches once they take half of the room left under the limit.
 
@@ -171,7 +172,10 @@ defmodule Typsty.Pool do
     memory_limit = opts[:memory_limit]
     max_renders = opts[:max_renders]
 
-    executable = executable || executable!()
+    executable =
+      executable ||
+        __executable__!(Path.join([:code.priv_dir(:typsty), "native", Typsty.WorkerBuild.executable_name()]))
+
     args = if(memory_limit, do: ["--memory-limit", Integer.to_string(memory_limit)], else: [])
     check_worker!(executable, args, memory_limit)
     if memory_limit, do: check_memory_limit!(executable, args, memory_limit)
@@ -192,9 +196,10 @@ defmodule Typsty.Pool do
     NimblePool.start_link(nimble_opts)
   end
 
-  defp executable! do
-    path = Path.join([:code.priv_dir(:typsty), "native", Typsty.WorkerBuild.executable_name()])
-
+  @doc false
+  # The worker program at the path, which must be there
+  @spec __executable__!(Path.t()) :: Path.t()
+  def __executable__!(path) do
     if File.regular?(path) do
       path
     else
@@ -366,6 +371,12 @@ defmodule Typsty.Pool do
       {^port, {:data, @started}} ->
         await(port, monitors, worker, deadline, timeout)
 
+      # Anything else was sent for an earlier request (after its answer), and would be taken
+      # for this one's: the worker is out of step, and the render goes to another one
+      {^port, {:data, _data}} ->
+        out_of_step()
+        :retry
+
       # The request didn't fit in the memory the worker had left
       {^port, {:exit_status, @exit_memory_limit}} ->
         {:exited,
@@ -483,6 +494,7 @@ defmodule Typsty.Pool do
     receive do
       {^port, _message} ->
         flush(port)
+        out_of_step()
         :remove
     after
       0 -> checkin
@@ -755,11 +767,13 @@ defmodule Typsty.Pool do
 
   # A worker must only answer requests: one that sends anything else is out of step
   def handle_info({port, {:data, _data}}, %{port: port}) do
-    Logger.warning("an idle Typsty.Pool worker sent data it wasn't asked for, and is replaced")
+    out_of_step()
     {:remove, :unexpected}
   end
 
   def handle_info(_message, worker), do: {:ok, worker}
+
+  defp out_of_step, do: Logger.warning("a Typsty.Pool worker sent data it wasn't asked for, and is replaced")
 
   @impl NimblePool
   def terminate_worker(_reason, %{port: port}, pool_state) do

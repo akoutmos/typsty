@@ -6,7 +6,7 @@ defmodule Typsty.PoolFailuresTest do
 
   alias Typsty.Pool
   alias Typsty.RenderError
-  alias Typsty.Test.{FakeWorker, Logs}
+  alias Typsty.Test.{FakeWorker, Helpers, Logs, Telemetry}
 
   @moduletag :pool
   @moduletag :unix
@@ -60,6 +60,8 @@ defmodule Typsty.PoolFailuresTest do
       # on the file system (and its access control lists)
       error = assert_raise RuntimeError, fn -> Pool.start_link(size: 1, __executable__: worker) end
 
+      worker = Regex.escape(worker)
+
       assert Exception.message(error) =~
                ~r/^(Typsty.Pool can't run its worker program at #{worker}: Erlang error: :eacces|Typsty.Pool's worker program at #{worker} failed to start \(it exited with status 13\): )$/
     end
@@ -74,19 +76,35 @@ defmodule Typsty.PoolFailuresTest do
   end
 
   describe "a worker that fails to start" do
-    test "is logged and started again in the background, and renders wait for it", %{tmp_dir: dir} do
-      Logs.forward(~r/a Typsty.Pool worker failed to start/)
+    test "is logged and started again in the background, a second apart", %{tmp_dir: dir} do
+      Logs.forward(~r/a Typsty.Pool worker failed to start/, time: true)
       pool = start_pool(FakeWorker.write!(dir, warm_up: "read_request; exit 3"))
 
-      # Once while the pool starts, then again in the background, a second apart rather than in
-      # a tight loop
-      assert_receive {:log, "a Typsty.Pool worker failed to start (it exited with status 3), and is started again"}
-      assert_receive {:log, "a Typsty.Pool worker failed to start (it exited with status 3)"}, 5_000
-      started = System.monotonic_time(:millisecond)
-      assert_receive {:log, "a Typsty.Pool worker failed to start (it exited with status 3)"}, 5_000
-      assert System.monotonic_time(:millisecond) - started >= 900
+      # Once while the pool starts, then again in the background, a second apart (as logged)
+      # rather than in a tight loop
+      assert_receive {:log, "a Typsty.Pool worker failed to start (it exited with status 3), and is started again",
+                      _time}
+
+      assert_receive {:log, "a Typsty.Pool worker failed to start (it exited with status 3)", first}, 5_000
+      assert_receive {:log, "a Typsty.Pool worker failed to start (it exited with status 3)", second}, 5_000
+      assert second - first >= 900_000
 
       assert {:error, %RenderError{reason: :busy}} = render(pool, timeout: 100)
+    end
+
+    test "is replaced by one that renders, once one starts", %{tmp_dir: dir} do
+      Logs.forward(~r/a Typsty.Pool worker failed to start/)
+
+      # The first worker fails its warm-up, and the ones after it start
+      started = Path.join(dir, "started")
+
+      warm_up =
+        ~s(if [ -e "#{started}" ]; then read_request; started; answer; else touch "#{started}"; read_request; exit 3; fi)
+
+      pool = start_pool(FakeWorker.write!(dir, warm_up: warm_up))
+
+      assert_receive {:log, "a Typsty.Pool worker failed to start (it exited with status 3), and is started again"}
+      assert render(pool, timeout: 10_000) == {:ok, ["<svg>fake</svg>"]}
     end
 
     test "because it answered out of step is started again", %{tmp_dir: dir} do
@@ -163,7 +181,10 @@ defmodule Typsty.PoolFailuresTest do
     test "waiting for its worker to take it fails when the pool stops", %{tmp_dir: dir} do
       pool = start_pool(FakeWorker.write!(dir, then: "read_request; wait_for_close"))
       task = Task.async(fn -> render(pool, timeout: 60_000) end)
-      wait_until(fn -> Process.info(task.pid, :current_function) == {:current_function, {Pool, :await_start, 6}} end)
+
+      assert Helpers.wait_until(fn ->
+               Process.info(task.pid, :current_function) == {:current_function, {Pool, :await_start, 6}}
+             end)
 
       stop_supervised!(pool)
 
@@ -173,12 +194,19 @@ defmodule Typsty.PoolFailuresTest do
     end
 
     test "leaves no messages from its worker behind, even if the worker sends more than its answer", %{tmp_dir: dir} do
-      # Written with its answer, so that both arrive together
-      extra = Path.join(dir, "extra")
-      File.write!(extra, FakeWorker.frame({:ok, ["<svg>extra</svg>"], []}))
+      # The answer and another one in one write (of less than a pipe's atomic size), so that
+      # they arrive together, before the port goes back to the pool
+      both = Path.join(dir, "both")
+
+      File.write!(
+        both,
+        FakeWorker.frame({:ok, ["<svg>fake</svg>"], []}) <> FakeWorker.frame({:ok, ["<svg>extra</svg>"], []})
+      )
 
       pool =
-        start_pool(FakeWorker.write!(dir, then: ~s(read_request; started; cat "$reply" "#{extra}"; wait_for_close)))
+        start_pool(
+          FakeWorker.write!(dir, then: ~s(read_request; started; { cat "#{both}" || exit 0; }; wait_for_close))
+        )
 
       # The extra answer comes here or goes to the pool, depending on when it arrives: either
       # way, the caller doesn't get it, and the worker, which is out of step, is replaced
@@ -189,25 +217,56 @@ defmodule Typsty.PoolFailuresTest do
       end
     end
 
+    test "never gets an answer its worker sent for another one", %{tmp_dir: dir} do
+      Logs.forward(~r/sent data it wasn't asked for/)
+
+      # A worker that sends another answer a moment after each one, when the next render
+      # (queued for the only worker) has taken it
+      extra = FakeWorker.printf({:ok, ["<svg>extra</svg>"], []})
+      then = ~s(while true; do read_request; started; answer; sleep 0.05; #{extra}; done)
+      pool = start_pool(FakeWorker.write!(dir, then: then))
+
+      results =
+        1..12
+        |> Task.async_stream(fn _render -> render(pool, timeout: 30_000) end, max_concurrency: 3, timeout: :infinity)
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      # Out-of-step workers are replaced, and renders go to others, which can run out of
+      # attempts: what matters is that none gets the other answer
+      refute {:ok, ["<svg>extra</svg>"]} in results
+      assert {:ok, ["<svg>fake</svg>"]} in results
+
+      assert Enum.all?(
+               results,
+               &(&1 == {:ok, ["<svg>fake</svg>"]} or match?({:error, %RenderError{reason: :crashed}}, &1))
+             )
+
+      assert_receive {:log, "a Typsty.Pool worker sent data it wasn't asked for, and is replaced"}
+    end
+
     test "whose worker doesn't take it is stopped once the timeout passes", %{tmp_dir: dir} do
-      pool = start_pool(FakeWorker.write!(dir, then: "read_request; wait_for_close"))
+      pid_file = Path.join(dir, "pid")
+      pool = start_pool(FakeWorker.write!(dir, then: "read_request; wait_for_close", pid_file: pid_file))
 
       assert {:error, %RenderError{reason: :timeout, diagnostics: [%{message: message}]}} = render(pool, timeout: 100)
       assert message == "rendering didn't finish within the timeout (100 ms), and its worker was stopped"
+      assert Helpers.wait_until(fn -> not running?(pid_file) end)
     end
 
     test "whose worker takes it but never answers is stopped once the timeout passes", %{tmp_dir: dir} do
-      pool = start_pool(FakeWorker.write!(dir, then: "read_request; started; wait_for_close"))
+      pid_file = Path.join(dir, "pid")
+      pool = start_pool(FakeWorker.write!(dir, then: "read_request; started; wait_for_close", pid_file: pid_file))
 
       {elapsed, result} = :timer.tc(fn -> render(pool, timeout: 100) end, :millisecond)
       assert {:error, %RenderError{reason: :timeout}} = result
 
-      # The worker gets a grace period to stop the render itself
+      # The worker gets a grace period to stop the render itself, and is then stopped
       assert elapsed >= 1_100
+      assert Helpers.wait_until(fn -> not running?(pid_file) end)
     end
 
     test "whose worker exits after answering is answered, and the next one gets a new worker", %{tmp_dir: dir} do
-      pool = start_pool(FakeWorker.write!(dir, then: ~s(read_request; started; cat "$reply"; exit 0)))
+      pool = start_pool(FakeWorker.write!(dir, then: ~s(read_request; started; answer; exit 0)))
 
       assert render(pool) == {:ok, ["<svg>fake</svg>"]}
       assert render(pool) == {:ok, ["<svg>fake</svg>"]}
@@ -217,13 +276,11 @@ defmodule Typsty.PoolFailuresTest do
       warning = %Typsty.Diagnostic{severity: :warning, message: "unknown font family: x", line: 2, column: 3}
       pool = start_pool(FakeWorker.write!(dir, reply: {:ok, ["<svg/>"], [warning]}))
 
-      :telemetry.attach("fake-#{inspect(self())}", [:typsty, :render, :stop], &__MODULE__.send_stop/4, self())
-      on_exit(fn -> :telemetry.detach("fake-#{inspect(self())}") end)
+      source = "A render with a warning"
+      Telemetry.forward_stops(source)
 
-      assert {:ok, ["<svg/>"]} = Typsty.to_svg("Hello", %{}, pool: pool)
-
-      assert_receive {:stop,
-                      %{template: %{source: "Hello"}, diagnostics: [%{message: "unknown font family: x", line: 2}]}}
+      assert {:ok, ["<svg/>"]} = Typsty.to_svg(source, %{}, pool: pool)
+      assert_receive {:stop, %{diagnostics: [%{message: "unknown font family: x", line: 2}]}}
     end
   end
 
@@ -232,7 +289,7 @@ defmodule Typsty.PoolFailuresTest do
       Logs.forward(~r/sent data it wasn't asked for/)
       start_pool(FakeWorker.write!(dir, then: "sleep 0.2; printf '\\000\\000\\000\\001x'; wait_for_close"))
 
-      assert_receive {:log, "an idle Typsty.Pool worker sent data it wasn't asked for, and is replaced"}, 5_000
+      assert_receive {:log, "a Typsty.Pool worker sent data it wasn't asked for, and is replaced"}, 5_000
     end
 
     test "that exits is replaced, with a warning unless it retired itself", %{tmp_dir: dir} do
@@ -242,21 +299,16 @@ defmodule Typsty.PoolFailuresTest do
 
       # A worker exits with status 0 when it retires (with its table of file paths nearly
       # full, say), which isn't worth a warning. The replacement answers renders
-      pool = start_pool(FakeWorker.write!(dir, then: ~s(read_request; started; cat "$reply"; exit 0)))
+      pool = start_pool(FakeWorker.write!(dir, then: ~s(read_request; started; answer; exit 0)))
       assert render(pool) == {:ok, ["<svg>fake</svg>"]}
       refute_receive {:log, "an idle Typsty.Pool worker exited (it exited with status 0)" <> _}, 300
       assert render(pool) == {:ok, ["<svg>fake</svg>"]}
     end
   end
 
-  @doc false
-  def send_stop(_event, _measurements, metadata, test), do: send(test, {:stop, metadata})
-
-  defp wait_until(condition, tries \\ 500) do
-    cond do
-      condition.() -> :ok
-      tries == 0 -> flunk("the condition never held")
-      true -> Process.sleep(10) && wait_until(condition, tries - 1)
-    end
+  # Whether the fake worker whose pid is in the file still runs
+  defp running?(pid_file) do
+    {_output, status} = System.cmd("kill", ["-0", pid_file |> File.read!() |> String.trim()], stderr_to_stdout: true)
+    status == 0
   end
 end
