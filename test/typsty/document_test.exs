@@ -4,6 +4,8 @@ defmodule Typsty.DocumentTest do
   alias Typsty.{RenderError, SyntaxError, Template}
   alias Typsty.Test.{Greeting, Invoice, Receipt}
 
+  import Typsty.Test.Helpers, only: [compile!: 3]
+
   describe "a module with render/1" do
     test "renders the ~TYPST sigil with the assigns render/1 computed" do
       assert {:ok, "%PDF-" <> _} = Greeting.to_pdf(%{name: "World", items: ["one", "two"]})
@@ -265,11 +267,5 @@ defmodule Typsty.DocumentTest do
         NotATemplate.to_pdf(%{})
       end
     end
-  end
-
-  defp compile!(dir, name, source) do
-    file = Path.join(dir, name)
-    File.write!(file, source)
-    Code.compile_file(file)
   end
 end

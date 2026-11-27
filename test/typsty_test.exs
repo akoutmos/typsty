@@ -3,6 +3,8 @@ defmodule TypstyTest do
 
   alias Typsty.{Diagnostic, RenderError, Template}
 
+  import Typsty.Test.Helpers, only: [png_size: 1]
+
   # A 1x1 transparent PNG
   @png Base.decode64!("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
 
@@ -518,8 +520,6 @@ defmodule TypstyTest do
              ]
     end
   end
-
-  defp png_size(<<137, "PNG", _::binary-size(12), width::32, height::32, _::binary>>), do: {width, height}
 
   defp tmp_dir!(name) do
     dir = Path.join([System.tmp_dir!(), "typsty_test", "#{name}_#{System.unique_integer([:positive])}"])

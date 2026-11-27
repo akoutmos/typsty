@@ -12,18 +12,28 @@ defmodule Typsty.Test.FakeWorker do
   - `:check` - shell code for `--check` (by default, it prints the protocol version)
   - `:warm_up` - shell code for the warm-up render (by default, it answers it)
   - `:then` - shell code for what comes after (by default, it answers every render with
-    `reply`)
+    `reply`). The script defines `read_request`, `started` (which acknowledges a request),
+    `answer` (which sends `reply`) and `wait_for_close`
   - `:reply` - what renders are answered with
   - `:executable` - whether the script can be run (true by default)
+  - `:pid_file` - a file it writes its OS pid to
+
+  The script's standard error goes nowhere, so that its complaints about writing to a
+  closed port don't end up in the tests' output (and so that a script the pool left behind
+  doesn't hold the VM's standard error open).
   """
   def write!(dir, opts \\ []) do
     path = Path.join(dir, "fake_worker_#{System.unique_integer([:positive])}")
     reply = Path.join(dir, "reply_#{System.unique_integer([:positive])}")
     File.write!(reply, frame(Keyword.get(opts, :reply, {:ok, ["<svg>fake</svg>"], []})))
 
+    pid_file = if opts[:pid_file], do: ~s(echo $$ > "#{opts[:pid_file]}"), else: ""
+
     File.write!(path, """
     #!/bin/sh
+    exec 2>/dev/null
     reply="#{reply}"
+    #{pid_file}
 
     if [ "$1" = "--check" ]; then
       #{Keyword.get(opts, :check, ~s(echo "typsty_worker 1"; exit 0))}
@@ -36,15 +46,20 @@ defmodule Typsty.Test.FakeWorker do
       dd bs=1 count="$length" of=/dev/null 2>/dev/null
     }
 
-    # Acknowledges a request: `started`, as a UTF-8 atom
-    started() { printf '\\000\\000\\000\\012\\203\\167\\007started'; }
+    # Acknowledges a request: `started`, as a UTF-8 atom. The VM ignores SIGPIPE, as does
+    # what it starts, so writing to a closed port fails rather than ending the script: a
+    # write that fails ends it, which ends a script left behind once the VM is gone
+    started() { printf '\\000\\000\\000\\012\\203\\167\\007started' || exit 0; }
+
+    # Answers a request with `reply`
+    answer() { cat "$reply" || exit 0; }
 
     # Waits until the pool closes the port
     wait_for_close() { dd bs=1 count=1 of=/dev/null 2>/dev/null; exit 0; }
 
-    #{Keyword.get(opts, :warm_up, ~s(read_request; started; cat "$reply"))}
+    #{Keyword.get(opts, :warm_up, "read_request; started; answer")}
 
-    #{Keyword.get(opts, :then, ~s(while true; do read_request; started; cat "$reply"; done))}
+    #{Keyword.get(opts, :then, "while true; do read_request; started; answer; done")}
     """)
 
     File.chmod!(path, if(Keyword.get(opts, :executable, true), do: 0o755, else: 0o644))
@@ -55,34 +70,9 @@ defmodule Typsty.Test.FakeWorker do
   def frame(term) when not is_binary(term), do: frame(:erlang.term_to_binary(term))
   def frame(binary), do: <<byte_size(binary)::32, binary::binary>>
 
-  @doc "Shell code that prints a frame with the term, as a worker sends it."
+  @doc "Shell code that prints a frame with the term, as a worker sends it (or ends the script)."
   def printf(term) do
     octal = for <<byte <- frame(term)>>, into: "", do: "\\" <> String.pad_leading(Integer.to_string(byte, 8), 3, "0")
-    "printf '#{octal}'"
-  end
-end
-
-defmodule Typsty.Test.Logs do
-  @moduledoc false
-  # Forwards the messages logged while a test runs that match a pattern to the test's
-  # process, as {:log, message}: logs from the pool's processes, say, which a test can then
-  # wait for
-
-  def forward(pattern) do
-    id = :"typsty_test_logs_#{System.unique_integer([:positive])}"
-    :ok = :logger.add_handler(id, __MODULE__, %{config: %{pid: self(), pattern: pattern}})
-    ExUnit.Callbacks.on_exit(fn -> :logger.remove_handler(id) end)
-  end
-
-  @doc false
-  def log(%{msg: msg}, %{config: %{pid: pid, pattern: pattern}}) do
-    message =
-      case msg do
-        {:string, chardata} -> IO.chardata_to_string(chardata)
-        {:report, report} -> inspect(report)
-        {format, args} -> format |> :io_lib.format(args) |> IO.chardata_to_string()
-      end
-
-    if message =~ pattern, do: send(pid, {:log, message})
+    "{ printf '#{octal}' || exit 0; }"
   end
 end

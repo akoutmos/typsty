@@ -6,7 +6,10 @@ defmodule Typsty.Test.HTTPServer do
   # answered with what the handler returns for it:
   #
   # - {status, body}: the body, with its length
-  # - {:repeat, status, chunk, count}: the chunk, count times, with their whole length
+  # - {:repeat, status, chunk, count}: the chunk, count times, with their whole length, and
+  #   then {:sent, port, chunks} to the test, with the number of chunks sent before the
+  #   client stopped reading
+  # - {:redirect, location}: a 302 to the location
   # - :close: no answer, the connection is closed
 
   def start(handler) do
@@ -62,7 +65,11 @@ defmodule Typsty.Test.HTTPServer do
         end)
 
       send(test, {:request, port, method, target, headers})
-      respond(socket, handler.(method, target, headers))
+
+      case respond(socket, handler.(method, target, headers)) do
+        {:sent, chunks} -> send(test, {:sent, port, chunks})
+        _sent -> :ok
+      end
     end
 
     :gen_tcp.close(socket)
@@ -75,6 +82,10 @@ defmodule Typsty.Test.HTTPServer do
     end
   end
 
+  defp respond(socket, {:redirect, location}) do
+    :gen_tcp.send(socket, "HTTP/1.1 302 Found\r\nlocation: #{location}\r\ncontent-length: 0\r\n\r\n")
+  end
+
   defp respond(socket, {status, body}) do
     :gen_tcp.send(socket, [head(status, byte_size(body)), body])
   end
@@ -82,16 +93,19 @@ defmodule Typsty.Test.HTTPServer do
   # The client may stop reading partway, which ends the response
   defp respond(socket, {:repeat, status, chunk, count}) do
     with :ok <- :gen_tcp.send(socket, head(status, byte_size(chunk) * count)) do
-      send_chunks(socket, chunk, count)
+      {:sent, send_chunks(socket, chunk, count, 0)}
     end
   end
 
   defp respond(_socket, :close), do: :ok
 
-  defp send_chunks(_socket, _chunk, 0), do: :ok
+  defp send_chunks(_socket, _chunk, 0, sent), do: sent
 
-  defp send_chunks(socket, chunk, count) do
-    with :ok <- :gen_tcp.send(socket, chunk), do: send_chunks(socket, chunk, count - 1)
+  defp send_chunks(socket, chunk, count, sent) do
+    case :gen_tcp.send(socket, chunk) do
+      :ok -> send_chunks(socket, chunk, count - 1, sent + 1)
+      {:error, _closed} -> sent
+    end
   end
 
   defp head(status, length) do

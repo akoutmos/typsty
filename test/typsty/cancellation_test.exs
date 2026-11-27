@@ -3,6 +3,8 @@ defmodule Typsty.CancellationTest do
   # :max_concurrent_renders config, so they run on their own
   use ExUnit.Case, async: false
 
+  alias Typsty.Test.Helpers
+
   alias Typsty.RenderError
 
   setup do
@@ -85,7 +87,7 @@ defmodule Typsty.CancellationTest do
 
   test "a render is cancelled when the process waiting for it exits" do
     caller = spawn(fn -> Typsty.to_pdf(long_document(), %{}, timeout: :infinity) end)
-    assert wait_until(fn -> Typsty.running_renders() == 1 end)
+    assert Helpers.wait_until(fn -> Typsty.running_renders() == 1 end)
 
     Process.exit(caller, :kill)
     assert wait_until_idle(2_000) == 0
@@ -99,7 +101,7 @@ defmodule Typsty.CancellationTest do
     renders =
       for _ <- 1..(schedulers * 2), do: Task.async(fn -> Typsty.to_pdf(long_document(), %{}, timeout: 10_000) end)
 
-    assert wait_until(fn -> Typsty.running_renders() == schedulers * 2 end)
+    assert Helpers.wait_until(fn -> Typsty.running_renders() == schedulers * 2 end)
 
     # Checking syntax runs on a dirty CPU scheduler, which is free
     {micros, :ok} = :timer.tc(fn -> Typsty.validate("= Hello") end)
@@ -107,14 +109,6 @@ defmodule Typsty.CancellationTest do
 
     Enum.each(renders, &Task.shutdown(&1, :brutal_kill))
     assert wait_until_idle() == 0
-  end
-
-  defp wait_until(fun, tries \\ 500) do
-    cond do
-      fun.() -> true
-      tries == 0 -> false
-      true -> Process.sleep(10) && wait_until(fun, tries - 1)
-    end
   end
 
   test "the limit must be a positive integer" do

@@ -6,6 +6,8 @@ defmodule Typsty.PDFTest do
   alias Typsty.RenderError
   alias Typsty.Test.PDF
 
+  import Typsty.Test.Helpers, only: [png_size: 1]
+
   describe "pages" do
     test "there's a page for each page break, as there's a PNG and an SVG for each" do
       source = ~S|#for i in range(assigns.pages) { if i > 0 { pagebreak() }; [Page #(i + 1)] }|
@@ -119,20 +121,19 @@ defmodule Typsty.PDFTest do
     end
 
     test "without a date, is the same every time it's rendered" do
-      dated = "Hello"
       undated = "#set document(date: none)\nHello"
-
-      {:ok, dated_pdf} = Typsty.to_pdf(dated)
-      {:ok, undated_pdf} = Typsty.to_pdf(undated)
+      assert {:ok, undated_pdf} = Typsty.to_pdf(undated)
       refute undated_pdf =~ "CreationDate"
       refute undated_pdf =~ "xmp:CreateDate"
-
-      # In another second, the date changes, and nothing else does
-      Process.sleep(1_100)
       assert Typsty.to_pdf(undated) == {:ok, undated_pdf}
-      assert {:ok, later} = Typsty.to_pdf(dated)
-      assert later != dated_pdf
-      assert byte_size(later) == byte_size(dated_pdf)
+
+      # PDFs from different times differ in their dates, and in nothing else but their ID,
+      # which is a hash of their content
+      dated = "#set document(date: assigns.date)\nHello"
+      assert {:ok, first} = Typsty.to_pdf(dated, %{date: ~U[2026-03-04 05:06:07Z]})
+      assert {:ok, second} = Typsty.to_pdf(dated, %{date: ~U[2026-03-04 05:06:08Z]})
+      assert first != second
+      assert without_dates(first) == without_dates(second)
     end
   end
 
@@ -269,5 +270,12 @@ defmodule Typsty.PDFTest do
     end
   end
 
-  defp png_size(<<137, "PNG", _::binary-size(12), width::32, height::32, _rest::binary>>), do: {width, height}
+  # The PDF with its dates (in its info dictionary and its XMP metadata) and its ID (in its
+  # trailer and its XMP metadata) blanked out
+  defp without_dates(pdf) do
+    pdf
+    |> String.replace(~r/D:\d{14}Z|\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ/, "DATE")
+    |> String.replace(~r"<xmpMM:(InstanceID|DocumentID)>[^<]*<", "<xmpMM:\\1>ID<")
+    |> String.replace(~r"/ID\[[^\]]*\]", "/ID[]")
+  end
 end
