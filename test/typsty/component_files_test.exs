@@ -278,7 +278,9 @@ defmodule Typsty.ComponentFilesTest do
     end
 
     test "works wherever the project is, whatever its folders' names", %{tmp_dir: dir} do
-      project = Path.join(dir, "we[ir]d {project} *")
+      # Characters a wildcard pattern would take for its own, but Windows doesn't allow * in a name
+      name = if match?({:win32, _}, :os.type()), do: "we[ir]d {project}", else: "we[ir]d {project} *"
+      project = Path.join(dir, name)
       File.mkdir_p!(Path.join(project, "seal/inner"))
       File.write!(Path.join(project, "seal/round.svg"), "<svg/>")
       File.write!(Path.join(project, "seal/inner/square.svg"), "<svg/>")
