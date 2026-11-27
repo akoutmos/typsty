@@ -1,13 +1,14 @@
 defmodule Typsty.SyntaxError do
   @moduledoc """
-  A template has invalid Typst syntax, or a component has something that components can't
-  have (see `Typsty.Component`). Raised when a module with a `~TYPST` sigil or a `.typ`
-  template is compiled, so that the problem fails the build instead of a render, and when
-  `mix format` formats one with `Typsty.Formatter`.
+  A template has invalid Typst syntax, or a component breaks the rules for components (see
+  `Typsty.Component`). Raised when a module with a `~TYPST` sigil or a `.typ` template is
+  compiled (or a component, with the `.typ` files in its folder), so that the problem fails
+  the build instead of a render, and when `mix format` formats one with `Typsty.Formatter`.
 
   `:diagnostics` has every problem in the template, and `:file`, `:line` and `:column` point
-  at the first one. `:kind` is `:syntax` for syntax errors, and `:component` for what a
-  component can't have.
+  at the first one. `:kind` is `:syntax` for syntax errors, and `:component` for breaking
+  the rules for components: content at their top level, reading `sys.inputs`, or reading a
+  file they don't have.
   """
 
   defexception [:file, :line, :column, :snippet, diagnostics: [], kind: :syntax]

@@ -2,8 +2,9 @@ defmodule Typsty.Template do
   @moduledoc """
   A Typst template with the assigns to render it with.
 
-  The `~TYPST` sigil and the `render/1` of a document module return this struct. Pass it to
-  `Typsty.to_pdf/3`, `Typsty.to_png/3` or `Typsty.to_svg/3` to render it.
+  The `~TYPST` sigil and the `render/1` of a document module return this struct, as does a
+  component's `render/0` (see `Typsty.Component`). Pass a template to `Typsty.to_pdf/3`,
+  `Typsty.to_png/3` or `Typsty.to_svg/3` to render it.
 
   - `:source` - the Typst source.
   - `:assigns` - the assigns to render it with, which the template reads from its `assigns`

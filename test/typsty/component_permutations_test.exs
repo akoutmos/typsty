@@ -33,6 +33,9 @@ defmodule Typsty.ComponentPermutationsTest do
 
   alias Typsty.ComponentPermutationsTest.{BadgeA, BadgeB, Branded}
   alias Typsty.{Diagnostic, RenderError}
+  alias Typsty.Test.Telemetry
+
+  import Typsty.Test.Helpers, only: [position: 2]
 
   alias Typsty.Test.{
     AnnualReport,
@@ -76,7 +79,8 @@ defmodule Typsty.ComponentPermutationsTest do
       assert Greeting.__typsty_components__() == []
 
       assigns = %{name: "World", items: ["one"]}
-      assert Greeting.to_svg(assigns, components: []) == Greeting.to_svg(assigns)
+      assert {:ok, _svgs} = expected = Greeting.to_svg(assigns)
+      assert Greeting.to_svg(assigns, components: []) == expected
       assert {:ok, [_svg]} = Greeting.to_svg(assigns, components: [Brand])
     end
 
@@ -203,15 +207,12 @@ defmodule Typsty.ComponentPermutationsTest do
     test "render the same as the components' code inline" do
       imported = @no_date <> ~s|#import "components/totals.typ": totals\n#totals(assigns.items, currency: "€")|
 
+      # The three components' sources, one after the other, without the imports between them
+      totals = "test/support/components/totals.typ" |> File.read!() |> String.replace(~r/^#import .*\n/m, "")
+
       inline =
         @no_date <>
-          """
-          #let money(amount, currency: "$") = [#currency#calc.round(amount, digits: 2)]
-          #let blue = rgb("#1a4d8f")
-          #let total(items) = items.map(item => item.price).sum(default: 0)
-          #let totals(items, currency: "$") = text(fill: blue)[*Total:* #money(total(items), currency: currency)]
-          #totals(assigns.items, currency: "€")
-          """
+          Money.render().source <> Brand.render().source <> totals <> ~s|#totals(assigns.items, currency: "€")|
 
       for format <- @formats do
         assert render!(format, imported, %{items: @items}, components: [Totals]) ==
@@ -332,9 +333,6 @@ defmodule Typsty.ComponentPermutationsTest do
 
   describe "PDF output from components" do
     test "embeds the fonts components use, and keeps their links to allowed URLs" do
-      :telemetry.attach("links-#{inspect(self())}", [:typsty, :render, :stop], &__MODULE__.send_stop/4, self())
-      on_exit(fn -> :telemetry.detach("links-#{inspect(self())}") end)
-
       source = """
       #import "components/extras.typ": mono, site
       Plain text, #mono[code],
@@ -342,6 +340,8 @@ defmodule Typsty.ComponentPermutationsTest do
       #site("mailto:hello@example.com")[mail],
       #site("javascript:alert(1)")[a script]
       """
+
+      Telemetry.forward_stops(source)
 
       assert {:ok, pdf} = Typsty.to_pdf(source, %{}, components: [Extras])
       assert "DejaVuSansMono" in PDF.fonts(pdf)
@@ -355,15 +355,16 @@ defmodule Typsty.ComponentPermutationsTest do
 
   describe "warnings and errors in components" do
     test "warnings point at the line in the component" do
-      :telemetry.attach("warnings-#{inspect(self())}", [:typsty, :render, :stop], &__MODULE__.send_stop/4, self())
-      on_exit(fn -> :telemetry.detach("warnings-#{inspect(self())}") end)
-
       source = ~s|#import "components/extras.typ": fancy\n#fancy[Hello]|
+      Telemetry.forward_stops(source)
       assert {:ok, _svg} = Typsty.to_svg(source, %{}, components: [Extras])
 
       assert_receive {:stop, %{template: %{source: ^source}, diagnostics: [warning]}}
       assert warning.message == "unknown font family: no such font"
-      assert {warning.file, warning.line, warning.column} == {"test/support/components/extras.ex", 9, 35}
+      extras = "test/support/components/extras.ex"
+
+      assert {warning.file, warning.line, warning.column} ==
+               Tuple.insert_at(position(extras, ~s|"No Such Font"|), 0, extras)
     end
 
     test "errors in a component that another one uses point at it, through the calls that led there" do
@@ -371,10 +372,12 @@ defmodule Typsty.ComponentPermutationsTest do
 
       assert {:error, %RenderError{diagnostics: [diagnostic]}} = Typsty.to_pdf(source, %{}, components: [Totals])
       assert diagnostic.message =~ "expected integer, float, or decimal, found string"
-      assert {diagnostic.file, diagnostic.line} == {"test/support/components/money.ex", 7}
+      {money_line, _column} = position("test/support/components/money.ex", "#let money")
+      {totals_line, _column} = position("test/support/components/totals.typ", "#money(")
+      assert {diagnostic.file, diagnostic.line} == {"test/support/components/money.ex", money_line}
 
       assert Enum.map(diagnostic.trace, &{&1.file, &1.line}) == [
-               {"test/support/components/totals.typ", 7},
+               {"test/support/components/totals.typ", totals_line},
                {nil, 3}
              ]
     end
@@ -384,17 +387,25 @@ defmodule Typsty.ComponentPermutationsTest do
 
       assert {:error, %RenderError{diagnostics: [diagnostic]}} = AnnualReport.to_pdf(assigns)
       assert diagnostic.message =~ ~s(dictionary does not contain key "price")
-      assert {diagnostic.file, diagnostic.line} == {"test/support/components/report.typ", 14}
-      assert %{file: "test/support/documents/annual_report.typ", line: 6} = List.last(diagnostic.trace)
+      {summarize, _column} = position("test/support/components/report.typ", "#let summarize")
+      {call, _column} = position("test/support/documents/annual_report.typ", "#summarize(")
+      assert {diagnostic.file, diagnostic.line} == {"test/support/components/report.typ", summarize}
+      assert %{file: "test/support/documents/annual_report.typ", line: ^call} = List.last(diagnostic.trace)
     end
 
     test "a document's template rendered on its own needs its components given" do
       template = Statement.render(@statement)
 
-      assert {:error, %RenderError{diagnostics: [%Diagnostic{message: message}]}} = Typsty.to_svg(template)
+      assert {:error, %RenderError{diagnostics: [%Diagnostic{message: message, hints: hints}]}} =
+               Typsty.to_svg(template)
+
       assert message =~ "/components/letterhead.typ is not one of the render's components"
 
-      assert Typsty.to_svg(template, %{}, components: [Letterhead, Tables]) == Statement.to_svg(@statement)
+      assert List.last(hints) =~
+               "only gets the components given with the :components option, not the ones a document module lists"
+
+      assert {:ok, _svgs} = expected = Statement.to_svg(@statement)
+      assert Typsty.to_svg(template, %{}, components: [Letterhead, Tables]) == expected
     end
   end
 
@@ -431,7 +442,8 @@ defmodule Typsty.ComponentPermutationsTest do
             {badge, render!(:svg, source, %{}, components: [badge])}
           end,
           max_concurrency: 8,
-          ordered: false
+          ordered: false,
+          timeout: :infinity
         )
         |> Enum.map(fn {:ok, result} -> result end)
 
@@ -462,20 +474,21 @@ defmodule Typsty.ComponentPermutationsTest do
 
     test "document modules with components render what they render inside the VM", %{pool: pool} do
       assigns = %{title: "Report", authors: ["Ada"], items: @items, currency: "$"}
-      assert AnnualReport.to_pdf(assigns, pool: pool) == AnnualReport.to_pdf(assigns)
-      assert Statement.to_svg(@statement, pool: pool) == Statement.to_svg(@statement)
+      assert {:ok, "%PDF-" <> _} = report = AnnualReport.to_pdf(assigns)
+      assert AnnualReport.to_pdf(assigns, pool: pool) == report
+      assert {:ok, _svgs} = statement = Statement.to_svg(@statement)
+      assert Statement.to_svg(@statement, pool: pool) == statement
     end
 
     test "errors in components point at the same lines as inside the VM", %{pool: pool} do
       source = ~s|#import "components/totals.typ": totals\n#totals(((name: "x", price: "a"),))|
 
-      assert Typsty.to_pdf(source, %{}, components: [Totals], pool: pool) ==
-               Typsty.to_pdf(source, %{}, components: [Totals])
+      assert {:error, %RenderError{diagnostics: [%{file: "test/support/components/money.ex"}]}} =
+               expected = Typsty.to_pdf(source, %{}, components: [Totals])
+
+      assert Typsty.to_pdf(source, %{}, components: [Totals], pool: pool) == expected
     end
   end
-
-  @doc false
-  def send_stop(_event, _measurements, metadata, test), do: send(test, {:stop, metadata})
 
   defp assert_renders(source, assigns, opts) do
     case Typsty.to_svg(source, assigns, opts) do

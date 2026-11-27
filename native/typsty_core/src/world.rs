@@ -289,13 +289,7 @@ impl TypstyWorld {
             // The directory is reserved for the components given to the render, which are in
             // `files`
             VirtualRoot::Project if is_component_path(id.vpath().get_with_slash()) => {
-                return Err(FileError::Other(Some(
-                    format!(
-                        "{} is not one of the render's components, or one of their files (components/ only has the components given to the render, and their files). Add the component's module to `use Typsty, components: [...]`, or to the :components option",
-                        id.vpath().get_with_slash()
-                    )
-                    .into(),
-                )));
+                return Err(not_a_component(id));
             }
             VirtualRoot::Project => {
                 let root = self.root.as_ref().ok_or_else(|| {
@@ -325,6 +319,12 @@ impl TypstyWorld {
                 id.vpath().get_with_slash()
             )
         })?;
+
+        // What's reserved is the directory on disk: on a file system that ignores case,
+        // /Components/x is components/x too, as is a path through a symbolic link to it
+        if matches!(id.root(), VirtualRoot::Project) && in_components_dir(&path, root.path()) {
+            return Err(not_a_component(id));
+        }
 
         read_regular_file(&path).map(Bytes::new)
     }
@@ -531,6 +531,31 @@ fn given_file(path: &str) -> Result<FileId, PrepareError> {
 /// which only has the components given to the render.
 fn is_component_path(path: &str) -> bool {
     path.starts_with("/components/")
+}
+
+/// Whether a file's real path (see `confine`) is in the root's `components/` directory, as
+/// it's named on disk.
+fn in_components_dir(real: &Path, root: &Path) -> bool {
+    std::fs::canonicalize(root)
+        .ok()
+        .and_then(|real_root| {
+            real.strip_prefix(real_root)
+                .ok()?
+                .components()
+                .next()
+                .map(|first| first.as_os_str() == "components")
+        })
+        .unwrap_or(false)
+}
+
+fn not_a_component(id: FileId) -> FileError {
+    FileError::Other(Some(
+        format!(
+            "{} is not one of the render's components, or one of their files (components/ only has the components given to the render, and their files). Add the component's module to `use Typsty, components: [...]`, or to the :components option",
+            id.vpath().get_with_slash()
+        )
+        .into(),
+    ))
 }
 
 /// Typst's parser doesn't skip a byte order mark, which would become part of the first line.

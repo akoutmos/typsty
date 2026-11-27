@@ -105,7 +105,8 @@ defmodule Typsty do
   ```
 
   `assigns` is bound at the top of the template, like a `let` binding, so it's only visible
-  in the template itself. Pass the files it imports, such as components, the values they
+  in the template itself. Pass the files it imports, such as components (see
+  `Typsty.Component`), the values they
   need as arguments, which keeps them independent of where their data comes from:
 
   ```typst
@@ -167,8 +168,9 @@ defmodule Typsty do
   ```
 
   Paths are relative to the project root (`"logo.png"` and `"/logo.png"` are the same file),
-  `main.typ` is the template itself, and `components/` is reserved for components. To also
-  read files from a directory, set `:root`; files given with `:files` take precedence.
+  `main.typ` is the template itself, and `components/` is reserved for components: `:files`
+  can't have files there, and it isn't read from `:root`. To also read files from a
+  directory, set `:root`; files given with `:files` take precedence.
   Without `:root`, the document can only read the files it's given. Files read from `:root`
   may be at most 512 MiB.
 
@@ -299,11 +301,14 @@ defmodule Typsty do
   ## Options
 
   - `:template` - the template file, relative to the module's file. Defaults to the
-    module's file name with the `.typ` extension. A module that defines `render/1` can't
-    have a template.
+    module's file name with the `.typ` extension, for the module its file is named after
+    (`MyApp.Invoice` in `invoice.ex`, rather than a module nested in it). A module that
+    defines `render/1` can't have a template.
   - `:components` - the components the template imports (see `Typsty.Component`), as a
-    list of modules. They're served at `components/<name>.typ`, with the components they
-    list.
+    list of modules. They're served at `components/<name>.typ`, with their files at
+    `components/<name>/` and the components they list. They're checked when the document
+    renders, so a module that isn't a component raises `ArgumentError` then, rather than
+    when the document compiles.
 
   ## Overriding the generated functions
 
@@ -325,6 +330,8 @@ defmodule Typsty do
     quote do
       @behaviour Typsty
 
+      # A document nested in a component (or next to one) has its sigil, not the component's
+      import Typsty.Component, only: []
       import Typsty, only: [sigil_TYPST: 2]
 
       @__typsty_template__ {unquote(template), unquote(explicit?)}
@@ -376,8 +383,19 @@ defmodule Typsty do
         raise ArgumentError, "the :template option must be a path, got: #{Macro.to_string(other)}"
 
       :error ->
-        {Path.rootname(caller.file) <> @template_extension, false}
+        if __named_after_file__?(caller),
+          do: {Path.rootname(caller.file) <> @template_extension, false},
+          else: {nil, false}
     end
+  end
+
+  @doc false
+  # Whether a module is the one its file is named after (MyApp.Invoice in invoice.ex), which
+  # is the one that gets the files named after it by default, rather than a module nested in
+  # it or next to it
+  @spec __named_after_file__?(Macro.Env.t()) :: boolean()
+  def __named_after_file__?(%Macro.Env{module: module, file: file}) do
+    file |> Path.rootname() |> Path.basename() == module |> Module.split() |> List.last() |> Macro.underscore()
   end
 
   @doc false
@@ -399,48 +417,63 @@ defmodule Typsty do
   defmacro __before_compile__(env) do
     {template, explicit?} = Module.get_attribute(env.module, :__typsty_template__)
     render_defined? = Module.defines?(env.module, {:render, 1}, :def)
-    template_exists? = File.regular?(template)
-    relative = Path.relative_to_cwd(template)
 
     check_render_is_public!(env)
     __check_not_both__!(env)
 
-    cond do
-      render_defined? and (template_exists? or explicit?) ->
-        raise CompileError,
-          file: env.file,
-          line: env.line,
-          description: "#{inspect(env.module)} defines render/1 and has a template (#{relative}). Use one or the other"
+    document_render(env, template, explicit?, render_defined?, template != nil and File.regular?(template))
+  end
 
-      render_defined? ->
-        # Recompiles the module if the template is added later, to report both being defined
-        quote do
-          @external_resource unquote(template)
-        end
+  # The document's render/1, from its template file, unless it defines render/1 itself
+  defp document_render(env, template, explicit?, render_defined?, template_exists?)
 
-      template_exists? ->
-        source = read_template!(template, env)
+  defp document_render(_env, nil = _template, _explicit?, true = _render_defined?, _template_exists?), do: nil
 
-        quote do
-          @external_resource unquote(template)
-
-          @doc "Returns the template in #{unquote(relative)} with the given assigns."
-          @spec render(map()) :: Typsty.Template.t()
-          def render(assigns) do
-            %Typsty.Template{source: unquote(source), assigns: assigns, file: unquote(template)}
-          end
-        end
-
-      true ->
-        reason = if explicit?, do: "the template #{relative} does not exist", else: "there is no #{relative}"
-
-        raise CompileError,
-          file: env.file,
-          line: env.line,
-          description:
-            "#{inspect(env.module)} needs a template: define render/1 using the ~TYPST sigil, " <>
-              "or add a template file (#{reason})"
+  defp document_render(env, template, explicit?, true = _render_defined?, template_exists?) do
+    if template_exists? or explicit? do
+      raise CompileError,
+        file: env.file,
+        line: env.line,
+        description:
+          "#{inspect(env.module)} defines render/1 and has a template (#{Path.relative_to_cwd(template)}). " <>
+            "Use one or the other"
     end
+
+    # Recompiles the module if the template is added later, to report both being defined
+    quote do
+      @external_resource unquote(template)
+    end
+  end
+
+  defp document_render(env, template, _explicit?, false, true = _template_exists?) do
+    source = read_template!(template, env)
+    relative = Path.relative_to_cwd(template)
+
+    quote do
+      @external_resource unquote(template)
+
+      @doc "Returns the template in #{unquote(relative)} with the given assigns."
+      @spec render(map()) :: Typsty.Template.t()
+      def render(assigns) do
+        %Typsty.Template{source: unquote(source), assigns: assigns, file: unquote(template)}
+      end
+    end
+  end
+
+  defp document_render(env, template, explicit?, false, false) do
+    reason =
+      cond do
+        template == nil -> "it isn't named after its file, #{Path.basename(env.file)}, so it has none by default"
+        explicit? -> "the template #{Path.relative_to_cwd(template)} does not exist"
+        true -> "there is no #{Path.relative_to_cwd(template)}"
+      end
+
+    raise CompileError,
+      file: env.file,
+      line: env.line,
+      description:
+        "#{inspect(env.module)} needs a template: define render/1 using the ~TYPST sigil, " <>
+          "or add a template file, or give one with the :template option (#{reason})"
   end
 
   defp check_render_is_public!(env) do
@@ -785,7 +818,7 @@ defmodule Typsty do
           raise ArgumentError, message
 
         {:error, reason, details} ->
-          diagnostics = diagnostics(reason, details, {template, locations}, native_opts)
+          diagnostics = diagnostics(reason, details, {template, locations, module}, native_opts)
           error = %RenderError{reason: reason, diagnostics: diagnostics}
           {{:error, error}, Map.merge(metadata, %{result: :error, reason: reason, diagnostics: diagnostics})}
       end
@@ -826,10 +859,11 @@ defmodule Typsty do
   defp document_components(nil), do: []
   defp document_components(module), do: module.__typsty_components__()
 
-  defp diagnostics(:typst, diagnostics, {template, locations}, native_opts) do
+  defp diagnostics(:typst, diagnostics, {template, locations, module}, native_opts) do
     Enum.map(diagnostics, fn diagnostic ->
       diagnostic
       |> component_hint()
+      |> missing_component_hint(template, module)
       |> Diagnostic.locate(template, locations)
       |> rewrite_hints(native_opts)
     end)
@@ -848,6 +882,24 @@ defmodule Typsty do
   end
 
   defp component_hint(diagnostic), do: diagnostic
+
+  # A document module's template (from its render/1, say) rendered with Typsty's functions
+  # doesn't get the components the module lists
+  defp missing_component_hint(%Diagnostic{message: message} = diagnostic, %Template{file: file}, nil = _module)
+       when is_binary(file) do
+    if message =~ "is not one of the render's components" do
+      hint =
+        "a template rendered with Typsty.to_pdf/3 (and the like) only gets the components given with the " <>
+          ":components option, not the ones a document module lists: render the module with its own functions, " <>
+          "like MyApp.Invoice.to_pdf/2, to give it those"
+
+      %{diagnostic | hints: diagnostic.hints ++ [hint]}
+    else
+      diagnostic
+    end
+  end
+
+  defp missing_component_hint(diagnostic, _template, _module), do: diagnostic
 
   # A package that isn't in the :package_paths directories. The whole message must match, since
   # messages can quote a template's data

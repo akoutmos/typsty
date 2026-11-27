@@ -35,6 +35,10 @@ defmodule Typsty.ComponentTest do
   alias Typsty.{Diagnostic, RenderError, SyntaxError, Template}
   alias Typsty.Test.{Brand, Letterhead, Statement, Tables}
 
+  import Typsty.Test.Helpers, only: [compile!: 3, position: 2]
+
+  @tables "test/support/components/tables.ex"
+
   @statement %{number: 7, items: [%{name: "Widget", price: 25}], signed_by: "Alex"}
 
   describe "rendering" do
@@ -47,7 +51,8 @@ defmodule Typsty.ComponentTest do
       inline = "#let boxed(body) = rect(fill: luma(230), inset: 4pt, body)\n#boxed[Hello]"
       imported = ~s(#import "components/box.typ": boxed\n#boxed[Hello])
 
-      assert Typsty.to_svg(imported, %{}, components: [Box]) == Typsty.to_svg(inline)
+      assert {:ok, _svgs} = expected = Typsty.to_svg(inline)
+      assert Typsty.to_svg(imported, %{}, components: [Box]) == expected
     end
 
     test "the :components option adds to the module's components" do
@@ -68,12 +73,13 @@ defmodule Typsty.ComponentTest do
       pool = Module.concat(__MODULE__, "Pool#{System.unique_integer([:positive])}")
       start_supervised!({Typsty.Pool, name: pool, size: 1})
 
-      assert Statement.to_svg(@statement, pool: pool) == Statement.to_svg(@statement)
+      assert {:ok, _svgs} = expected = Statement.to_svg(@statement)
+      assert Statement.to_svg(@statement, pool: pool) == expected
 
       assert {:error, %RenderError{diagnostics: [diagnostic]}} =
                Statement.to_svg(%{@statement | items: [%{name: "Widget"}]}, pool: pool)
 
-      assert {diagnostic.file, diagnostic.line} == {"test/support/components/tables.ex", 10}
+      assert {diagnostic.file, diagnostic.line} == {@tables, elem(position(@tables, "price]"), 0)}
     end
   end
 
@@ -83,17 +89,18 @@ defmodule Typsty.ComponentTest do
                Statement.to_pdf(%{@statement | items: [%{name: "Widget"}]})
 
       assert diagnostic.message =~ ~s(dictionary does not contain key "price")
-      assert {diagnostic.file, diagnostic.line, diagnostic.column} == {"test/support/components/tables.ex", 10, 46}
+      # At the field that isn't there
+      assert {diagnostic.file, diagnostic.line, diagnostic.column} ==
+               Tuple.insert_at(position(@tables, "price]"), 0, @tables)
 
-      assert Enum.any?(
-               diagnostic.trace,
-               &match?(%{file: "test/support/documents/statement.ex", line: 11}, &1)
-             )
+      {call, _column} = position("test/support/documents/statement.ex", "#line-items(assigns.items)")
+      assert Enum.any?(diagnostic.trace, &match?(%{file: "test/support/documents/statement.ex", line: ^call}, &1))
     end
 
     test "point at the line in a component's .typ file" do
       assert {:error, %RenderError{diagnostics: [diagnostic]}} = Statement.to_pdf(%{@statement | signed_by: 1})
-      assert {diagnostic.file, diagnostic.line} == {"test/support/components/letterhead.typ", 12}
+      letterhead = "test/support/components/letterhead.typ"
+      assert {diagnostic.file, diagnostic.line} == {letterhead, elem(position(letterhead, "#name.first()"), 0)}
     end
 
     test "say that components don't see the document's assigns" do
@@ -103,7 +110,7 @@ defmodule Typsty.ComponentTest do
                Typsty.to_pdf(source, %{total: 1}, components: [Tables])
 
       assert diagnostic.message == "unknown variable: assigns"
-      assert {diagnostic.file, diagnostic.line} == {"test/support/components/tables.ex", 13}
+      assert {diagnostic.file, diagnostic.line} == {@tables, elem(position(@tables, "assigns.total"), 0)}
       assert List.last(diagnostic.hints) =~ "components don't see the document's assigns"
     end
 
@@ -132,7 +139,31 @@ defmodule Typsty.ComponentTest do
       assert diagnostic.message =~ "is not one of the render's components"
 
       # The component, rather than the file in the directory
-      assert Statement.to_svg(@statement, root: dir) == Statement.to_svg(@statement)
+      assert {:ok, _svgs} = expected = Statement.to_svg(@statement)
+      assert Statement.to_svg(@statement, root: dir) == expected
+    end
+
+    @tag :unix
+    test "isn't read from the :root directory under another name", %{tmp_dir: dir} do
+      File.mkdir_p!(Path.join(dir, "components"))
+      File.write!(Path.join(dir, "components/note.txt"), "from the directory")
+      File.ln_s!(Path.join(dir, "components"), Path.join(dir, "linked"))
+
+      # Through a symbolic link, and in another case on a file system that ignores case
+      names =
+        if File.exists?(Path.join(dir, "COMPONENTS")), do: ["linked", "Components", "COMPONENTS"], else: ["linked"]
+
+      for name <- names do
+        assert {:error, %RenderError{diagnostics: [%{message: message}]}} =
+                 Typsty.to_pdf(~s|#read("#{name}/note.txt")|, %{}, root: dir)
+
+        assert message =~ "/#{name}/note.txt is not one of the render's components"
+      end
+
+      # Other directories are read as usual
+      File.mkdir_p!(Path.join(dir, "notes"))
+      File.write!(Path.join(dir, "notes/note.txt"), "from the directory")
+      assert {:ok, _pdf} = Typsty.to_pdf(~s|#assert.eq(read("notes/note.txt"), "from the directory")|, %{}, root: dir)
     end
 
     test "can't have files in :files" do
@@ -274,6 +305,35 @@ defmodule Typsty.ComponentTest do
       assert Exception.message(error) =~ "a component can't read `sys.inputs`, which holds the document's assigns"
     end
 
+    test "refuse sys used other than to read its fields, and eval", %{tmp_dir: dir} do
+      for {code, message} <- [
+            {"#let total() = (sys).inputs.assigns.total", "a component can't read `sys.inputs`"},
+            {"#let s = sys", "a component can't read `sys.inputs`"},
+            {~S|#let total() = eval("sys.inputs.assigns.total")|,
+             "a component can't use `eval`, which can read `sys.inputs`"}
+          ] do
+        error =
+          assert_raise SyntaxError, fn ->
+            compile!(dir, "values.ex", """
+            defmodule Typsty.Test.Values do
+              use Typsty.Component
+              def render, do: ~TYPST|#{code}|
+            end
+            """)
+          end
+
+        assert error.kind == :component
+        assert Exception.message(error) =~ message
+      end
+
+      # Its other fields are fine
+      compile!(
+        dir,
+        "version.ex",
+        ~s|defmodule Typsty.Test.Version do\n  use Typsty.Component\n  def render, do: ~TYPST"#let v = sys.version"\nend\n|
+      )
+    end
+
     test "report syntax errors as syntax errors", %{tmp_dir: dir} do
       error =
         assert_raise SyntaxError, fn ->
@@ -395,11 +455,5 @@ defmodule Typsty.ComponentTest do
         """)
       end
     end
-  end
-
-  defp compile!(dir, name, source) do
-    file = Path.join(dir, name)
-    File.write!(file, source)
-    Code.compile_file(file)
   end
 end

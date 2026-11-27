@@ -46,8 +46,9 @@ defmodule Typsty.Options do
       type_spec: quote(do: Path.t() | nil),
       default: nil,
       doc: """
-      A directory to read the files that aren't in `:files` from. Documents can't read
-      outside it, even through symbolic links.
+      A directory to read the files that aren't in `:files` from, except `components/`,
+      which only has the render's components. Documents can't read outside it, even
+      through symbolic links.
       """
     ],
     font_paths: [

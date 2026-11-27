@@ -6,6 +6,8 @@ defmodule Typsty.ComponentFilesTest do
   alias Typsty.{RenderError, SyntaxError}
   alias Typsty.Test.{Brand, Icons, LabelA, LabelB, PDF, Stamp}
 
+  import Typsty.Test.Helpers, only: [compile!: 3, position: 2]
+
   @no_date "#set document(date: none)\n"
   @stamp_dir "test/support/components/stamp"
 
@@ -76,7 +78,8 @@ defmodule Typsty.ComponentFilesTest do
       assert diagnostic.message =~
                "/components/icon-set/nope.svg is not one of the render's components, or one of their files"
 
-      assert {diagnostic.file, diagnostic.line} == {"test/support/components/icons.ex", 9}
+      icons = "test/support/components/icons.ex"
+      assert {diagnostic.file, diagnostic.line} == {icons, elem(position(icons, "#let icon(name)"), 0)}
     end
 
     test "aren't served when they're hidden, or the component isn't given" do
@@ -122,10 +125,13 @@ defmodule Typsty.ComponentFilesTest do
       assert expected[LabelA] != expected[LabelB]
 
       1..40
-      |> Task.async_stream(fn i ->
-        label = if rem(i, 2) == 0, do: LabelA, else: LabelB
-        {label, Typsty.to_svg(source, %{}, components: [label])}
-      end)
+      |> Task.async_stream(
+        fn i ->
+          label = if rem(i, 2) == 0, do: LabelA, else: LabelB
+          {label, Typsty.to_svg(source, %{}, components: [label])}
+        end,
+        timeout: :infinity
+      )
       |> Enum.each(fn {:ok, {label, result}} -> assert result == expected[label] end)
     end
 
@@ -144,7 +150,12 @@ defmodule Typsty.ComponentFilesTest do
       assert {:error, %RenderError{diagnostics: [diagnostic]}} = Typsty.to_svg(source, %{}, components: [Stamp])
 
       assert diagnostic.message =~ "cannot add"
-      assert {diagnostic.file, diagnostic.line, diagnostic.column} == {"#{@stamp_dir}/helpers.typ", 4, 17}
+      # At the addition
+      helpers = "#{@stamp_dir}/helpers.typ"
+
+      assert {diagnostic.file, diagnostic.line, diagnostic.column} ==
+               Tuple.insert_at(position(helpers, ~s|"a" + 1|), 0, helpers)
+
       assert [%{file: nil, line: 2}] = diagnostic.trace
     end
   end
@@ -185,6 +196,183 @@ defmodule Typsty.ComponentFilesTest do
 
       assert hint =~
                "the component's files are in #{Path.relative_to_cwd(Path.join(dir, "seals"))}, which has no square.svg"
+    end
+
+    test "refuses paths written as if they were relative to its folder", %{tmp_dir: dir} do
+      File.mkdir_p!(Path.join(dir, "notary"))
+      File.write!(Path.join(dir, "notary/seal.svg"), "<svg/>")
+
+      component = """
+      defmodule Typsty.Test.Notary do
+        use Typsty.Component
+        def render, do: ~TYPST|#let seal = image("FILE")|
+      end
+      """
+
+      for {file, hint} <- [
+            {"seal.svg",
+             "paths in a component are relative to components/, where it is: its file seal.svg is notary/seal.svg"},
+            {"stamp.svg", "paths in a component are relative to components/, where it is: its own files are in notary/"}
+          ] do
+        error = assert_raise SyntaxError, fn -> compile!(dir, "notary.ex", String.replace(component, "FILE", file)) end
+        assert [%{message: message, hints: [^hint]}] = error.diagnostics
+        assert message == "#{file} isn't one of the component's files"
+      end
+
+      # Other components' sources are there
+      compile!(dir, "notary.ex", String.replace(component, ~s|image("FILE")|, ~s|read("brand.typ")|))
+    end
+
+    test "refuses paths to its files by its folder's name, when it has another", %{tmp_dir: dir} do
+      File.mkdir_p!(Path.join(dir, "masthead"))
+      File.write!(Path.join(dir, "masthead/seal.svg"), "<svg/>")
+
+      error =
+        assert_raise SyntaxError, fn ->
+          compile!(dir, "masthead.ex", """
+          defmodule Typsty.Test.Masthead do
+            use Typsty.Component, name: "header"
+            def render, do: ~TYPST|#let seal = image("masthead/seal.svg")|
+          end
+          """)
+        end
+
+      assert [%{message: "masthead/seal.svg isn't one of the component's files", hints: [hint]}] = error.diagnostics
+      assert hint == "the component reads its files by its name, header, not its folder's: seal.svg is header/seal.svg"
+
+      # By its name, they're there; and another component's folder isn't checked
+      compile!(dir, "masthead.ex", """
+      defmodule Typsty.Test.Masthead do
+        use Typsty.Component, name: "header"
+        def render, do: ~TYPST|#let seal = image("header/seal.svg") + image("brand/logo.svg")|
+      end
+      """)
+    end
+
+    test "checks the files it imports from its folder", %{tmp_dir: dir} do
+      File.mkdir_p!(Path.join(dir, "ledger"))
+      File.write!(Path.join(dir, "ledger/rows.typ"), "#let row = 1\n")
+
+      [{module, _binary}] =
+        compile!(dir, "ledger.ex", """
+        defmodule Typsty.Test.Ledger do
+          use Typsty.Component
+          def render, do: ~TYPST|#import "ledger/rows.typ": row|
+        end
+        """)
+
+      assert [{"rows.typ", %Typsty.Template{}}] = module.__typsty_files__()
+
+      error =
+        assert_raise SyntaxError, fn ->
+          compile!(dir, "ledger.ex", """
+          defmodule Typsty.Test.Ledger do
+            use Typsty.Component
+            def render, do: ~TYPST|#import "ledger/columns.typ": column|
+          end
+          """)
+        end
+
+      assert [%{message: "ledger/columns.typ isn't one of the component's files"}] = error.diagnostics
+    end
+
+    test "works wherever the project is, whatever its folders' names", %{tmp_dir: dir} do
+      project = Path.join(dir, "we[ir]d {project} *")
+      File.mkdir_p!(Path.join(project, "seal/inner"))
+      File.write!(Path.join(project, "seal/round.svg"), "<svg/>")
+      File.write!(Path.join(project, "seal/inner/square.svg"), "<svg/>")
+
+      [{module, _binary}] =
+        compile!(project, "seal.ex", """
+        defmodule Typsty.Test.Seal do
+          use Typsty.Component
+          def render, do: ~TYPST|#let round = image("seal/round.svg")|
+        end
+        """)
+
+      assert Enum.map(module.__typsty_files__(), &elem(&1, 0)) == ["inner/square.svg", "round.svg"]
+      refute module.__mix_recompile__?()
+    end
+
+    test "can have its source in its folder, which isn't one of its files", %{tmp_dir: dir} do
+      File.mkdir_p!(Path.join(dir, "rosette"))
+      File.write!(Path.join(dir, "rosette/rosette.typ"), ~s|#let rosette = image("rosette/petal.svg")\n|)
+
+      File.write!(
+        Path.join(dir, "rosette/petal.svg"),
+        ~s|<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>|
+      )
+
+      [{module, _binary}] =
+        compile!(dir, "rosette.ex", """
+        defmodule Typsty.Test.Rosette do
+          use Typsty.Component, template: "rosette/rosette.typ"
+        end
+        """)
+
+      assert Enum.map(module.__typsty_files__(), &elem(&1, 0)) == ["petal.svg"]
+      refute module.__mix_recompile__?()
+
+      source = ~s|#import "components/rosette.typ": rosette\n#rosette|
+      assert {:ok, _svgs} = Typsty.to_svg(source, %{}, components: [module])
+    end
+
+    @tag :unix
+    test "refuses files Typst can't read, and follows links in its folder once", %{tmp_dir: dir} do
+      File.mkdir_p!(Path.join(dir, "loopy/nested"))
+      File.write!(Path.join(dir, "loopy/nested/a.txt"), "a")
+      File.ln_s!(Path.join(dir, "loopy"), Path.join(dir, "loopy/nested/back"))
+
+      component =
+        ~s|defmodule Typsty.Test.Loopy do\n  use Typsty.Component\n  def render, do: ~TYPST"#let a = 1"\nend\n|
+
+      [{module, _binary}] = compile!(dir, "loopy.ex", component)
+      assert Enum.map(module.__typsty_files__(), &elem(&1, 0)) == ["nested/a.txt"]
+
+      File.write!(Path.join(dir, "loopy/back\\slash.txt"), "b")
+
+      assert_raise CompileError,
+                   ~r/back\\slash.txt, one of the files of Typsty.Test.Loopy, has a backslash in its name/,
+                   fn ->
+                     compile!(dir, "loopy.ex", component)
+                   end
+    end
+
+    test "nested in a document module, or next to one, has neither's defaults", %{tmp_dir: dir} do
+      # The document's template and folder, which the component nested in it doesn't take
+      File.write!(Path.join(dir, "receipt.typ"), ~s|#import "components/total.typ": total\n#total(assigns.amount)|)
+      File.mkdir_p!(Path.join(dir, "receipt"))
+      File.write!(Path.join(dir, "receipt/logo.svg"), "<svg/>")
+
+      [{receipt, _}, {total, _}] =
+        compile!(dir, "receipt.ex", """
+        defmodule Typsty.Test.Receipt2.Receipt do
+          use Typsty, components: [Typsty.Test.Receipt2.Receipt.Total]
+
+          defmodule Total do
+            use Typsty.Component
+            def render, do: ~TYPST|#let total(amount) = [Total: #amount]|
+          end
+        end
+        """)
+        |> Enum.sort()
+
+      assert total.__typsty_files__() == []
+      assert {:ok, _svgs} = Typsty.to_svg(receipt.render(%{amount: 5}), %{}, components: [total])
+      assert {:ok, _svgs} = receipt.to_svg(%{amount: 5})
+
+      # A module that isn't named after its file needs a source given
+      assert_raise CompileError,
+                   ~r/needs a source: .*\(it isn't named after its file, others.ex, so it has none by default\)/,
+                   fn ->
+                     compile!(dir, "others.ex", "defmodule Typsty.Test.Sibling do\n  use Typsty.Component\nend\n")
+                   end
+
+      assert_raise CompileError,
+                   ~r/needs a template: .*\(it isn't named after its file, others.ex, so it has none by default\)/,
+                   fn ->
+                     compile!(dir, "others.ex", "defmodule Typsty.Test.SiblingDocument do\n  use Typsty\nend\n")
+                   end
     end
 
     test "checks the paths of a component without files", %{tmp_dir: dir} do
@@ -343,11 +531,5 @@ defmodule Typsty.ComponentFilesTest do
       File.rm!(Path.join(dir, "growing/a.txt"))
       assert module.__mix_recompile__?()
     end
-  end
-
-  defp compile!(dir, name, source) do
-    file = Path.join(dir, name)
-    File.write!(file, source)
-    Code.compile_file(file)
   end
 end

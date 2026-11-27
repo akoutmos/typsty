@@ -6,11 +6,12 @@
 //!   rule) is refused: content outside a function never appears in a document that imports
 //!   the component, and a set or show rule there only applies to the component's own file.
 //! - A component can't read `sys.inputs`, where the document's assigns are, so it only gets
-//!   data as arguments. The check is on the syntax: it catches `sys.inputs`,
-//!   `std.sys.inputs` and imports of `inputs` from `sys`, not `sys` passed around under
-//!   another name.
+//!   data as arguments. `sys` (and `std.sys`) may only be used to read their other fields, so
+//!   it can't be passed around or renamed, and `eval`, which can read it too, is refused. The
+//!   check is on the syntax, without following scopes: a parameter named `sys` is taken for
+//!   the real one.
 
-use typst::syntax::ast::{self, Expr, Imports};
+use typst::syntax::ast::{self, AstNode, Expr, Imports};
 use typst::syntax::{LinkedNode, Source, SyntaxKind};
 
 use crate::diagnostics::Diagnostic;
@@ -24,8 +25,11 @@ const RULE_HINT: &str = "a set or show rule outside a function only applies to t
 
 const INPUTS: &str = "a component can't read `sys.inputs`, which holds the document's assigns";
 
-const INPUTS_HINT: &str =
-    "take what the component needs as arguments, and pass it from the document";
+const INPUTS_HINT: &str = "use `sys` only to read its other fields (like `sys.version`), and take what the component needs as arguments, passed from the document";
+
+const EVAL: &str = "a component can't use `eval`, which can read `sys.inputs`";
+
+const EVAL_HINT: &str = "build what the component needs from its arguments instead";
 
 /// The problems with a component's source, which is empty for a valid component: its syntax
 /// errors if it has any (the other rules are only checked on valid syntax), and otherwise
@@ -88,77 +92,160 @@ fn top_level_errors(source: &Source) -> Vec<Diagnostic> {
     errors
 }
 
-/// Where the component reads `sys.inputs`.
+/// Where the component reads `sys.inputs`, or could: `sys` (and `std`, which holds it) may
+/// only be used to read their fields, other than `inputs` (and `std.sys.inputs`), and `eval`
+/// can't be used at all, since it evaluates code that could.
 fn input_errors(source: &Source) -> Vec<Diagnostic> {
     let mut errors = Vec::new();
 
     // Walked with a stack rather than recursively, since the tree can be deep
     let mut nodes = vec![LinkedNode::new(source.root())];
     while let Some(node) = nodes.pop() {
-        if reads_inputs(&node) {
-            errors.push(Diagnostic::at(source, node.offset(), INPUTS, INPUTS_HINT));
-        } else {
-            nodes.extend(node.children());
+        if let Some(problem) = forbidden_use(&node) {
+            let (message, hint) = match problem {
+                Forbidden::Inputs => (INPUTS, INPUTS_HINT),
+                Forbidden::Eval => (EVAL, EVAL_HINT),
+            };
+            errors.push(Diagnostic::at(source, node.offset(), message, hint));
         }
+
+        nodes.extend(node.children());
     }
 
     errors
 }
 
-fn reads_inputs(node: &LinkedNode) -> bool {
-    if let Some(access) = node.cast::<ast::FieldAccess>() {
-        return access.field().as_str() == "inputs"
-            && path(access.target()).is_some_and(|path| is_sys(&path));
+enum Forbidden {
+    Inputs,
+    Eval,
+}
+
+/// Whether the node is an identifier that the component can't use there: `sys` or `std`
+/// other than to read a field (or to import from them), or `eval`.
+fn forbidden_use(node: &LinkedNode) -> Option<Forbidden> {
+    let ident = node.cast::<ast::Ident>()?;
+    let name = ident.as_str();
+    if !matches!(name, "sys" | "std" | "eval") || is_binding(node) {
+        return None;
     }
 
-    let Some(import) = node.cast::<ast::ModuleImport>() else {
-        return false;
-    };
-    let Some(source) = path(import.source()) else {
-        return false;
-    };
+    let parent = node.parent()?;
 
-    // `import sys as s`, or `import sys: *`
-    if is_sys(&source)
-        && (import.new_name().is_some() || matches!(import.imports(), Some(Imports::Wildcard)))
-    {
-        return true;
+    if let Some(access) = parent.cast::<ast::FieldAccess>() {
+        // The field of a field access, as in `assigns.sys`, is only a name
+        if !std::ptr::eq(access.target().to_untyped(), node.get()) {
+            return None;
+        }
+
+        return match (name, access.field().as_str()) {
+            ("sys", "inputs") => Some(Forbidden::Inputs),
+            ("sys", _) => None,
+            ("std", "eval") => Some(Forbidden::Eval),
+            ("std", "sys") => std_sys_use(parent),
+            ("std", _) => None,
+            _ => Some(Forbidden::Eval),
+        };
     }
 
-    let Some(Imports::Items(items)) = import.imports() else {
-        return false;
-    };
+    if let Some(import) = parent.cast::<ast::ModuleImport>() {
+        if std::ptr::eq(import.source().to_untyped(), node.get()) {
+            return forbidden_import(name, import);
+        }
+    }
 
-    items.iter().any(|item| {
-        let mut full = source.clone();
-        full.extend(item.path().iter().map(|ident| ident.as_str()));
-
-        // `import sys: inputs`, `import std: sys.inputs`, or `import std: sys as s`
-        let renames_sys = matches!(item, ast::ImportItem::Renamed(_)) && is_sys(&full);
-        renames_sys || (1..full.len()).any(|end| is_sys(&full[..end]) && full[end] == "inputs")
+    Some(if name == "eval" {
+        Forbidden::Eval
+    } else {
+        Forbidden::Inputs
     })
 }
 
-/// The identifiers of an expression made only of identifiers and field accesses: `std.sys`
-/// is `["std", "sys"]`.
-fn path<'a>(expr: Expr<'a>) -> Option<Vec<&'a str>> {
-    match expr {
-        Expr::Ident(ident) => Some(vec![ident.as_str()]),
-        Expr::FieldAccess(access) => {
-            let mut path = path(access.target())?;
-            path.push(access.field().as_str());
-            Some(path)
+/// `std.sys` may only be used to read one of its fields other than `inputs`.
+fn std_sys_use(std_sys: &LinkedNode) -> Option<Forbidden> {
+    let grandparent = std_sys.parent()?;
+
+    match grandparent.cast::<ast::FieldAccess>() {
+        Some(access) if std::ptr::eq(access.target().to_untyped(), std_sys.get()) => {
+            (access.field().as_str() == "inputs").then_some(Forbidden::Inputs)
         }
-        _ => None,
+        _ => Some(Forbidden::Inputs),
     }
 }
 
-fn is_sys(path: &[&str]) -> bool {
-    matches!(path, ["sys"] | ["std", "sys"])
+/// Imports from `sys` or `std` may bring in their fields under their names, which are then
+/// checked where they're used, but not `inputs` or `eval`, nor rename `sys` or `std`.
+fn forbidden_import(name: &str, import: ast::ModuleImport) -> Option<Forbidden> {
+    if name == "eval" || import.new_name().is_some() {
+        return Some(if name == "eval" {
+            Forbidden::Eval
+        } else {
+            Forbidden::Inputs
+        });
+    }
+
+    let items = match import.imports() {
+        // `import sys: *` brings `inputs` in; `import std: *` only brings `sys` and `eval` in
+        // under their names, which are checked where they're used
+        Some(Imports::Wildcard) => return (name == "sys").then_some(Forbidden::Inputs),
+        Some(Imports::Items(items)) => items,
+        None => return None,
+    };
+
+    items.iter().find_map(|item| {
+        let path: Vec<&str> = item.path().iter().map(|ident| ident.as_str()).collect();
+        let renamed = matches!(item, ast::ImportItem::Renamed(_));
+
+        match (name, path.as_slice()) {
+            ("sys", ["inputs", ..]) => Some(Forbidden::Inputs),
+            ("std", ["sys", "inputs", ..]) => Some(Forbidden::Inputs),
+            ("std", ["sys"]) if renamed => Some(Forbidden::Inputs),
+            ("std", ["eval", ..]) => Some(Forbidden::Eval),
+            _ => None,
+        }
+    })
+}
+
+/// Whether an identifier names what's being bound rather than using it: a `let` binding's
+/// name or pattern, a parameter, a loop variable, an argument's or a dictionary entry's
+/// name, or the name an import binds.
+fn is_binding(node: &LinkedNode) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+
+    if let Some(binding) = parent.cast::<ast::LetBinding>() {
+        return binding
+            .init()
+            .is_none_or(|init| !std::ptr::eq(init.to_untyped(), node.get()));
+    }
+
+    if let Some(closure) = parent.cast::<ast::Closure>() {
+        return closure
+            .name()
+            .is_some_and(|name| std::ptr::eq(name.to_untyped(), node.get()));
+    }
+
+    if let Some(named) = parent.cast::<ast::Named>() {
+        return std::ptr::eq(named.name().to_untyped(), node.get());
+    }
+
+    if let Some(for_loop) = parent.cast::<ast::ForLoop>() {
+        return !std::ptr::eq(for_loop.iterable().to_untyped(), node.get());
+    }
+
+    matches!(
+        parent.kind(),
+        SyntaxKind::Params
+            | SyntaxKind::Destructuring
+            | SyntaxKind::Spread
+            | SyntaxKind::ImportItemPath
+            | SyntaxKind::RenamedImportItem
+    )
 }
 
 /// The functions that read a file from a path given as their first argument.
 const READERS: &[&str] = &[
+    "path",
     "image",
     "read",
     "json",
@@ -172,30 +259,34 @@ const READERS: &[&str] = &[
 ];
 
 /// The paths that a component reads files from, written as strings: the first argument of
-/// `image`, `read`, the data loading functions, `plugin` and `bibliography` (which takes an
-/// array of them too), with the 1-based line and column of each string. They're checked
-/// against the component's files when it compiles; paths built at runtime can't be.
+/// `path`, `image`, `read`, the data loading functions, `plugin` and `bibliography` (which takes an
+/// array of them too), called by their name or through `std`, unless the file defines its
+/// own function by that name; and the paths it imports and includes (packages aside). With
+/// the 1-based line and column of each string. They're checked against the component's
+/// files when it compiles; paths built at runtime can't be.
 pub fn file_paths(source: &Source) -> Vec<(String, usize, usize)> {
+    let own = defined_names(source);
     let mut paths = Vec::new();
 
     // Walked with a stack rather than recursively, since the tree can be deep
     let mut nodes = vec![LinkedNode::new(source.root())];
     while let Some(node) = nodes.pop() {
-        if let Some(path) = read_path(&node) {
-            let strings: Vec<LinkedNode> = match path.kind() {
-                SyntaxKind::Str => vec![path],
-                SyntaxKind::Array => path
-                    .children()
-                    .filter(|item| item.kind() == SyntaxKind::Str)
-                    .collect(),
-                _ => Vec::new(),
-            };
+        let strings: Vec<LinkedNode> = match read_path(&node, &own).or_else(|| imported_path(&node))
+        {
+            Some(path) if path.kind() == SyntaxKind::Str => vec![path],
+            Some(path) if path.kind() == SyntaxKind::Array => path
+                .children()
+                .filter(|item| item.kind() == SyntaxKind::Str)
+                .collect(),
+            _ => Vec::new(),
+        };
 
-            for string in strings {
-                let value = string.cast::<ast::Str>().map(|string| string.get());
-                let position = source.lines().byte_to_line_column(string.offset());
+        for string in strings {
+            let value = string.cast::<ast::Str>().map(|string| string.get());
+            let position = source.lines().byte_to_line_column(string.offset());
 
-                if let (Some(value), Some((line, column))) = (value, position) {
+            if let (Some(value), Some((line, column))) = (value, position) {
+                if !value.starts_with('@') {
                     paths.push((value.to_string(), line + 1, column + 1));
                 }
             }
@@ -208,14 +299,21 @@ pub fn file_paths(source: &Source) -> Vec<(String, usize, usize)> {
     paths
 }
 
-/// The first positional argument of a call to one of the `READERS`.
-fn read_path<'a>(node: &LinkedNode<'a>) -> Option<LinkedNode<'a>> {
+/// The first positional argument of a call to one of the `READERS`, by its name (unless the
+/// file defines its own) or through `std`.
+fn read_path<'a>(node: &LinkedNode<'a>, own: &[String]) -> Option<LinkedNode<'a>> {
     let call = node.cast::<ast::FuncCall>()?;
-    let Expr::Ident(callee) = call.callee() else {
-        return None;
+    let reader = match call.callee() {
+        Expr::Ident(callee) if !own.iter().any(|name| name == callee.as_str()) => {
+            callee.get().clone()
+        }
+        Expr::FieldAccess(access) if matches!(access.target(), Expr::Ident(target) if target.as_str() == "std") => {
+            access.field().get().clone()
+        }
+        _ => return None,
     };
 
-    if !READERS.contains(&callee.as_str()) {
+    if !READERS.contains(&reader.as_str()) {
         return None;
     }
 
@@ -224,6 +322,48 @@ fn read_path<'a>(node: &LinkedNode<'a>) -> Option<LinkedNode<'a>> {
         .find(|child| child.kind() == SyntaxKind::Args)?;
     args.children()
         .find(|child| matches!(child.cast::<ast::Arg>(), Some(ast::Arg::Pos(_))))
+}
+
+/// The path an import or include reads, when it's a string.
+fn imported_path<'a>(node: &LinkedNode<'a>) -> Option<LinkedNode<'a>> {
+    if !matches!(
+        node.kind(),
+        SyntaxKind::ModuleImport | SyntaxKind::ModuleInclude
+    ) {
+        return None;
+    }
+
+    node.children()
+        .find(|child| child.kind() == SyntaxKind::Str)
+}
+
+/// The names the file binds itself, with `let` (as a variable or a function) or an import,
+/// wherever they are: a call by one of them isn't the standard library's.
+fn defined_names(source: &Source) -> Vec<String> {
+    let mut names = Vec::new();
+
+    let mut nodes = vec![source.root()];
+    while let Some(node) = nodes.pop() {
+        if let Some(binding) = node.cast::<ast::LetBinding>() {
+            names.extend(
+                binding
+                    .kind()
+                    .bindings()
+                    .iter()
+                    .map(|ident| ident.get().to_string()),
+            );
+        }
+
+        if let Some(import) = node.cast::<ast::ModuleImport>() {
+            if let Some(Imports::Items(items)) = import.imports() {
+                names.extend(items.iter().map(|item| item.bound_name().get().to_string()));
+            }
+        }
+
+        nodes.extend(node.children());
+    }
+
+    names
 }
 
 #[cfg(test)]
@@ -294,23 +434,51 @@ mod tests {
             "#import std: sys.inputs",
             "#import std: sys as s",
             "#import std.sys: inputs",
+            "#import std as s",
+            // `sys` used other than to read one of its fields
+            "#let a() = (sys).inputs",
+            "#let a() = {sys}.inputs",
+            "#import (sys): inputs",
+            "#let s = sys",
+            "#let a() = dictionary(sys).inputs",
+            "#let a() = (std.sys).inputs",
+            "#let a() = f(sys)",
+            "#let a() = (x: sys)",
         ] {
-            assert_eq!(
-                problems(text),
-                vec![(1, problems(text)[0].1, INPUTS.to_string())],
-                "{text}"
-            );
+            let problems = problems(text);
+            assert_eq!(problems.len(), 1, "{text}: {problems:?}");
+            assert_eq!(problems[0].2, INPUTS, "{text}");
         }
 
         for text in [
             "#import sys",
             "#import sys: version",
             "#import std: sys",
+            "#import std: *",
             "#let a = sys.version",
+            "#let a = std.sys.version",
+            "#let pow = std.calc.pow(2, 3)",
             "#let inputs = (a: 1)\n#let b = inputs.a",
             "#let a(x) = x.inputs",
+            "#let a(x) = x.sys + x.eval",
+            "#let a = (sys: 1, eval: 2)",
+            "#let a(sys: none) = 1",
         ] {
             assert_eq!(problems(text), vec![], "{text}");
+        }
+    }
+
+    #[test]
+    fn refuses_eval() {
+        for text in [
+            "#let a() = eval(\"sys.inputs\")",
+            "#let a() = std.eval(\"1\")",
+            "#let e = eval",
+            "#import std: eval",
+        ] {
+            let problems = problems(text);
+            assert_eq!(problems.len(), 1, "{text}: {problems:?}");
+            assert_eq!(problems[0].2, EVAL, "{text}");
         }
     }
 
@@ -322,6 +490,10 @@ mod tests {
 #let dynamic(name) = image("stamp/" + name)
 #let other = custom("stamp/not-read.svg")
 #let text = read(encoding: none, "stamp/raw.bin")
+#import "stamp/helpers.typ": helper
+#import "@preview/oxifmt:1.0.0": strfmt
+#let page = std.image("stamp/page.png")
+#let mark = image(path("stamp/mark.svg"))
 "##;
         let paths: Vec<_> = file_paths(&Source::detached(text))
             .into_iter()
@@ -336,8 +508,22 @@ mod tests {
                 ("a.bib".to_string(), (3, 27)),
                 ("stamp/b.bib".to_string(), (3, 36)),
                 ("stamp/raw.bin".to_string(), (6, 34)),
+                ("stamp/helpers.typ".to_string(), (7, 9)),
+                ("stamp/page.png".to_string(), (9, 23)),
+                ("stamp/mark.svg".to_string(), (10, 24)),
             ]
         );
+    }
+
+    #[test]
+    fn leaves_out_calls_to_the_files_own_functions() {
+        let text = "#let image(name) = name\n#import \"x.typ\": read\n#let a = image(\"check\") + read(\"key\")\n#let b = std.image(\"real.png\")\n";
+        let paths: Vec<_> = file_paths(&Source::detached(text))
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .collect();
+
+        assert_eq!(paths, vec!["x.typ".to_string(), "real.png".to_string()]);
     }
 
     #[test]
