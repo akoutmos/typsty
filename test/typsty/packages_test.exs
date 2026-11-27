@@ -2,6 +2,8 @@ defmodule Typsty.PackagesTest do
   # The task tests change the application config
   use ExUnit.Case, async: false
 
+  import Typsty.Test.Helpers, only: [tar_gz: 2]
+
   alias Mix.Tasks.Typsty.Packages.Get
   alias Typsty.Packages
 
@@ -351,20 +353,38 @@ defmodule Typsty.PackagesTest do
     end
   end
 
-  test "refuses archives that expand past 256 MiB, before they're all decompressed", %{dir: dir, opts: opts} do
-    # 257 MiB of zeros, compressed a MiB at a time, which takes about 256 KiB
+  test "refuses archives that expand past the limit, before they're all decompressed", %{dir: dir, opts: opts} do
+    # 64 MiB of zeros, compressed a MiB at a time, which takes about 64 KiB, against a limit
+    # of 1 MiB (256 MiB without the option)
     z = :zlib.open()
     :ok = :zlib.deflateInit(z, :best_compression, :deflated, 31, 8, :default)
     zeros = :binary.copy(<<0>>, 1024 * 1024)
-    bomb = IO.iodata_to_binary([for(_ <- 1..257, do: :zlib.deflate(z, zeros)), :zlib.deflate(z, [], :finish)])
+    bomb = IO.iodata_to_binary([for(_ <- 1..64, do: :zlib.deflate(z, zeros)), :zlib.deflate(z, [], :finish)])
     :zlib.close(z)
     assert byte_size(bomb) < 1024 * 1024
 
-    opts = Keyword.put(opts, :http_get, fn _url -> {:ok, bomb} end)
+    opts = Keyword.merge(opts, http_get: fn _url -> {:ok, bomb} end, max_package_size: 1024 * 1024)
+    test = self()
 
-    assert_raise Mix.Error, "the archive of @preview/shout:0.2.0 expands to more than 256 MiB", fn ->
-      Packages.get(["@preview/shout:0.2.0"], dir, opts)
-    end
+    # In a process that's killed past 16 MiB, counting the binaries it holds: decompressing
+    # the whole archive before checking its size would take 64
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        words = div(16 * 1024 * 1024, :erlang.system_info(:wordsize))
+        Process.flag(:max_heap_size, %{size: words, kill: true, error_logger: false, include_shared_binaries: true})
+
+        result =
+          try do
+            Packages.get(["@preview/shout:0.2.0"], dir, opts)
+          rescue
+            error in Mix.Error -> {:raised, Exception.message(error)}
+          end
+
+        send(test, {:result, result})
+      end)
+
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 10_000
+    assert_received {:result, {:raised, "the archive of @preview/shout:0.2.0 expands to more than 1 MiB"}}
   end
 
   test "extracts large files whole", %{dir: dir, opts: opts, tmp_dir: tmp_dir} do
@@ -380,7 +400,7 @@ defmodule Typsty.PackagesTest do
     file = Path.join(tmp_dir, "a-file")
     File.write!(file, "")
 
-    assert_raise Mix.Error, ~r"^failed to save @preview/shout:0.2.0: #{file}/preview/shout: ", fn ->
+    assert_raise Mix.Error, ~r"^failed to save @preview/shout:0.2.0: #{Regex.escape(file)}/preview/shout: ", fn ->
       Packages.get(["@preview/shout:0.2.0"], file, opts)
     end
   end
@@ -390,7 +410,7 @@ defmodule Typsty.PackagesTest do
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, "a file, not a directory")
 
-    assert_raise Mix.Error, ~r"^failed to save @preview/shout:0.2.0 in #{path}: ", fn ->
+    assert_raise Mix.Error, ~r"^failed to save @preview/shout:0.2.0 in #{Regex.escape(path)}: ", fn ->
       Packages.get(["@preview/shout:0.2.0"], dir, opts)
     end
 
@@ -578,12 +598,5 @@ defmodule Typsty.PackagesTest do
     assert_raise Mix.Error, ~r/which an umbrella project doesn't have. .* or give a --path/, fn ->
       Mix.Project.in_project(:umbrella, tmp_dir, fn _module -> Get.run(["@preview/shout:0.2.0"]) end)
     end
-  end
-
-  defp tar_gz(tmp_dir, files) do
-    path = Path.join(tmp_dir, "archive-#{System.unique_integer([:positive])}.tar.gz")
-    entries = for {name, contents} <- files, do: {String.to_charlist(name), contents}
-    :ok = :erl_tar.create(String.to_charlist(path), entries, [:compressed])
-    File.read!(path)
   end
 end

@@ -4,6 +4,8 @@ defmodule Typsty.PackagesHTTPTest do
   # shares, so these tests don't run at the same time as others
   use ExUnit.Case, async: false
 
+  import Typsty.Test.Helpers, only: [tar_gz: 2]
+
   alias Typsty.Packages
   alias Typsty.Test.HTTPServer
 
@@ -111,12 +113,48 @@ defmodule Typsty.PackagesHTTPTest do
       refute File.exists?(Path.join(dir, "preview/hello/1.0.0"))
     end
 
-    test "stops downloads past 64 MiB", %{dir: dir} do
+    test "stops downloads past 64 MiB, leaving nothing of them behind", %{dir: dir} do
+      # A download of a GiB, which the server sends a MiB at a time, until the client stops
       chunk = :binary.copy(<<0>>, 1024 * 1024)
-      server = HTTPServer.start(fn "GET", _target, _headers -> {:repeat, 200, chunk, 65} end)
+      server = HTTPServer.start(fn "GET", _target, _headers -> {:repeat, 200, chunk, 1024} end)
 
       assert_raise Mix.Error, ~r/: it's larger than 64 MiB$/, fn -> get(["@preview/hello:1.0.0"], dir, server.url) end
       refute File.exists?(Path.join(dir, "preview/hello/1.0.0"))
+
+      port = server.port
+      assert_receive {:sent, ^port, sent}, 10_000
+      assert sent < 128
+
+      {:messages, messages} = Process.info(self(), :messages)
+      refute Enum.any?(messages, &match?({:http, _response}, &1))
+    end
+
+    test "follows redirects to other hosts", %{dir: dir, archive: archive} do
+      cdn = HTTPServer.start(fn "GET", _target, _headers -> {200, archive} end)
+
+      registry =
+        HTTPServer.start(fn "GET", target, _headers -> {:redirect, "http://localhost:#{cdn.port}#{target}"} end)
+
+      assert [{_package, :fetched, nil}] = get(["@preview/hello:1.0.0"], dir, registry.url)
+      port = cdn.port
+      assert_received {:request, ^port, "GET", "/preview/hello-1.0.0.tar.gz", %{"host" => "localhost:" <> _}}
+    end
+
+    test "works for hosts in any case, and for several hosts at once", %{dir: dir, registry: registry} do
+      assert [{_package, :fetched, nil}] = get(["@preview/hello:1.0.0"], dir, "http://LOCALHOST:#{registry.port}")
+
+      results =
+        1..30
+        |> Task.async_stream(
+          fn i ->
+            host = if rem(i, 2) == 0, do: "127.0.0.1", else: "localhost"
+            get(["@preview/hello:1.0.0"], Path.join(dir, "#{i}"), "http://#{host}:#{registry.port}")
+          end,
+          timeout: :infinity
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      assert results == List.duplicate([{{"preview", "hello", "1.0.0"}, :fetched, nil}], 30)
     end
   end
 
@@ -166,6 +204,66 @@ defmodule Typsty.PackagesHTTPTest do
       refute_received {:request, ^proxy_port, _method, _target, _headers}
     end
 
+    test "for HTTPS aren't used once their variable is unset", %{dir: dir} do
+      proxy = HTTPServer.start(fn "CONNECT", _target, _headers -> {403, ""} end)
+      System.put_env("HTTPS_PROXY", "http://127.0.0.1:#{proxy.port}")
+
+      assert_raise Mix.Error, ~r/: the proxy refused to connect \(403 Forbidden\)$/, fn ->
+        get(["@preview/hello:1.0.0"], dir, "https://packages.example.invalid")
+      end
+
+      System.delete_env("HTTPS_PROXY")
+      port = HTTPServer.closed_port()
+
+      assert_raise Mix.Error, ~r/: couldn't connect to 127.0.0.1:#{port}$/, fn ->
+        get(["@preview/hello:1.0.0"], dir, "https://127.0.0.1:#{port}")
+      end
+    end
+
+    test "with other schemes than http:// are refused, without showing their value", %{dir: dir, registry: registry} do
+      for {variable, value, url} <- [
+            {"HTTPS_PROXY", "https://ada:s3cret@127.0.0.1:3128", "https://packages.example.invalid"},
+            {"HTTP_PROXY", "socks5://ada:s3cret@127.0.0.1:1080", registry.url}
+          ] do
+        System.put_env(variable, value)
+        scheme = value |> String.split(":") |> hd()
+
+        error = assert_raise Mix.Error, fn -> get(["@preview/hello:1.0.0"], dir, url) end
+
+        assert Exception.message(error) =~
+                 "the #{variable} variable has a #{scheme}:// proxy, which mix typsty.packages.get can't use"
+
+        refute Exception.message(error) =~ "s3cret"
+
+        System.delete_env(variable)
+      end
+
+      System.put_env("HTTP_PROXY", "http://:3128")
+
+      assert_raise Mix.Error, "the HTTP_PROXY variable isn't a proxy's URL, like http://proxy.example.com:3128", fn ->
+        get(["@preview/hello:1.0.0"], dir, registry.url)
+      end
+    end
+
+    test "can have a user without a password, and count as unset when empty", %{
+      dir: dir,
+      archive: archive,
+      registry: registry
+    } do
+      proxy = HTTPServer.start(registry(archive))
+      System.put_env("HTTP_PROXY", "http://ada@127.0.0.1:#{proxy.port}")
+
+      assert [{_package, :fetched, nil}] = get(["@preview/hello:1.0.0"], dir, "http://packages.example.invalid")
+      proxy_port = proxy.port
+      assert_received {:request, ^proxy_port, "GET", _url, %{"proxy-authorization" => authorization}}
+      assert authorization == "Basic " <> Base.encode64("ada:")
+
+      System.put_env("HTTP_PROXY", "  ")
+      assert [{_package, :fetched, nil}] = get(["@preview/hello:1.0.0"], dir, registry.url, force: true)
+      registry_port = registry.port
+      assert_received {:request, ^registry_port, "GET", "/preview/hello-1.0.0.tar.gz", _headers}
+    end
+
     test "for HTTPS that want a password, or refuse, say so", %{dir: dir} do
       for {status, message} <- [
             {407, "the proxy needs a user and password (it answered 407 Proxy Authentication Required)"},
@@ -182,12 +280,5 @@ defmodule Typsty.PackagesHTTPTest do
         assert_received {:request, ^port, "CONNECT", "packages.example.invalid:443", _headers}
       end
     end
-  end
-
-  defp tar_gz(tmp_dir, files) do
-    path = Path.join(tmp_dir, "archive-#{System.unique_integer([:positive])}.tar.gz")
-    entries = for {name, contents} <- files, do: {String.to_charlist(name), contents}
-    :ok = :erl_tar.create(String.to_charlist(path), entries, [:compressed])
-    File.read!(path)
   end
 end
