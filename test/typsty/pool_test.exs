@@ -327,6 +327,11 @@ defmodule Typsty.PoolTest do
                    Pool.start_link(memory_limit: -1)
                  end
 
+    assert_raise ArgumentError,
+                 "invalid value for :memory_limit option: expected a number of bytes of at most 4611686018427387904, " <>
+                   "or nil, got: 4611686018427387905",
+                 fn -> Pool.start_link(memory_limit: Integer.pow(2, 62) + 1) end
+
     assert_raise ArgumentError, ~r/^unknown options \[:workers\], valid options are: \[:name, :size/, fn ->
       Pool.start_link(workers: 2)
     end
@@ -338,6 +343,19 @@ defmodule Typsty.PoolTest do
     assert_raise ArgumentError, ~r/invalid value for :pool option: expected the name or pid of a Typsty.Pool/, fn ->
       Typsty.to_pdf("x", %{}, pool: "pool")
     end
+  end
+
+  test "a pool can be named globally or through a registry, and rendered with by that name" do
+    global = {:global, {__MODULE__, System.unique_integer([:positive])}}
+    start_supervised!({Pool, name: global, size: 1})
+    assert {:ok, "%PDF-" <> _} = Typsty.to_pdf("Hello", %{}, pool: global)
+
+    registry = Module.concat(__MODULE__, "Registry#{System.unique_integer([:positive])}")
+    start_supervised!({Registry, keys: :unique, name: registry})
+    via = {:via, Registry, {registry, :pool}}
+    start_supervised!({Pool, name: via, size: 1})
+    assert {:ok, ["<svg" <> _]} = Typsty.to_svg("Hello", %{}, pool: via)
+    assert [{_pid, nil}] = Registry.lookup(registry, :pool)
   end
 
   test "a pool whose workers can't start fails to start" do

@@ -26,8 +26,18 @@ defmodule Typsty.Options do
       type_spec: quote(do: %{optional(String.t()) => binary()} | [{String.t(), binary()}]),
       doc: """
       The files the document reads, such as images, data files and other `.typ` files, as
-      binaries, by their path in the project (see [Files](Typsty.html#module-files)). This
-      option can't be set in the config.
+      binaries, by their path in the project (see [Files](Typsty.html#module-files)). Paths
+      in `components/` are reserved for components. This option can't be set in the config.
+      """
+    ],
+    components: [
+      type: {:custom, __MODULE__, :components, []},
+      type_doc: "list of `t:module/0`",
+      type_spec: quote(do: [module()]),
+      default: [],
+      doc: """
+      Components the document imports (see `Typsty.Component`), besides the ones its module
+      lists with `use Typsty, components: [...]`. This option can't be set in the config.
       """
     ],
     root: [
@@ -36,8 +46,9 @@ defmodule Typsty.Options do
       type_spec: quote(do: Path.t() | nil),
       default: nil,
       doc: """
-      A directory to read the files that aren't in `:files` from. Documents can't read
-      outside it, even through symbolic links.
+      A directory to read the files that aren't in `:files` from, except `components/`,
+      which only has the render's components. Documents can't read outside it, even
+      through symbolic links.
       """
     ],
     font_paths: [
@@ -227,10 +238,13 @@ defmodule Typsty.Options do
   # Options given to a function are validated without their defaults, and so is the
   # config, so that the defaults, the config and the options can be merged in that order.
   # The schemas are checked once, when this module compiles.
+  # The options that can only be given to a render, not set in the config
+  @render_only [:files, :components]
+
   without_defaults = fn schema -> Keyword.new(schema, fn {key, spec} -> {key, Keyword.delete(spec, :default)} end) end
 
   @render_given NimbleOptions.new!(without_defaults.(@render))
-  @config_given NimbleOptions.new!(without_defaults.(Keyword.delete(@render, :files) ++ @config_only))
+  @config_given NimbleOptions.new!(without_defaults.(Keyword.drop(@render, @render_only) ++ @config_only))
   @fonts_given NimbleOptions.new!(without_defaults.(Keyword.take(@render, @font_options)))
   @format_schema NimbleOptions.new!(@format)
   @formatter_schema NimbleOptions.new!(@formatter)
@@ -304,8 +318,8 @@ defmodule Typsty.Options do
               "(config :typsty, ppi: 300), and a Typsty.Pool's options go in its child spec"
     end
 
-    if Keyword.has_key?(config, :files) do
-      raise ArgumentError, "the :files option can't be set in the config, only given to a render"
+    for key <- @render_only, Keyword.has_key?(config, key) do
+      raise ArgumentError, "the #{inspect(key)} option can't be set in the config, only given to a render"
     end
 
     case NimbleOptions.validate(config, @config_given) do
@@ -342,10 +356,47 @@ defmodule Typsty.Options do
   def files(other), do: {:error, "expected a map or a list of tuples, got: #{inspect(other, limit: 5)}"}
 
   defp file_problem({path, contents}) when is_binary(path) and is_binary(contents) do
-    if not String.valid?(path), do: "expected paths that are valid UTF-8, got: #{inspect(path)}"
+    cond do
+      not String.valid?(path) ->
+        "expected paths that are valid UTF-8, got: #{inspect(path)}"
+
+      component_path?(path) ->
+        "the path #{inspect(path)} is in components/, which is reserved for components (see Typsty.Component)"
+
+      true ->
+        nil
+    end
   end
 
   defp file_problem(other), do: "expected paths (strings) mapped to binaries, got: #{inspect(other, limit: 5)}"
+
+  # Whether a path is in components/ once it's normalized, as Typst does: `.` and empty
+  # segments are skipped, and `..` removes the segment before it. Typst refuses paths that
+  # leave the project, and paths with backslashes
+  defp component_path?(path) do
+    path
+    |> String.split("/")
+    |> Enum.reduce_while([], fn
+      segment, segments when segment in ["", "."] -> {:cont, segments}
+      "..", [_ | segments] -> {:cont, segments}
+      "..", [] -> {:halt, :outside}
+      segment, segments -> {:cont, [segment | segments]}
+    end)
+    |> case do
+      :outside -> false
+      segments -> match?(["components" | _], Enum.reverse(segments))
+    end
+  end
+
+  @doc false
+  def components(modules) when is_list(modules) do
+    case Enum.reject(modules, &(is_atom(&1) and &1 not in [nil, true, false])) do
+      [] -> {:ok, modules}
+      [other | _] -> {:error, "expected a list of component modules, and #{inspect(other)} isn't one"}
+    end
+  end
+
+  def components(other), do: {:error, "expected a list of component modules, got: #{inspect(other)}"}
 
   @doc false
   def optional_path(nil), do: {:ok, nil}

@@ -37,15 +37,16 @@ defmodule Typsty.WorkerBuild do
   end
 
   @doc false
-  @spec build!() :: :ok
-  def build! do
+  # Builds the worker into the directory, priv/native by default
+  @spec build!(Path.t()) :: :ok
+  def build!(dir \\ "priv/native") do
     Mix.shell().info("Compiling typsty_worker in release mode (#{Path.relative_to_cwd(@native_dir)})")
 
     args = ~w(build --release --package typsty_worker --message-format=json-render-diagnostics)
 
     case System.cmd("cargo", args, cd: @native_dir) do
       {output, 0} ->
-        destination = Path.join("priv/native", executable_name())
+        destination = Path.join(dir, executable_name())
         File.mkdir_p!(Path.dirname(destination))
 
         # Copied next to it and renamed into place, rather than copied over it: a running
