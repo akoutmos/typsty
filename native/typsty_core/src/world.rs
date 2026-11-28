@@ -56,8 +56,16 @@ static HIGHEST_FILE_ID: AtomicU16 = AtomicU16::new(0);
 
 static GIVEN_PATHS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// The standard library for documents without assigns.
-static LIBRARY: LazyLock<LazyHash<Library>> = LazyLock::new(|| LazyHash::new(Library::default()));
+/// The standard library for documents without assigns, whose `sys.inputs.assigns` is an empty
+/// dictionary, so that imported files can read it whether there are assigns or not.
+static LIBRARY: LazyLock<LazyHash<Library>> = LazyLock::new(|| LazyHash::new(library(Dict::new())));
+
+/// The standard library, with the assigns in `sys.inputs.assigns`.
+fn library(assigns: Dict) -> Library {
+    let mut inputs = Dict::new();
+    inputs.insert("assigns".into(), Value::Dict(assigns));
+    Library::builder().with_inputs(inputs).build()
+}
 
 /// The line added before the template, which binds its assigns. The assigns are passed in
 /// `sys.inputs.assigns` (rather than as `sys.inputs` itself, which packages read their own
@@ -100,15 +108,7 @@ impl Prepared {
         root: Option<String>,
         package_paths: Vec<String>,
     ) -> Result<Self, PrepareError> {
-        let library = if assigns.is_empty() {
-            None
-        } else {
-            let mut inputs = Dict::new();
-            inputs.insert("assigns".into(), Value::Dict(assigns));
-            Some(LazyHash::new(
-                Library::builder().with_inputs(inputs).build(),
-            ))
-        };
+        let library = (!assigns.is_empty()).then(|| LazyHash::new(library(assigns)));
 
         let mut given = HashMap::with_capacity(files.len());
         for (path, bytes) in files {

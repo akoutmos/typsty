@@ -40,14 +40,15 @@ and musl) and Windows (x86-64).
 - The assigns (a map) are passed to the template as a dictionary named `assigns`
   (`#assigns.name`), as Typst values rather than generated code, so they never
   shadow anything in Typst: strings, numbers, booleans, `nil`, lists, tuples,
-  maps (as dictionaries sorted by key), dates and times, decimals, `MapSet`s and
-  `Range`s. Other structs implement `Typsty.Encoder`, by deriving it
-  (`@derive {Typsty.Encoder, only: [...]}`) or implementing it. Using an assign
-  that wasn't given comes with a hint that says so. Imported files other than
-  components can read the assigns from `sys.inputs.assigns`.
+  maps (as dictionaries sorted by key), dates and times, decimals, `MapSet`s,
+  `Range`s and `Date.Range`s. Other structs implement `Typsty.Encoder`, by
+  deriving it (`@derive {Typsty.Encoder, only: [...]}`) or implementing it. Using
+  an assign that wasn't given comes with a hint that says so. Imported files
+  other than components can read the assigns from `sys.inputs.assigns`.
 - A virtual file system: images, data files and `.typ` files are passed as
   binaries with the `:files` option. Files can also be read from a `:root`
-  directory, which documents can't read outside of, even through symbolic links.
+  directory, which documents can't read outside of, even through symbolic links
+  (unless one is swapped in while a document reads it).
 - Fonts from the system, from Typst's embedded fonts and from `:font_paths`,
   scanned once per font configuration and cached. `Typsty.font_families/1` lists
   the font families and warms the cache.
@@ -79,14 +80,14 @@ and musl) and Windows (x86-64).
 - `Typsty.Pool`, a pool of worker processes to render in, with the `:pool`
   option (per render, or in the config), favored for input from untrusted users
   that isn't well validated. A render that runs past its timeout is stopped
-  right away, a render can be given a memory limit (`:memory_limit`), and a
-  worker that crashes takes nothing else down. Workers get only the environment
+  right away, renders can be held to a memory limit set for the pool
+  (`:memory_limit`), and a worker that crashes takes nothing else down. Workers get only the environment
   variables that finding fonts needs. A pool starts once its workers have
   started and loaded their fonts, so that the first renders don't wait for them.
   Workers are replaced when they're stopped, can be recycled after a number of
   renders (`:max_renders`), and end with the pool, with the process rendering
   with them, and with the VM. Renders return what they return in the NIF, and
-  can also read PDF files. The worker program is built from the same code as the
+  can also read PDF files and SVGs that contain SVGs. The worker program is built from the same code as the
   NIF, and precompiled downloads include it.
 - Protection for the VM:
   - Renders run on threads of their own with large stacks (as does Typst's
@@ -98,7 +99,7 @@ and musl) and Windows (x86-64).
     process waiting for it exits. At most `:max_concurrent_renders` renders run
     at once, counting cancelled renders still winding down, and
     `Typsty.running_renders/0` reports how many are running.
-  - Assigns are nested at most 256 levels deep.
+  - Assigns are nested at most 128 levels deep.
   - Links can only go to http, https, mailto and tel URLs (or relative ones):
     others, such as `javascript:` URLs from a template's data, are left out of
     PDFs and SVGs with a warning. SVGs escape the URLs that Typst doesn't.
@@ -110,16 +111,15 @@ and musl) and Windows (x86-64).
     megapixels (including images inside SVGs), SVG and XML files nested more
     than 1,024 levels deep, compressed SVGs expanding past 128 MiB, XML entities
     that nest or expand past 16 MiB, SVGs with content far outside their canvas,
-    PNG color profiles that expand past 16 MiB, images without pixels, CBOR that
-    declares more items than it holds, deeply nested bibliographies and BibTeX
-    references that cycle or expand exponentially are refused, as are PDF files
-    and SVGs inside SVGs (which renders in a `Typsty.Pool` can read). Only
-    regular files of at most 512 MiB are read from disk.
+    SVG turbulence filters of more than 24 octaves, PNG color profiles that
+    expand past 16 MiB, images without pixels, CBOR that declares more items
+    than it holds, deeply nested bibliographies and BibTeX references that cycle
+    or expand exponentially are refused, as are PDF files and SVGs inside SVGs
+    (which renders in a `Typsty.Pool` can read). Only regular files of at most
+    512 MiB are read from disk.
   - PNG export refuses pages that would need more than 2^28 pixels of textures.
   - Typst keeps every file path for the life of the VM, with room for 65,535: a
     render may use at most 10,000 paths, at most 50,000 different paths may be
     given in `:files` over the life of the VM (or of a pool's worker), and
     renders needing a new path are stopped before the table runs out. A
     `Typsty.Pool` replaces a worker whose table is nearly full.
-- `THIRD_PARTY_NOTICES.txt`, with the licenses of what the precompiled binaries
-  are built from, which ships with them.

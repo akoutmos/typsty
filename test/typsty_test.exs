@@ -49,6 +49,15 @@ defmodule TypstyTest do
       assert {:ok, _pdf} = Typsty.to_pdf(source, %{title: "My title", upper: "x"}, files: %{"helper.typ" => helper})
     end
 
+    test "imported files can read sys.inputs.assigns when there are no assigns" do
+      files = %{"total.typ" => ~S|#let total = sys.inputs.assigns.at("total", default: 0)|}
+
+      assert {:ok, _pdf} = Typsty.to_pdf("#import \"total.typ\": total\n#assert.eq(total, 0)", %{}, files: files)
+
+      assert {:ok, _pdf} =
+               Typsty.to_pdf("#import \"total.typ\": total\n#assert.eq(total, 5)", %{total: 5}, files: files)
+    end
+
     test "points errors at lines of the template, not counting the line that binds the assigns" do
       assert {:error, %RenderError{diagnostics: [diagnostic]}} =
                Typsty.to_pdf("first line\nsecond #assigns.nmae", %{name: "World"})
@@ -178,8 +187,9 @@ defmodule TypstyTest do
 
     test "returns the warnings that came before an error" do
       source = ~s|#set text(font: "No Such Font")\nHi\n#assigns.missing|
-      assert {:error, %RenderError{diagnostics: diagnostics}} = Typsty.to_pdf(source)
+      assert {:error, %RenderError{diagnostics: diagnostics} = error} = Typsty.to_pdf(source)
       assert [%{severity: :error}, %{severity: :warning, message: "unknown font family: no such font"}] = diagnostics
+      assert Exception.message(error) =~ "warning: unknown font family: no such font"
     end
 
     test "leaves links to URLs other than web, mail and phone ones out" do
@@ -497,6 +507,11 @@ defmodule TypstyTest do
   describe "format/2" do
     test "formats with typstyle" do
       assert {:ok, "#let x = (1, 2)\n= Title\n"} = Typsty.format("#let   x=(1,2)\n= Title")
+
+      words = String.duplicate("word ", 40) |> String.trim()
+      assert {:ok, wrapped} = Typsty.format(words, line_length: 40, wrap_text: true)
+      assert wrapped |> String.split("\n", trim: true) |> length() == 5
+      assert {:ok, ^words <> "\n"} = Typsty.format(words, line_length: 40)
     end
 
     test "uses the options" do

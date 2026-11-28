@@ -6,8 +6,9 @@ defmodule Typsty.Telemetry do
 
   * `[:typsty, :render, :start]` - rendering has begun
   * `[:typsty, :render, :stop]` - rendering has finished, successfully or with an error
-  * `[:typsty, :render, :exception]` - rendering raised, for example because of invalid
-    options or assigns
+  * `[:typsty, :render, :exception]` - rendering raised, for example because of an invalid
+    option or assign. (Assigns that aren't a map, and templates that aren't a string or a
+    `Typsty.Template`, raise before rendering begins, without any event.)
 
   | event        | measurements                       | metadata                                                              |
   | ------------ | ---------------------------------- | --------------------------------------------------------------------- |

@@ -356,13 +356,13 @@ defmodule Typsty.Packages do
 
   # The packages the package's Typst files import or include, found by parsing them with
   # Typst's parser, so that imports in comments and strings don't count. This may include
-  # packages that are only imported by its examples.
+  # packages that are only imported by its examples. The files are matched within the
+  # directory, so that its path isn't taken for a pattern if it has characters like [ or {
   defp imports(dir) do
-    dir
-    |> Path.join("**/*.typ")
-    |> Path.wildcard()
+    ~c"**/*.typ"
+    |> :filelib.wildcard(String.to_charlist(dir))
     |> Enum.flat_map(fn file ->
-      text = File.read!(file)
+      text = File.read!(Path.join(dir, file))
       if String.valid?(text), do: Typsty.Native.package_imports(text), else: []
     end)
     |> Enum.flat_map(fn spec ->

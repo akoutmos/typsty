@@ -53,6 +53,6 @@ chmod 755 "$staging/$worker"
 # The plain ustar format leaves out extended attributes and macOS metadata, which
 # COPYFILE_DISABLE alone doesn't
 tarball="dist/$name.tar.gz"
-(cd "$staging" && COPYFILE_DISABLE=1 tar --format=ustar -czf "$root/$tarball" "$name" "$worker" $notices)
+(cd "$staging" && COPYFILE_DISABLE=1 tar --format=ustar -czf "$root/$tarball" "$name" "$worker")
 
 echo "$tarball"

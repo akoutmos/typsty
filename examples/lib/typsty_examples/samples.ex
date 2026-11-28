@@ -368,8 +368,7 @@ defmodule TypstyExamples.Samples do
         name: "Business checking",
         last4: "4821"
       },
-      starts_on: ~D[2026-10-01],
-      ends_on: ~D[2026-10-31],
+      period: Date.range(~D[2026-10-01], ~D[2026-10-31]),
       opening_balance: Decimal.new("48213.07"),
       transactions: transactions
     }

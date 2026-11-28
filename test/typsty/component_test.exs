@@ -122,6 +122,9 @@ defmodule Typsty.ComponentTest do
                "/components/brand.typ is not one of the render's components, or one of their files (components/ only " <>
                  "has the components given to the render, and their files). Add the component's module to " <>
                  "`use Typsty, components: [...]`, or to the :components option"
+
+      # The hint for a document module's template doesn't apply to Typst source
+      refute Enum.any?(diagnostic.hints, &(&1 =~ "document module"))
     end
   end
 
@@ -277,6 +280,7 @@ defmodule Typsty.ComponentTest do
                "invalid component: #{error.file}:7:5: a component can only define things (with `#let`) and import them (with `#import`)"
 
       assert message =~ "\n    Hello #a\n    ^"
+      assert message =~ "#{error.file}:8:5: a component can only define things"
     end
 
     test "refuse anything but definitions and imports at the top level of a .typ file", %{tmp_dir: dir} do
