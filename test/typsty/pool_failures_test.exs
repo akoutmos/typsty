@@ -45,6 +45,48 @@ defmodule Typsty.PoolFailuresTest do
       end
     end
 
+    # Such as the system's loader, for a program built for a newer C library
+    test "fails its check with a message on stderr fails the pool's start, with the message", %{tmp_dir: dir} do
+      worker = Path.join(dir, "loader_error")
+      File.write!(worker, "#!/bin/sh\necho \"typsty_worker: version 'GLIBC_2.34' not found\" >&2\nexit 1\n")
+      File.chmod!(worker, 0o755)
+
+      assert_raise RuntimeError,
+                   ~r/failed to start \(it exited with status 1\): typsty_worker: version 'GLIBC_2.34' not found$/,
+                   fn -> Pool.start_link(size: 1, __executable__: worker) end
+    end
+
+    test "refuses its arguments fails the pool's start, saying it was started wrongly", %{tmp_dir: dir} do
+      worker = FakeWorker.write!(dir, check: ~s(echo "typsty_worker: unknown argument"; exit 87))
+
+      assert_raise RuntimeError, ~r/failed to start \(it was started wrongly\): typsty_worker: unknown argument$/, fn ->
+        Pool.start_link(size: 1, __executable__: worker)
+      end
+    end
+
+    test "answers its warm-up out of step fails the pool's start, without leaving the worker running",
+         %{tmp_dir: dir} do
+      worker = FakeWorker.write!(dir, warm_up: ~s(read_request; printf '\\000\\000\\000\\001x'; wait_for_close))
+
+      assert_raise RuntimeError, ~r/failed to start/, fn ->
+        Pool.start_link(size: 1, memory_limit: 100_000_000, __executable__: worker)
+      end
+
+      # The warm-up runs in the process starting the pool, which would own the worker's port
+      assert for(port <- Port.list(), Port.info(port, :connected) == {:connected, self()}, do: port) == []
+    end
+
+    test "gets only the environment variables that finding fonts needs", %{tmp_dir: dir} do
+      System.put_env("TYPSTY_TEST_SECRET", "hunter2")
+      on_exit(fn -> System.delete_env("TYPSTY_TEST_SECRET") end)
+
+      env = Path.join(dir, "env")
+      start_pool(FakeWorker.write!(dir, warm_up: ~s(env > "#{env}"; read_request; started; answer)))
+
+      refute File.read!(env) =~ "TYPSTY_TEST_SECRET"
+      assert File.read!(env) =~ ~r/^PATH=/m
+    end
+
     test "doesn't exist fails the pool's start", %{tmp_dir: dir} do
       missing = Path.join(dir, "missing")
 
@@ -137,7 +179,8 @@ defmodule Typsty.PoolFailuresTest do
     for {code, why} <- [
           {"exit 7", "it exited with status 7"},
           {"exit 87", "it lost track of its requests"},
-          {"kill -TERM $$", "it was killed by signal 15"}
+          {"kill -TERM $$", "it was killed by signal 15"},
+          {"kill -KILL $$", "it was killed by signal 9, perhaps by the system, for running out of memory"}
         ] do
       test "whose worker crashes fails, saying how (#{why})", %{tmp_dir: dir} do
         pool = start_pool(FakeWorker.write!(dir, then: "read_request; started; " <> unquote(code)))
@@ -203,17 +246,27 @@ defmodule Typsty.PoolFailuresTest do
         FakeWorker.frame({:ok, ["<svg>fake</svg>"], []}) <> FakeWorker.frame({:ok, ["<svg>extra</svg>"], []})
       )
 
+      pid_file = Path.join(dir, "pid")
+
       pool =
         start_pool(
-          FakeWorker.write!(dir, then: ~s(read_request; started; { cat "#{both}" || exit 0; }; wait_for_close))
+          FakeWorker.write!(dir,
+            then: ~s(read_request; started; { cat "#{both}" || exit 0; }; wait_for_close),
+            pid_file: pid_file
+          )
         )
 
       # The extra answer comes here or goes to the pool, depending on when it arrives: either
       # way, the caller doesn't get it, and the worker, which is out of step, is replaced
+      # rather than given the next render
+      worker = read_pid(pid_file)
+      assert render(pool) == {:ok, ["<svg>fake</svg>"]}
+      assert Helpers.wait_until(fn -> not running?(worker) end)
+
       for _render <- 1..3 do
-        assert render(pool) == {:ok, ["<svg>fake</svg>"]}
         Process.sleep(50)
         assert {:messages, []} = Process.info(self(), :messages)
+        assert render(pool) == {:ok, ["<svg>fake</svg>"]}
       end
     end
 
@@ -251,8 +304,8 @@ defmodule Typsty.PoolFailuresTest do
       # Read now: the worker that replaces it writes its own pid there
       worker = read_pid(pid_file)
 
-      assert {:error, %RenderError{reason: :timeout, diagnostics: [%{message: message}]}} = render(pool, timeout: 100)
-      assert message == "rendering didn't finish within the timeout (100 ms), and its worker was stopped"
+      assert {:error, %RenderError{reason: :timeout, diagnostics: [%{message: message}]}} = render(pool, timeout: 1_000)
+      assert message == "rendering didn't finish within the timeout (1000 ms), and its worker was stopped"
       assert Helpers.wait_until(fn -> not running?(worker) end)
     end
 
@@ -261,11 +314,11 @@ defmodule Typsty.PoolFailuresTest do
       pool = start_pool(FakeWorker.write!(dir, then: "read_request; started; wait_for_close", pid_file: pid_file))
       worker = read_pid(pid_file)
 
-      {elapsed, result} = :timer.tc(fn -> render(pool, timeout: 100) end, :millisecond)
+      {elapsed, result} = :timer.tc(fn -> render(pool, timeout: 1_000) end, :millisecond)
       assert {:error, %RenderError{reason: :timeout}} = result
 
       # The worker gets a grace period to stop the render itself, and is then stopped
-      assert elapsed >= 1_100
+      assert elapsed >= 2_000
       assert Helpers.wait_until(fn -> not running?(worker) end)
     end
 

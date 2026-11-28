@@ -3,9 +3,10 @@ defprotocol Typsty.Encoder do
   Converts structs into data that can be passed to a template.
 
   `Date`, `Time`, `NaiveDateTime`, `DateTime` and `Decimal` become Typst datetimes and
-  decimals, and `MapSet`s and `Range`s become arrays, without this protocol. Other structs
-  must implement it to be passed to a template, so that their internal fields (an Ecto
-  schema's metadata, or a password hash) don't reach templates by accident.
+  decimals, and `MapSet`s, `Range`s and `Date.Range`s become arrays, without this
+  protocol. Other structs must implement it to be passed to a template, so that their
+  internal fields (an Ecto schema's metadata, or a password hash) don't reach templates by
+  accident.
 
   Derive it to pass a struct as a dictionary of its fields, or of some of them:
 
@@ -75,6 +76,25 @@ defprotocol Typsty.Encoder do
 end
 
 defimpl Typsty.Encoder, for: MapSet do
-  # In order, so that the same set gives the same array
-  def encode(set), do: set |> MapSet.to_list() |> Enum.sort()
+  # In order, so that the same set gives the same array. Dates, times and decimals are sorted
+  # by value: in Erlang's term order, their structs would sort field by field, which puts
+  # dates in order of their day of the month
+  @by_value [Date, Time, NaiveDateTime, DateTime, Decimal]
+
+  def encode(set) do
+    members = MapSet.to_list(set)
+
+    case members do
+      [%module{} | _] when module in @by_value ->
+        if Enum.all?(members, &comparable?(&1, module)), do: Enum.sort(members, module), else: Enum.sort(members)
+
+      _members ->
+        Enum.sort(members)
+    end
+  end
+
+  # Decimals that aren't numbers (NaN, infinity) can't be compared, and are refused once
+  # they're encoded, as they are outside a set
+  defp comparable?(%{__struct__: Decimal, coef: coef}, Decimal), do: is_integer(coef)
+  defp comparable?(member, module), do: is_struct(member, module)
 end

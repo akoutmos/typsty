@@ -11,9 +11,10 @@ defmodule Typsty.Value do
   #
   # Atoms become strings, tuples become lists, and structs go through Typsty.Encoder.
 
-  # Typst recurses into values when it hashes, compares and prints them, so deeply nested
-  # data is refused (the native code has the same limit)
-  @max_depth 256
+  # Typst recurses into values when it hashes, compares and prints them, and the NIF converts
+  # them on a dirty scheduler's thread, whose stack is small, so deeply nested data is
+  # refused (the native code has the same limit)
+  @max_depth 128
 
   @max_int 9_223_372_036_854_775_807
   @min_int -9_223_372_036_854_775_808
@@ -30,7 +31,7 @@ defmodule Typsty.Value do
   # Typst's dates go from year -9999 to 9999
   @max_year 9999
 
-  # A range is passed as a list of its numbers, which a range can make enormous
+  # A range is passed as a list of its numbers or dates, which a range can make enormous
   @max_range_size 1_000_000
 
   # How many structs Typsty.Encoder may turn into other structs in a row, so that two
@@ -118,6 +119,18 @@ defmodule Typsty.Value do
   defp encode(%Range{} = range, path, _encodings) do
     if Range.size(range) > @max_range_size do
       invalid!(path, "is a range of #{Range.size(range)} numbers, more than #{@max_range_size}. Pass a list")
+    end
+
+    encode(Enum.to_list(range), path, 0)
+  end
+
+  # Each date is checked as it's converted, so a range that runs past Typst's years is
+  # refused at the first date out of them
+  defp encode(%Date.Range{} = range, path, _encodings) do
+    size = Enum.count(range)
+
+    if size > @max_range_size do
+      invalid!(path, "is a range of #{size} dates, more than #{@max_range_size}. Pass its first and last dates")
     end
 
     encode(Enum.to_list(range), path, 0)
@@ -216,7 +229,6 @@ defmodule Typsty.Value do
   defp proper?([_ | tail]), do: proper?(tail)
   defp proper?(_tail), do: false
 
-  # Decimal.to_string(decimal, :normal), without depending on Decimal
   # Without Enum.with_index/1, which would copy a large list once more
   defp encode_list([], _path, _index), do: []
 
@@ -225,7 +237,10 @@ defmodule Typsty.Value do
 
   # Trailing zeros after the decimal point that a Typst decimal has no room for are dropped,
   # so that 1.000…0 with 30 zeros (as multiplying decimals can give) is 1. Decimals far out of
-  # range are left to be refused, rather than divided digit by digit
+  # range are left to be refused, rather than divided digit by digit. Zero always fits, with
+  # as many of its places as fit (0E+41 comes from multiplying zero by 1E+41)
+  defp trim_zeros(0, exp), do: {0, exp |> max(-@max_decimal_places) |> min(0)}
+
   defp trim_zeros(coef, exp)
        when exp < 0 and exp >= -@max_trimmed_zeros and coef < @max_trimmable_coefficient and rem(coef, 10) == 0 and
               (-exp > @max_decimal_places or coef >= @max_decimal_integer),
@@ -233,6 +248,7 @@ defmodule Typsty.Value do
 
   defp trim_zeros(coef, exp), do: {coef, exp}
 
+  # Decimal.to_string(decimal, :normal), without depending on Decimal
   defp decimal_string(sign, coef, exp) do
     digits = Integer.to_string(coef)
 

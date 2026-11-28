@@ -156,11 +156,21 @@ defmodule Typsty.PackagesTest do
 
     assert File.read!(Path.join(dir, "preview/greet/1.0.0/lib.typ")) =~ "#let greet"
     assert File.read!(Path.join(dir, "preview/shout/0.2.0/src/shout.typ")) =~ "#let shout"
-    assert Path.wildcard(Path.join(dir, "**/*.tmp-*")) == []
+    assert Path.wildcard(Path.join(dir, "**/.*.tmp-*"), match_dot: true) == []
 
     assert_received {:report, "* Fetched @preview/greet:1.0.0"}
     assert_received {:report, "* Fetched @preview/shout:0.2.0 (imported by @preview/greet:1.0.0)"}
     refute_received {:get, "#{@registry}/index.json"}
+  end
+
+  test "fetches the packages a package imports into a directory with wildcard characters in its path",
+       %{tmp_dir: tmp_dir, opts: opts} do
+    dir = Path.join(tmp_dir, "we[ir]d {packages}")
+
+    assert [
+             {{"preview", "greet", "1.0.0"}, :fetched, nil},
+             {{"preview", "shout", "0.2.0"}, :fetched, {"preview", "greet", "1.0.0"}}
+           ] = Packages.get(["@preview/greet:1.0.0"], dir, opts)
   end
 
   test "the fetched packages can be imported by templates", %{dir: dir, opts: opts} do
@@ -219,7 +229,13 @@ defmodule Typsty.PackagesTest do
   end
 
   test "skips the proxy for hosts in NO_PROXY, the way curl does" do
-    on_exit(fn -> System.delete_env("NO_PROXY") end)
+    # The lowercase variable counts too, when the uppercase one is empty
+    saved = for name <- ["NO_PROXY", "no_proxy"], do: {name, System.get_env(name)}
+    System.delete_env("no_proxy")
+
+    on_exit(fn ->
+      for {name, value} <- saved, do: if(value, do: System.put_env(name, value), else: System.delete_env(name))
+    end)
 
     for {no_proxy, expected} <- [
           {"packages.typst.org", true},

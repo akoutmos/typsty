@@ -15,9 +15,11 @@ use std::str::FromStr;
 use typst::foundations::{Datetime, Decimal, Dict, Str, Value};
 
 /// How deeply lists and maps may be nested. Typst recurses into values when it hashes,
-/// compares and prints them, and the NIF converts them on a scheduler thread, which has a
-/// small stack. `Typsty.Value` enforces the same limit with a better error message.
-pub const MAX_DEPTH: usize = 256;
+/// compares and prints them, and the NIF converts them on a dirty scheduler's thread, whose
+/// stack is small: maps nested 256 deep took 87% of its default size on Apple Silicon, and
+/// 128 deep fit in the smallest size it can be given (`+sssdcpu 20`). `Typsty.Value`
+/// enforces the same limit with a better error message.
+pub const MAX_DEPTH: usize = 128;
 
 /// A dictionary of a map's entries, sorted by key. Erlang maps have no order of their own,
 /// and the order the NIF and the worker see a map's entries in differs, so sorting gives

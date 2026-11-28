@@ -67,7 +67,10 @@ defmodule Typsty.WorkerBuildTest do
     File.chmod!(cargo, 0o755)
   end
 
+  # A real build, which takes minutes when Cargo decides to rebuild Typst (when the variables
+  # its build scripts read differ from the last build's, say)
   @tag :tmp_dir
+  @tag timeout: 600_000
   test "builds the worker, replacing the one there rather than writing over it", %{tmp_dir: dir} do
     Mix.shell(Mix.Shell.Process)
     on_exit(fn -> Mix.shell(Mix.Shell.IO) end)

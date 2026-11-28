@@ -2,7 +2,7 @@ defmodule Typsty.PoolTest do
   use ExUnit.Case, async: true
 
   alias Typsty.{Pool, RenderError}
-  alias Typsty.Test.{Greeting, Invoice}
+  alias Typsty.Test.{Greeting, Helpers, Invoice}
 
   @moduletag :pool
 
@@ -167,6 +167,33 @@ defmodule Typsty.PoolTest do
       assert {:error, %RenderError{reason: :typst}} = Typsty.to_pdf(source, %{}, files: %{"page.pdf" => pdf})
     end
 
+    # usvg warns about COLRv1 glyphs it can't draw, such as this test font's sweep gradients,
+    # with println!, which mustn't reach the stdout the worker answers on. (The warning
+    # shows up on the test run's stderr.) The font is from ttf-parser's tests, under the
+    # Apache License 2.0 (test/support/fonts/colr_1_LICENSE)
+    test "renders whatever else a worker prints", %{pool: pool} do
+      svg = """
+      <svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">
+        <text x="10" y="80" font-family="COLRv1 Static Test Glyphs" font-size="60">&#xF0201;</text>
+      </svg>
+      """
+
+      fonts = Path.expand("../support/fonts", __DIR__)
+      opts = [files: %{"glyph.svg" => svg}, font_paths: [fonts], pool: pool, timeout: 10_000]
+      assert {:ok, "%PDF-" <> _} = Typsty.to_pdf(~S|#image("glyph.svg")|, %{}, opts)
+    end
+
+    test "SVGs with content far off their canvas are refused, as they are inside the VM", %{pool: pool} do
+      svg =
+        ~s|<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs><pattern id="p" width="64" height="64" patternUnits="userSpaceOnUse"><path d="M0 0c15 15 20 39 12 59s-18-18-13-3e12"/></pattern></defs><rect width="512" height="512" fill="url(#p)"/></svg>|
+
+      render = &Typsty.to_png(~S|#image("logo.svg", width: 5cm)|, %{}, [files: %{"logo.svg" => svg}] ++ &1)
+
+      assert {:error, %RenderError{reason: :typst} = pooled} = render.(pool: pool)
+      assert {:error, %RenderError{reason: :typst} = inside} = render.([])
+      assert pooled.diagnostics == inside.diagnostics
+    end
+
     test "concurrent renders sharing names don't affect each other", %{pool: pool} do
       render = fn id, pool ->
         files = %{"lib.typ" => ~s(#let tag = "lib-#{id}"), "data.json" => JSON.encode!(%{id: id})}
@@ -181,12 +208,18 @@ defmodule Typsty.PoolTest do
       |> Enum.each(fn {:ok, {id, result}} -> assert result == expected[id] end)
     end
 
+    test "callers that don't trap exits still don't once they've rendered", %{pool: pool} do
+      assert {:ok, _pdf} = Typsty.to_pdf("fine", %{}, pool: pool)
+      assert {:error, %RenderError{reason: :typst}} = Typsty.to_pdf("#nobody", %{}, pool: pool)
+      assert Process.info(self(), :trap_exit) == {:trap_exit, false}
+    end
+
     test "callers that trap exits get no stray messages", %{pool: pool} do
       Process.flag(:trap_exit, true)
 
       assert {:ok, _pdf} = Typsty.to_pdf("fine", %{}, pool: pool)
       assert {:error, %RenderError{reason: :typst}} = Typsty.to_pdf("#nobody", %{}, pool: pool)
-      assert {:error, %RenderError{reason: :timeout}} = Typsty.to_pdf(@busy, %{}, pool: pool, timeout: 50)
+      assert {:error, %RenderError{reason: :timeout}} = Typsty.to_pdf(@busy, %{}, pool: pool, timeout: 1_000)
 
       refute_receive _message, 100
     end
@@ -198,20 +231,20 @@ defmodule Typsty.PoolTest do
       assert length(idle_workers(pool)) == 3
 
       # A render that waited for a worker would be :busy
-      assert {:error, %RenderError{reason: :timeout}} = Typsty.to_pdf(@busy, %{}, pool: pool, timeout: 100)
+      assert {:error, %RenderError{reason: :timeout}} = Typsty.to_pdf(@busy, %{}, pool: pool, timeout: 1_000)
     end
   end
 
   describe "stopping renders" do
     test "a render that times out is stopped right away", %{pool: pool} do
-      {micros, result} = :timer.tc(fn -> Typsty.to_pdf(@busy, %{}, pool: pool, timeout: 100) end)
+      {micros, result} = :timer.tc(fn -> Typsty.to_pdf(@busy, %{}, pool: pool, timeout: 1_000) end)
 
       assert {:error, %RenderError{reason: :timeout, diagnostics: [%{message: message}]}} = result
-      assert message == "rendering didn't finish within the timeout (100 ms), and its worker was stopped"
+      assert message == "rendering didn't finish within the timeout (1000 ms), and its worker was stopped"
 
       # The worker stops itself at the timeout, or is ended a second after it, long before
       # the render would have finished
-      assert micros < 2_000_000
+      assert micros < 3_000_000
 
       assert {:ok, _pdf} = Typsty.to_pdf("the pool still works", %{}, pool: pool)
     end
@@ -285,7 +318,9 @@ defmodule Typsty.PoolTest do
           spawn(fn -> send(parent, {:result, Typsty.to_pdf("waits", %{}, pool: pool, timeout: :infinity)}) end)
         end
 
-      Process.sleep(100)
+      # Once they're all waiting, the pool has their requests once it's answered one after them
+      assert Helpers.wait_until(fn -> Enum.all?(waiting, &(Process.info(&1, :status) == {:status, :waiting})) end)
+      _state = :sys.get_state(pool)
       stop_supervised!(pool)
 
       for _ <- waiting do

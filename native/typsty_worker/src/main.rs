@@ -21,8 +21,10 @@
 //! full, so that the pool replaces it.
 //!
 //! The process ends, with an exit status the pool understands, when a render runs past its
-//! timeout or the process goes over its memory limit (`--memory-limit BYTES`). Stdout only
-//! carries responses; problems are reported on stderr.
+//! timeout or the process goes over its memory limit (`--memory-limit BYTES`). Problems are
+//! reported on stderr. Responses are written to the stdout the process started with, and
+//! stdout itself is pointed at stderr before the first request, so that anything else that
+//! prints (usvg prints warnings about some fonts with `println!`) can't break their framing.
 //!
 //! `typsty_worker --check` starts up as a worker would, prints the protocol version and
 //! exits, for the pool to check that the worker can run before starting any.
@@ -31,6 +33,7 @@ mod etf;
 mod memory;
 mod value;
 
+use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -90,6 +93,11 @@ fn main() {
         return;
     }
 
+    let responses = take_stdout().unwrap_or_else(|error| {
+        eprintln!("typsty_worker: couldn't set up its output: {error}");
+        exit::now(exit::PROTOCOL);
+    });
+
     // Requests are read on a thread of their own, so that the worker notices right away when
     // the pool closes the port, even in the middle of a render, and exits. Closing the port
     // is how the pool stops a render, and it also happens when the process using the worker
@@ -107,7 +115,7 @@ fn main() {
         // Acknowledges the request before working on it, so that the pool can tell a worker
         // that died before it got the request (whose render can go to another worker) from
         // one that died during the render
-        if write_response(&Term::atom("started")).is_err() {
+        if write_response(&responses, &Term::atom("started")).is_err() {
             exit::now(exit::PROTOCOL);
         }
 
@@ -124,7 +132,7 @@ fn main() {
             );
         }
 
-        if write_response(&response).is_err() {
+        if write_response(&responses, &response).is_err() {
             // The pool is gone
             exit::now(exit::PROTOCOL);
         }
@@ -144,10 +152,53 @@ fn main() {
     }
 }
 
-fn write_response(response: &Term) -> io::Result<()> {
-    let mut output = BufWriter::new(io::stdout().lock());
+fn write_response(responses: &File, response: &Term) -> io::Result<()> {
+    let mut output = BufWriter::new(responses);
     etf::write_frame(response, &mut output)?;
     output.flush()
+}
+
+/// Takes the process's stdout for responses, and points stdout at stderr, where anything
+/// else that prints goes from then on.
+#[cfg(unix)]
+fn take_stdout() -> io::Result<File> {
+    use std::os::fd::AsFd;
+
+    let responses = File::from(io::stdout().as_fd().try_clone_to_owned()?);
+
+    // SAFETY: dup2 points file descriptor 1 at stderr's file, in one step. Responses have a
+    // descriptor of their own, so nothing depends on what descriptor 1 was
+    if unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(responses)
+}
+
+/// Takes the process's stdout for responses, and points stdout at stderr, where anything
+/// else that prints goes from then on. (Rust looks the standard handles up for every write.)
+#[cfg(windows)]
+fn take_stdout() -> io::Result<File> {
+    use std::os::windows::io::{AsHandle, AsRawHandle, RawHandle};
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetStdHandle(std_handle: u32, handle: RawHandle) -> i32;
+    }
+
+    // (DWORD)-11
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+
+    let responses = File::from(io::stdout().as_handle().try_clone_to_owned()?);
+
+    // SAFETY: SetStdHandle only changes which handle the process's standard output is.
+    // Stderr's handle stays open for the life of the process, and responses have a handle of
+    // their own
+    if unsafe { SetStdHandle(STD_OUTPUT_HANDLE, io::stderr().as_raw_handle()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(responses)
 }
 
 fn read_requests(requests: mpsc::SyncSender<Vec<u8>>) {

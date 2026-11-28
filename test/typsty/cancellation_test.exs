@@ -62,7 +62,11 @@ defmodule Typsty.CancellationTest do
   end
 
   test "PNG exports are cancelled between pages" do
-    assert {:error, %RenderError{}} = Typsty.to_png(long_document(), %{}, timeout: 50)
+    # Quick to lay out, but every page takes a while to draw at 600 ppi (about 40 s for them
+    # all), so the render times out while it exports
+    pages = "#set page(width: 20cm, height: 20cm)\n#for i in range(300) { if i > 0 { pagebreak() }; [#i] }"
+
+    assert {:error, %RenderError{reason: :timeout}} = Typsty.to_png(pages, %{}, ppi: 600, timeout: 1_000)
     assert wait_until_idle(2_000) == 0
   end
 

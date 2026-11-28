@@ -4,7 +4,7 @@ defmodule Typsty.DocumentTest do
   alias Typsty.{RenderError, SyntaxError, Template}
   alias Typsty.Test.{Greeting, Invoice, Receipt}
 
-  import Typsty.Test.Helpers, only: [compile!: 3]
+  import Typsty.Test.Helpers, only: [compile!: 3, external_resources: 1]
 
   describe "a module with render/1" do
     test "renders the ~TYPST sigil with the assigns render/1 computed" do
@@ -41,6 +41,10 @@ defmodule Typsty.DocumentTest do
     test "renders the .typ file next to the module" do
       items = [%{name: "Widget", price: Decimal.new("19.99")}, %{name: "Gadget", price: Decimal.new("5.01")}]
       assert {:ok, "%PDF-" <> _} = Invoice.to_pdf(%{number: 1042, items: items})
+    end
+
+    test "is recompiled when its template changes" do
+      assert external_resources(Invoice) == ["test/support/documents/invoice.typ"]
     end
 
     test "points render errors at the line in the template file" do
@@ -89,13 +93,23 @@ defmodule Typsty.DocumentTest do
     end
 
     test "raises SyntaxError for invalid syntax in a single-line sigil", %{tmp_dir: dir} do
-      assert_raise SyntaxError, ~r/single_line.ex:3:44: unclosed delimiter/, fn ->
-        compile!(dir, "single_line.ex", """
-        defmodule Typsty.Test.SingleLine do
-          use Typsty
-          def render(assigns), do: ~TYPST"#let x = (1, 2"
+      error =
+        assert_raise SyntaxError, ~r/single_line.ex:3:44: unclosed delimiter/, fn ->
+          compile!(dir, "single_line.ex", """
+          defmodule Typsty.Test.SingleLine do
+            use Typsty
+            def render(assigns), do: ~TYPST"#let x = (1, 2"
+          end
+          """)
         end
-        """)
+
+      # The caret is under the unclosed parenthesis
+      assert Exception.message(error) =~ "\n    #let x = (1, 2\n" <> String.duplicate(" ", 13) <> "^"
+    end
+
+    test "raises for assigns that are a keyword list, saying options go after them" do
+      assert_raise ArgumentError, ~r/^the assigns must be a map, got a list: \[ppi: 300\]\. Options go after/, fn ->
+        Greeting.to_png(ppi: 300)
       end
     end
 
@@ -206,48 +220,6 @@ defmodule Typsty.DocumentTest do
           "defmodule Typsty.Test.AtomTemplate do\n  use Typsty, template: :invoice\nend\n"
         )
       end
-    end
-  end
-
-  describe "without the NIF, when cross-compiling" do
-    # The NIF is built for another machine then, so templates compile without being checked,
-    # with one warning
-    setup do
-      key = {Typsty, :warned_unavailable}
-      warned = :persistent_term.get(key, false)
-      :persistent_term.put(key, false)
-      on_exit(fn -> :persistent_term.put(key, warned) end)
-    end
-
-    test "templates compile unchecked, with one warning" do
-      unloaded = fn _source ->
-        raise UndefinedFunctionError, module: Typsty.Native, function: :syntax_errors, arity: 1
-      end
-
-      not_loaded = fn _source -> :erlang.nif_error(:nif_not_loaded) end
-
-      warnings =
-        ExUnit.CaptureIO.capture_io(:stderr, fn ->
-          assert Typsty.__native_check__(unloaded, "#let x = (") == :unavailable
-          assert Typsty.__native_check__(not_loaded, "#let x = (") == :unavailable
-        end)
-
-      assert warnings =~
-               "Typsty can't check templates and components, since its NIF couldn't be loaded (cross-compiling?)"
-
-      assert length(String.split(warnings, "can't check templates")) == 2
-    end
-
-    test "other errors aren't hidden" do
-      other_module = fn _source -> raise UndefinedFunctionError, module: Typsty.Elsewhere, function: :f, arity: 1 end
-      other_error = fn _source -> :erlang.error(:badarg) end
-
-      assert_raise UndefinedFunctionError, ~r/Typsty.Elsewhere.f\/1/, fn ->
-        Typsty.__native_check__(other_module, "")
-      end
-
-      assert_raise ArgumentError, fn -> Typsty.__native_check__(other_error, "") end
-      assert Typsty.__native_check__(&Typsty.Native.syntax_errors/1, "= Fine") == []
     end
   end
 

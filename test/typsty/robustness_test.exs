@@ -18,7 +18,7 @@ defmodule Typsty.RobustnessTest do
       error = assert_raise ArgumentError, fn -> Typsty.to_pdf("#v", %{v: nest_list(10_000, 1)}) end
       assert error.message =~ "assigns.v[0][0][0][0][0]…[0][0][0][0] is nested too deeply"
 
-      assert {:ok, _pdf} = Typsty.to_pdf("#assigns.v.len()", %{v: nest_list(200, 1)})
+      assert {:ok, _pdf} = Typsty.to_pdf("#assigns.v.len()", %{v: nest_list(120, 1)})
     end
   end
 
@@ -130,6 +130,26 @@ defmodule Typsty.RobustnessTest do
     test "PNG export refuses content placed far off the page" do
       result = Typsty.to_png(~S|#place(dx: assigns.x * 1pt)[Hello]|, %{x: 1.0e10})
       assert_render_error(result, "content is placed or scaled more than")
+    end
+  end
+
+  describe "SVGs with content far off their canvas" do
+    # Drawing it aborts the VM, whether it's in the SVG's groups or drawn through a pattern
+    # or a filter's image
+    @far "M0 0c15 15 20 39 12 59s-18-18-13-3e12"
+
+    test "are refused before Typst draws them" do
+      pattern =
+        ~s|<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs><pattern id="p" width="64" height="64" patternUnits="userSpaceOnUse"><path d="#{@far}"/></pattern></defs><rect width="512" height="512" fill="url(#p)"/></svg>|
+
+      filter =
+        ~s|<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 512 512"><defs><path id="far" d="#{@far}"/><filter id="f"><feImage xlink:href="#far"/></filter></defs><rect width="512" height="512" filter="url(#f)"/></svg>|
+
+      template = ~S|#image("logo.svg", width: 5cm)|
+      far = "times its size away from its canvas"
+
+      assert_render_error(Typsty.to_png(template, %{}, files: %{"logo.svg" => pattern}), far)
+      assert_render_error(Typsty.to_pdf(template, %{}, files: %{"logo.svg" => filter}), far)
     end
   end
 

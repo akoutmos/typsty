@@ -6,7 +6,7 @@ defmodule Typsty.ComponentFilesTest do
   alias Typsty.{RenderError, SyntaxError}
   alias Typsty.Test.{Brand, Icons, LabelA, LabelB, PDF, Stamp}
 
-  import Typsty.Test.Helpers, only: [compile!: 3, position: 2, unload: 1]
+  import Typsty.Test.Helpers, only: [compile!: 3, external_resources: 1, position: 2, unload: 1]
 
   @no_date "#set document(date: none)\n"
   @stamp_dir "test/support/components/stamp"
@@ -19,6 +19,17 @@ defmodule Typsty.ComponentFilesTest do
       assert {"pixel.png", File.read!(Path.join(@stamp_dir, "pixel.png"))} in Stamp.__typsty_files__()
       assert Icons.__typsty_files__() |> Enum.map(&elem(&1, 0)) == ["check.svg", "cross.svg"]
       assert Brand.__typsty_files__() == []
+    end
+
+    test "recompile the component when they change, as its template does" do
+      assert external_resources(Stamp) == [
+               "test/support/components/stamp.typ",
+               "test/support/components/stamp/caption.txt",
+               "test/support/components/stamp/data/codes.json",
+               "test/support/components/stamp/helpers.typ",
+               "test/support/components/stamp/pixel.png",
+               "test/support/components/stamp/seal.svg"
+             ]
     end
 
     test "are read by the component by their path in components/" do

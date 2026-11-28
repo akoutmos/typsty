@@ -57,6 +57,11 @@ pub const MAX_BIB_EXPANSION: u64 = 64 * 1024 * 1024;
 /// another), and legitimate drawings stay close to their canvas.
 const MAX_SVG_REACH: f32 = 1000.0;
 
+/// The most octaves an SVG's turbulence filter (`feTurbulence`) may have. Each one is drawn
+/// for every pixel, and a render inside the VM can't be stopped while it's drawn, but past
+/// about 10, more octaves make no visible difference.
+const MAX_TURBULENCE_OCTAVES: f64 = 24.0;
+
 /// File extensions Typst reads as data (or text), and only decodes as a PDF when a template
 /// asks for that with `format: "pdf"`.
 const DATA_EXTENSIONS: &[&str] = &[
@@ -642,8 +647,27 @@ fn check_xml(bytes: &[u8]) -> Result<(), String> {
     check_depth(&document)?;
     check_data_urls(&document)?;
 
-    if document.root_element().has_tag_name("svg") && !isolated() {
+    if document.root_element().has_tag_name("svg") {
+        check_turbulence(&document)?;
         check_svg_geometry(text)?;
+    }
+
+    Ok(())
+}
+
+fn check_turbulence(document: &roxmltree::Document) -> Result<(), String> {
+    for node in document.descendants() {
+        let octaves = node
+            .has_tag_name("feTurbulence")
+            .then(|| node.attribute("numOctaves"))
+            .flatten()
+            .and_then(|octaves| octaves.trim().parse::<f64>().ok());
+
+        if octaves.is_some_and(|octaves| octaves > MAX_TURBULENCE_OCTAVES) {
+            return Err(format!(
+                "the SVG has a turbulence filter with more than {MAX_TURBULENCE_OCTAVES} octaves, which takes too long to draw"
+            ));
+        }
     }
 
     Ok(())
@@ -667,11 +691,21 @@ fn check_svg_geometry(text: &str) -> Result<(), String> {
     let size = tree.size();
     let reach = MAX_SVG_REACH * size.width().max(size.height()).max(1.0);
 
+    // Patterns, clip paths, masks and the images filters draw (`feImage`) are drawn too, but
+    // aren't in the root's groups: the tree lists every one of them, nested ones included
     let mut groups = vec![tree.root()];
-    while let Some(group) = groups.pop() {
-        groups.extend(group.clip_path().map(|clip| clip.root()));
-        groups.extend(group.mask().map(|mask| mask.root()));
+    groups.extend(tree.patterns().iter().map(|pattern| pattern.root()));
+    groups.extend(tree.clip_paths().iter().map(|clip| clip.root()));
+    groups.extend(tree.masks().iter().map(|mask| mask.root()));
+    for filter in tree.filters() {
+        for primitive in filter.primitives() {
+            if let usvg::filter::Kind::Image(image) = primitive.kind() {
+                groups.push(image.root());
+            }
+        }
+    }
 
+    while let Some(group) = groups.pop() {
         for node in group.children() {
             let transform = node.abs_transform();
             let bounds = node.abs_bounding_box();
@@ -1217,5 +1251,69 @@ mod tests {
 
         let fine = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="240"><g transform="scale(2)"><path d="M-10 -10 L 30 30"/></g></svg>"#;
         assert!(check(fine.as_bytes(), Some("svg")).is_ok());
+    }
+
+    #[test]
+    fn refuses_turbulence_with_too_many_octaves() {
+        let turbulence = |octaves: &str| {
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><filter id="t"><feTurbulence baseFrequency="0.05" numOctaves="{octaves}"/></filter><rect width="100" height="100" filter="url(#t)"/></svg>"#
+            )
+        };
+
+        assert!(check(turbulence("100000000").as_bytes(), Some("svg")).is_err());
+        assert!(check(turbulence(" 1e8 ").as_bytes(), Some("svg")).is_err());
+        assert!(check(turbulence("25").as_bytes(), Some("svg")).is_err());
+        assert!(check(turbulence("24").as_bytes(), Some("svg")).is_ok());
+        assert!(check(turbulence("4").as_bytes(), Some("svg")).is_ok());
+    }
+
+    #[test]
+    fn refuses_far_geometry_in_patterns_clip_paths_masks_and_filters() {
+        // Drawn through a pattern (one inside another, too), a clip path, a mask, or a filter's
+        // image: none of them are among the root's groups
+        let svg = |defs: &str, used: &str| {
+            format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 512 512"><defs>{defs}</defs>{used}</svg>"##
+            )
+        };
+        let cases = |shape: &str| {
+            [
+                svg(
+                    &format!(
+                        r#"<pattern id="p" width="64" height="64" patternUnits="userSpaceOnUse">{shape}</pattern>"#
+                    ),
+                    r#"<rect width="512" height="512" fill="url(#p)"/>"#,
+                ),
+                svg(
+                    &format!(
+                        r#"<pattern id="q" width="8" height="8" patternUnits="userSpaceOnUse">{shape}</pattern><pattern id="p" width="64" height="64" patternUnits="userSpaceOnUse"><rect width="64" height="64" fill="url(#q)"/></pattern>"#
+                    ),
+                    r#"<rect width="512" height="512" fill="url(#p)"/>"#,
+                ),
+                svg(
+                    &format!(r#"<clipPath id="c">{shape}</clipPath>"#),
+                    r#"<rect width="512" height="512" clip-path="url(#c)"/>"#,
+                ),
+                svg(
+                    &format!(r#"<mask id="m">{shape}</mask>"#),
+                    r#"<rect width="512" height="512" mask="url(#m)"/>"#,
+                ),
+                svg(
+                    &format!(
+                        r##"<g id="shape">{shape}</g><filter id="f"><feImage xlink:href="#shape"/></filter>"##
+                    ),
+                    r#"<rect width="512" height="512" filter="url(#f)"/>"#,
+                ),
+            ]
+        };
+
+        for far in cases(r#"<path d="M0 0c15 15 20 39 12 59s-18-18-13-3e12"/>"#) {
+            assert!(check(far.as_bytes(), Some("svg")).is_err(), "{far}");
+        }
+
+        for near in cases(r#"<path d="M0 0L30 30L0 30Z"/>"#) {
+            assert!(check(near.as_bytes(), Some("svg")).is_ok(), "{near}");
+        }
     }
 }

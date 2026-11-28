@@ -197,7 +197,7 @@ format dates:
 | maps                                        | `dictionary`, with string keys, sorted      |
 | `Date`, `Time`, `NaiveDateTime`, `DateTime` | `datetime` (`DateTime` keeps its wall time) |
 | `Decimal`                                   | `decimal`                                   |
-| `MapSet`, `Range`                           | `array`                                     |
+| `MapSet`, `Range`, `Date.Range`             | `array`                                     |
 | other structs                               | see `Typsty.Encoder`                        |
 
 The assigns are a map with atom or string keys. A template reads keys that
@@ -209,9 +209,13 @@ that may be missing with a default:
 ```
 
 Keyword lists are lists of tuples, so they become arrays of pairs: pass maps for
-dictionaries. Typst's datetimes have no time zone or fractions of a second, so a
-`DateTime` keeps its wall time and times are truncated to the second, and its
-decimals have 28 significant digits.
+dictionaries. A `Date.Range` becomes an array of the dates it steps through, so
+a template shows a range of days with `assigns.period.first()` and
+`assigns.period.last()`. A `MapSet` becomes a sorted array: dates, times and
+decimals in order of their values, anything else in Erlang's term order. Typst's
+datetimes have no time zone or fractions of a second, so a `DateTime` keeps its
+wall time and times are truncated to the second, and its decimals have 28
+significant digits.
 
 Other structs are passed when they implement `Typsty.Encoder`, so that their
 internal fields (an Ecto schema's metadata, or a password hash) don't reach
@@ -376,15 +380,19 @@ MyApp.Report.to_pdf(assigns,
 
 Name files yourself, rather than with names that come from users (an upload's
 file name, say): a `.typ` file in `:files` takes the place of the one the
-template imports, which would let a user run their own Typst code. Use names
-like `uploads/#{id}.png`. (Components can't be replaced that way:
-`components/` is reserved for them, so `:files` can't have files there, and it
-isn't read from `:root`.)
+template imports, which would let a user run their own Typst code. Use fixed
+names, like `upload.png`, or `uploads/1.png`, `uploads/2.png` and so on,
+numbered within the render rather than by id, since every new name counts
+against a limit for the life of the VM (see below). (Components can't be
+replaced that way: `components/` is reserved for them, so `:files` can't have
+files there, and it isn't read from `:root`.)
 
 Without the `:root` option, a document can only read the files it's given. Set
 `:root` to a directory to also read files from it (files in `:files` take
-precedence). Documents can't read outside it, even through symbolic links, and
-may read files of up to 512 MiB from it. `main.typ` is the template itself.
+precedence). Documents can't read outside it, even through symbolic links,
+unless a link is swapped in while a document reads it, so don't set `:root` to a
+directory that others can write to. Documents may read files of up to 512 MiB
+from it. `main.typ` is the template itself.
 
 Typst keeps every file path it has seen for the life of the VM, and has room for
 65,535 of them, so use stable names like `logo.png` rather than a new unique
@@ -415,8 +423,9 @@ application and turn system fonts off:
 config :typsty, font_paths: [Application.app_dir(:my_app, "priv/fonts")], system_fonts: false
 ```
 
-Fonts are scanned once for each combination of font options and cached for the
-life of the VM. Font files are only read the first time a document uses them. To
+Fonts are scanned once for each combination of font options, and the fonts
+found for the 32 combinations used most recently are kept. Font files are only
+read the first time a document uses them. To
 scan them ahead of the first render, call `Typsty.font_families/1` when your
 application starts. It also returns the font families that were found, which
 helps when a font isn't being picked up.
@@ -517,8 +526,9 @@ whole VM down. It's built to protect the VM from what you render with:
   message, like any other. The thread has a 256 MiB stack (reserved address
   space, not memory), as does Typst's thread pool, so deeply nested content
   can't overflow a stack, panics in Typst are returned as a
-  `Typsty.RenderError`, and Typst's own limits (parsing, call and layout depth)
-  get a chance to stop runaway recursion.
+  `Typsty.RenderError` (a panic in one of the jobs Typst runs in the background
+  is only logged, and its render may never finish), and Typst's own limits
+  (parsing, call and layout depth) get a chance to stop runaway recursion.
 - **Renders are independent.** Concurrent renders of the same template, with the
   same file names and assigns names but different values (as a Phoenix
   controller does for each request), each produce exactly what they would on
@@ -539,7 +549,7 @@ whole VM down. It's built to protect the VM from what you render with:
   out can't pile up in the background. `Typsty.running_renders/0` reports how
   many are running.
 - **Assigns are data, never code.** They're converted to Typst values, nested at
-  most 256 levels deep, with numbers and dates checked against what Typst can
+  most 128 levels deep, with numbers and dates checked against what Typst can
   hold, and are shown as they are: a template can't do anything with them that
   it couldn't do with values it wrote itself. Links can only go to http, https,
   mailto and tel URLs (or relative ones): a link to another kind, such as a
@@ -548,13 +558,14 @@ whole VM down. It's built to protect the VM from what you render with:
   or hang its decoders: images whose header claims more than 134 megapixels (a
   small file can claim to be enormous), including images inside SVGs; SVG and
   XML files nested more than 1,024 levels deep; compressed SVGs that expand past
-  128 MiB; SVGs with content far outside their canvas; XML entities that nest or
-  expand past 16 MiB; PNG color profiles that expand past 16 MiB; images without
-  pixels; CBOR that declares more items than it holds; deeply nested
-  bibliographies, and BibTeX references that cycle or expand exponentially; PDF
-  files. Files are only read from `:root` and package directories if they are
-  regular files inside them, so a symbolic link can't lead elsewhere, and a link
-  to `/dev/zero` or a FIFO can't hang a render.
+  128 MiB; SVGs with content far outside their canvas, and SVG turbulence
+  filters of more than 24 octaves; XML entities that nest or expand past 16 MiB;
+  PNG color profiles that expand past 16 MiB; images without pixels; CBOR that
+  declares more items than it holds; deeply nested bibliographies, and BibTeX
+  references that cycle or expand exponentially; PDF files. Files are only read
+  from `:root` and package directories if they are regular files inside them, so
+  a symbolic link can't lead elsewhere (unless it's swapped in while the file is
+  read), and a link to `/dev/zero` or a FIFO can't hang a render.
 - **PNG export is checked before rasterizing.** A page, and the images,
   gradients and tilings on it, may use at most 2^28 pixels of textures (1 GiB),
   so an extreme `:ppi` or content far larger than the page returns an error
@@ -612,7 +623,8 @@ NIF can't:
 
 - A render that runs past its timeout is **stopped right away**, whatever it's
   doing, including pure computation.
-- A render can be given a **memory limit**, and is stopped when it goes over it.
+- Renders can be held to a **memory limit**, set for the pool, and a render that
+  goes over it is stopped.
 - A worker that crashes, for any reason, takes **nothing else down**.
 
 Add a pool to your supervision tree, and render with it:
@@ -634,11 +646,12 @@ config :typsty, pool: MyApp.TypstPool
 ```
 
 Renders return what they return without a pool: the same output and the same
-warnings and errors, pointing at the same lines (and they can read PDF files). A
-worker that's stopped is replaced, and workers end when the pool stops, when the
-process rendering with them exits and when the VM exits. A pool that stops
-before or during a render returns an error to the process waiting for it. A new
-worker loads the fonts renders use by default before it takes renders.
+warnings and errors, pointing at the same lines (and they can read PDF files, and
+SVGs that contain SVGs). A worker that's stopped is replaced, and workers end
+when the pool stops, when the process rendering with them exits and when the VM
+exits. A pool that stops before or during a render returns an error to the
+process waiting for it. A new worker loads the fonts renders use by default
+before it takes renders.
 
 The pool isolates crashes and memory use, not privileges: its workers run as the
 same user as the VM. They get only the environment variables that finding fonts
