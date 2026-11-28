@@ -14,7 +14,9 @@ defmodule Typsty.Test.Helpers do
   change, relative to the current directory and sorted.
   """
   def external_resources(module) do
-    binary = File.read!(:code.which(module))
+    # Found in the code path: when tests run with coverage, the module that's loaded was
+    # compiled by cover, and :code.which/1 returns :cover_compiled rather than a file
+    binary = File.read!(:code.where_is_file(~c"#{module}.beam"))
     {:ok, {^module, [debug_info: {:debug_info_v1, backend, data}]}} = :beam_lib.chunks(binary, [:debug_info])
     {:ok, %{attributes: attributes}} = backend.debug_info(:elixir_v1, module, data, [])
 
